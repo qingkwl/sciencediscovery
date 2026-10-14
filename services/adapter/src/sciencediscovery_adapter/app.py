@@ -52,10 +52,16 @@ def create_app(settings: Settings | None = None, *, transport: httpx.AsyncBaseTr
         # No read timeout: SSE runs stay open for the whole agent run.
         timeout = httpx.Timeout(connect=5.0, read=None, write=60.0, pool=5.0)
         async with (
+            # [windows-desktop] reason: 炸点③-10 —— both clients only ever reach
+            # loopback URLs (legacy API, tool bridge). trust_env=True lets host
+            # proxy variables in, and a NO_PROXY entry like "[::1]" crashes this
+            # httpx version at client construction (InvalidURL: Invalid port
+            # ':1]'), killing the adapter before it serves. Loopback must not
+            # depend on proxy env at all.
             httpx.AsyncClient(base_url=settings.legacy_url, transport=transport, timeout=timeout,
-                              follow_redirects=False) as legacy,
+                              follow_redirects=False, trust_env=False) as legacy,
             # Tool-bridge calls go to loopback URLs the caller names, not to the legacy base URL.
-            httpx.AsyncClient(timeout=timeout) as bridge,
+            httpx.AsyncClient(timeout=timeout, trust_env=False) as bridge,
         ):
             app.state.legacy = legacy
             app.state.bridge = bridge

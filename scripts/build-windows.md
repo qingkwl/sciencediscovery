@@ -64,14 +64,27 @@ echo registry=https://registry.npmmirror.com >> .npmrc
 
 ## 5. 平台边界（当前 Windows 上**不可用**的命令）
 
-以下命令是 Linux/macOS 形态，Windows 原生暂不可用，属 F2 范围：
+F2 已为启动链提供 Windows 原生等价物（`.mjs`），Linux/macOS 的 bash 脚本保持原样：
+
+| 原命令（bash，Windows 不可用） | Windows 等价物（F2 新增） |
+| --- | --- |
+| `pnpm start` / `pnpm server`（`start-stack.sh --mode local`） | `node scripts/start-stack.mjs --mode local`（可选 `--no-build` `--no-node-build` `--no-jiuwenswarm`） |
+| `pnpm start:jiuwenswarm` / `pnpm jiuwenswarm:*`（`jiuwenswarm.sh`） | `node scripts/jiuwenswarm.mjs <setup\|start\|stop\|status\|env>` |
+
+仍不可用（无 Windows 等价物）：
 
 | 命令 | 原因 |
 | --- | --- |
-| `pnpm start` / `pnpm server` / `pnpm start:jiuwenswarm` | 调用 bash 脚本（`run-local.sh` / `start-stack.sh`） |
-| `pnpm jiuwenswarm:*` | 同上 |
 | `pnpm ci:e2e:legacy` | 调用 `.ci/run-e2e.sh` |
-| `pnpm runner:binary` | SEA 单文件打包，Linux-only |
+| `pnpm runner:binary` | SEA 单文件打包，Linux-only（`.mjs` 在非 Linux 平台自动跳过该步） |
+| `start-stack.sh --mode docker` | `.mjs` 暂只移植 local 模式，docker 模式请用 WSL 跑原 bash 脚本 |
 
-Linux/WSL 侧回归说明：F1 对构建输入零改动（唯一变更是
-`scripts/check-architecture.mjs` 的路径分隔符修复，平台中立），双平台不回归。
+Windows 侧已知行为差异：runner 沙箱依赖（bubblewrap/seatbelt）不存在，runner 以
+`ready:false` 优雅降级启动（Provider A 语义）；科学环境（micromamba）不可用，待 F4。
+
+Linux/WSL 侧回归说明：F1/F2 未改动任何 bash 启动脚本，双平台启动链不回归。
+F2 改动的三个存量文件均为平台中立修复且可上游：`swarm-patches.py` 显式
+`encoding="utf-8"`（Linux 行为不变）；openevolve vendor `runner.py` 的
+`import resource` 加 try/except（Linux 上正常导入，行为不变）；adapter
+`app.py` 两个 httpx.AsyncClient 加 `trust_env=False`（adapter 是纯 loopback
+服务，不读宿主代理变量在 Linux 下同样更正确，但属行为微调，上游沟通时注明）。

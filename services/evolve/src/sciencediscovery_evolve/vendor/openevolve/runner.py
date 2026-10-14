@@ -35,7 +35,13 @@ import io
 import json
 import math
 import random
-import resource
+# [windows-desktop] reason: 炸点③-9 —— `resource` is a Unix-only stdlib module.
+# set_resource_limits() already treats every refused limit as "unavailable";
+# with resource=None every getattr() misses and all limits report unavailable.
+try:
+    import resource
+except ImportError:
+    resource = None
 import time
 from typing import List
 
