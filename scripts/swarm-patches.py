@@ -37,7 +37,9 @@ def process(mode, target, tag, patch_dir=None):
         raise ValueError(f"No supported Swarm patch set for {tag}")
     manifest = target / ".sciencediscovery-patches.json"
     paths = sorted({name for patch in patches for name in
-                    re.findall(r"^\+\+\+ b/(.+)$", patch.read_text(), re.M)})
+                    # [windows-desktop] reason: 炸点③-8 —— patch files are UTF-8; the
+                    # platform default codec (GBK on zh-CN Windows) must never apply.
+                    re.findall(r"^\+\+\+ b/(.+)$", patch.read_text(encoding="utf-8"), re.M)})
     for name in paths:
         if not (target / name).resolve().is_relative_to(target):
             raise ValueError(f"Unsafe patch path: {name}")
@@ -49,7 +51,7 @@ def process(mode, target, tag, patch_dir=None):
         # A patch revised in place no longer reverses cleanly over its old result,
         # and a revised new-file patch finds its file already there. Start a source
         # checkout from the pinned files whenever the recorded patch set changed.
-        previous = json.loads(manifest.read_text()) if manifest.exists() else None
+        previous = json.loads(manifest.read_text(encoding="utf-8")) if manifest.exists() else None
         if previous and previous.get("patches") != expected["patches"] and (target / ".git").exists():
             restore_pinned(target, tag, set(paths) | set(previous.get("files", {})), env)
         for patch in patches:
@@ -60,9 +62,9 @@ def process(mode, target, tag, patch_dir=None):
             subprocess.run(command + ["--check", str(patch)], env=env, check=True)
             subprocess.run(command + [str(patch)], env=env, check=True)
         expected["files"] = {name: digest(target / name) for name in paths}
-        manifest.write_text(json.dumps(expected, indent=2) + "\n")
+        manifest.write_text(json.dumps(expected, indent=2) + "\n", encoding="utf-8")
     else:
-        actual = json.loads(manifest.read_text())
+        actual = json.loads(manifest.read_text(encoding="utf-8"))
         expected["files"] = {name: digest(target / name) for name in paths}
         if actual != expected:
             raise ValueError("Swarm patch verification failed; rebuild or run setup before starting")
