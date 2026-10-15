@@ -160,6 +160,7 @@ import {
 } from "@sciencediscovery/idea-tree";
 
 import { SessionStoreHttpError } from "../store.js";
+import { currentExecutionSandboxed, providerBadgeLabel, unsandboxedApprovalModeMessage, type ExecutionBadge, type ExecutionCapability } from "@sciencediscovery/execution-router";
 import { validateLiveProvider } from "../store/providers.js";
 import { normalizeApiToken } from "../store/secrets.js";
 import { remoteWorkspaceKey, syncRemoteWorkspace } from "../remote-runner.js";
@@ -784,6 +785,15 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
     }
   };
 
+  // F5 (0.B1 §5)：无沙箱时 always_allow 的拦截。返回 409 话术；放行返回 null。
+  const unsandboxedApprovalBlock = async (approvalMode: string | undefined): Promise<string | null> => {
+    if (approvalMode !== "always_allow") return null;
+    const capability: ExecutionCapability = await platform.executionRouter.capability();
+    if (currentExecutionSandboxed(capability)) return null;
+    const badge: ExecutionBadge = platform.executionRouter.providers().find((entry) => entry.id === capability.provider)?.badge ?? "direct";
+    return unsandboxedApprovalModeMessage(badge);
+  };
+
   const server = createServer(async (request, response) => {
     const requestPath = (request.url ?? "/").split("?", 1)[0] || "/";
     try {
@@ -840,6 +850,25 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       }
 
       if (await handleExecutionReadiness(request, response, url, store, runnerClient, remoteCompute, () => readJson(request))) return;
+      if (url.pathname === "/api/execution-provider") {
+        // F5 执行路由层：角标数据源（GET）与热切换重探（POST refresh，
+        // 0.B1 §3 复用 runner /execution-capability 协议，不新增 wire 格式）。
+        if (request.method === "GET") {
+          sendJson(response, 200, {
+            capability: await platform.executionRouter.capability(),
+            providers: platform.executionRouter.providers(),
+          });
+          return;
+        }
+        if (request.method === "POST") {
+          const body = await readJson<{ refresh?: boolean }>(request);
+          sendJson(response, 200, {
+            capability: await platform.executionRouter.capability(body.refresh === true),
+            providers: platform.executionRouter.providers(),
+          });
+          return;
+        }
+      }
       if (request.method === "GET" && url.pathname === "/api/projects") {
         sendJson(response, 200, store.listProjects());
         return;
@@ -2207,6 +2236,9 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
         if (body.modelId && body.settingsOverrides?.modelId && body.modelId !== body.settingsOverrides.modelId) {
           return sendError(response, 400, "modelId conflicts with settingsOverrides.modelId");
         }
+        // 0.B1 §5 会话创建入口：无沙箱时 always_allow → 409 + 引导文案。
+        const approvalBlock = await unsandboxedApprovalBlock(body.approvalMode);
+        if (approvalBlock) return sendError(response, 409, approvalBlock);
         const settingsOverrides: RuntimeSettingsOverrides = {
           ...body.settingsOverrides,
           ...(body.modelId ? { modelId: body.modelId } : {}),
@@ -2379,6 +2411,10 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
         // recording a no-op re-selection and the "from" side of the audit entry.
         const previousApprovalMode = requestedApprovalMode ? store.getSession(sessionId)?.approvalMode : undefined;
         if (requestedApprovalMode && previousApprovalMode !== requestedApprovalMode) {
+          // 0.B1 §5 运行期切换入口：无沙箱时切到 always_allow → 409（UI
+          // 置灰只是体验层，这里是 enforcement）。
+          const approvalBlock = await unsandboxedApprovalBlock(requestedApprovalMode);
+          if (approvalBlock) return sendError(response, 409, approvalBlock);
           const teardown = (await runnerClient.health().catch(() => undefined))?.scientificEnvs?.available
             ? await runnerClient.teardownKernels(sessionId, "Approval mode changed; persistent memory was lost")
             : undefined;

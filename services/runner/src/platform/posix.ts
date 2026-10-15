@@ -41,4 +41,7 @@ export const posixAdaptation: OsAdaptation = {
     // F4.4: posix keeps the upstream solver error verbatim.
     return null;
   },
+  environmentShellPath(prefixPath) {
+    return resolve(prefixPath, "bin", "bash");
+  },
 };

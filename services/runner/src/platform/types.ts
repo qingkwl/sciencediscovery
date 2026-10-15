@@ -93,4 +93,13 @@ export interface OsAdaptation {
    * null: the error passes through unchanged.
    */
   packageInstallGuidance(rawErrorMessage: string): string | null;
+
+  /**
+   * Shell interpreter inside a conda environment prefix (F5.3). Windows 原生
+   * 宿主没有 bash；win32 starter 环境预装 m2-bash（MSYS2 移植），落在
+   * `Library\usr\bin\bash.exe`（已实证安装验证）。posix conda 布局的
+   * `bin/bash` 仅供完整性；posix runner 走 bwrap/seatbelt 分支，不会
+   * 用到 none 直跑的 shell 路径。
+   */
+  environmentShellPath(prefixPath: string): string;
 }

@@ -58,7 +58,7 @@ import type { EnvironmentStore } from "./environment-store.js";
 import { buildSeatbeltProfile, canonicalPath, seatbeltPwdShim, seatbeltWorkspaceMapping } from "./seatbelt.js";
 // [windows-desktop] reason: F3.2 —— Windows 无 SIGKILL 语义与进程组，
 // 杀子进程统一走 platform/ 适配层（posix=child.kill 透传，win32=taskkill /T /F）。
-import { condaActivationPaths, terminateTree } from "./platform/index.js";
+import { condaActivationPaths, environmentShellPath, terminateTree } from "./platform/index.js";
 import { RunnerSkillPackages } from "./skill-packages.js";
 
 import { RUNNER_VERSION } from "./version.js";
@@ -1255,19 +1255,20 @@ export async function executeShell(
   gateways?: EgressGatewayRegistry,
   runtime?: import("./environment-store.js").EnvironmentRuntime,
   onOutput?: (stream: "stdout" | "stderr", chunk: Buffer) => void,
+  environmentStore?: Pick<EnvironmentStore, "capability" | "resolveRuntime">,
 ): Promise<ShellExecutionResult> {
   if (!request.code.trim()) throw new Error("Shell code is required");
   if (!request.executionId?.trim()) throw new Error("Execution ID is required");
-  if (executorSandboxKind(config) === "none") {
-    // [windows-desktop] F4.3: no bash on a native Windows host; the agent's
-    // shell tool is disabled until the WSL sandbox plugin (F5 Provider B).
-    throw new Error("Shell execution requires a sandboxed runner; the direct-execution provider (Windows) does not support shell");
-  }
   const networkAccess = epochSandboxNetworkAccess(request.permissionEpoch);
   if (request.permissionEpoch.mounts.length !== 1
     || request.permissionEpoch.mounts[0]?.source !== "workspace"
     || request.permissionEpoch.mounts[0]?.mode !== "read-write") {
     throw new Error("Shell execution accepts exactly one read-write workspace mount");
+  }
+  if (executorSandboxKind(config) === "none") {
+    // [windows-desktop] F5.3: Provider A runs the agent's shell code through
+    // m2-bash inside the managed conda environment (see executeDirectShell).
+    return await executeDirectShell(config, request, signal, envProfile, gateways, runtime, onOutput, environmentStore);
   }
 
   const maxWorkspaceBytes = resolveQuotaBytes(request.maxWorkspaceBytes, config.maxWorkspaceBytes, "maxWorkspaceBytes");
@@ -1369,6 +1370,118 @@ export async function executeShell(
     networkPolicy: networkAccess.mode,
     runnerVersion: RUNNER_VERSION,
     sandbox,
+    startedAt,
+    workingDirectory: launch.chdir,
+  };
+}
+
+/**
+ * [windows-desktop] F5.3: Provider A（直跑）的 shell 路径。Windows 宿主没有
+ * bash；受管 conda 环境预装 m2-bash（MSYS2 移植，已实证落在
+ * `Library\usr\bin\bash.exe`），它就是 agent 的 run_shell 在 Provider A 下
+ * 的唯一执行载体。代码经 `bash --noprofile --norc -euo pipefail -s` 从
+ * stdin 进入，cwd = 工作区，语义与 bwrap 分支一致（minus 命名空间隔离）。
+ *
+ * 模型未指定 environmentId 时回退到 starter-python 环境（与 executePython
+ * 的 resolveRuntime(undefined, "python") 默认一致）；环境内没有 m2-bash
+ * 时报错并给出修复指引（重建/更新 starter 环境）。
+ */
+async function executeDirectShell(
+  config: ExecutorConfig,
+  request: ShellExecutionRequest,
+  signal: AbortSignal | undefined,
+  envProfile: SessionEnvProfile | undefined,
+  gateways: EgressGatewayRegistry | undefined,
+  runtime: import("./environment-store.js").EnvironmentRuntime | undefined,
+  onOutput: ((stream: "stdout" | "stderr", chunk: Buffer) => void) | undefined,
+  environmentStore: Pick<EnvironmentStore, "capability" | "resolveRuntime"> | undefined,
+): Promise<ShellExecutionResult> {
+  let resolved = runtime;
+  if (!resolved) {
+    if (!environmentStore?.capability.available) {
+      throw new Error("Shell execution on the direct-execution provider (Windows) requires the scientific environment capability");
+    }
+    resolved = environmentStore.resolveRuntime(undefined, "python");
+  }
+  const shellPath = environmentShellPath(resolved.prefixPath);
+  try {
+    await access(shellPath);
+  } catch {
+    throw new Error(
+      `Shell execution on the direct-execution provider requires m2-bash in the managed environment `
+      + `(expected at ${shellPath}). Recreate or update the starter environment to add it.`,
+    );
+  }
+
+  const maxWorkspaceBytes = resolveQuotaBytes(request.maxWorkspaceBytes, config.maxWorkspaceBytes, "maxWorkspaceBytes");
+  const maxOutputBytes = resolveQuotaBytes(request.maxOutputBytes, config.maxOutputBytes, "maxOutputBytes");
+  const workspaceRoot = await validatedWorkspace(config.dataDir, request.workspaceRoot);
+  await assertWorkspaceWithinQuota(workspaceRoot, maxWorkspaceBytes);
+  const before = await workspaceSnapshot(workspaceRoot);
+  const startedAt = new Date().toISOString();
+  const networkAccess = epochSandboxNetworkAccess(request.permissionEpoch);
+  let chdir = workspaceRoot;
+  if (request.cwd !== undefined) {
+    if (isAbsolute(request.cwd)) throw new Error("cwd must be workspace-relative");
+    const directory = await realpath(resolve(workspaceRoot, request.cwd));
+    const relativePath = relative(workspaceRoot, directory);
+    if (relativePath === ".." || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) {
+      throw new Error("cwd must remain inside the writable workspace");
+    }
+    if (!(await stat(directory)).isDirectory()) throw new Error("cwd must be a directory");
+    chdir = directory;
+  }
+  const egress = await prepareSandboxEgress(config.dataDir, networkAccess, gateways, "none", request.sandboxEgressProxy);
+  const launch = buildDirectLaunch({
+    chdir,
+    egress,
+    envProfile,
+    executable: shellPath,
+    language: "shell",
+    pathEnv: [
+      ...condaActivationPaths(resolved.prefixPath),
+      process.env.PATH ?? "",
+    ].filter(Boolean).join(delimiter),
+    workspaceRoot,
+  });
+  const processResult = await runSandboxed(
+    config,
+    launch,
+    ["--noprofile", "--norc", "-euo", "pipefail", "-s"],
+    request.code,
+    executionTimeoutMs(request.executionTimeoutMs, config.execTimeoutMs),
+    workspaceRoot,
+    signal,
+    "Shell execution",
+    maxWorkspaceBytes,
+    maxOutputBytes,
+    "baseline",
+    onOutput,
+  );
+  await assertWorkspaceWithinQuota(workspaceRoot, maxWorkspaceBytes);
+
+  const after = await workspaceSnapshot(workspaceRoot);
+  const createdFiles = [...after.keys()].filter((path) => !before.has(path)).toSorted();
+  const modifiedFiles = [...after.entries()]
+    .filter(([path, fingerprint]) => before.has(path) && before.get(path) !== fingerprint)
+    .map(([path]) => path)
+    .toSorted();
+  return {
+    ...processResult,
+    cgroupMode: RESOURCE_LIMIT_MODE,
+    createdFiles,
+    environmentRevisionId: resolved.revision.id,
+    environmentVariables: launch.env,
+    executionId: request.executionId,
+    finishedAt: new Date().toISOString(),
+    kernelId: `ephemeral:${request.executionId}`,
+    kernelMode: "ephemeral",
+    language: "shell",
+    modifiedFiles,
+    networkAccessRevision: networkAccess.revision,
+    networkPolicy: networkAccess.mode,
+    runnerVersion: RUNNER_VERSION,
+    sandbox: "none",
     startedAt,
     workingDirectory: launch.chdir,
   };

@@ -21,7 +21,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TestContext } from "node:test";
 
-import { condaActivationPaths, environmentInterpreterPath, micromambaBinaryName, packageInstallGuidance, renameReplace, restrictToOwner, starterPackages, terminateTree } from "./index.js";
+import { condaActivationPaths, environmentInterpreterPath, environmentShellPath, micromambaBinaryName, packageInstallGuidance, renameReplace, restrictToOwner, starterPackages, terminateTree } from "./index.js";
 
 function processAlive(pid: number): boolean {
   // tasklist exit code stays 0 even for no match, so inspect the output.
@@ -107,9 +107,16 @@ test("renameReplace replaces an existing destination", async (context) => {
 test("starterPackages swaps matplotlib for matplotlib-base on win32 (炸点③-17)", () => {
   // qt6's in-package qml test resources exceed MAX_PATH even under a shallow
   // prefix; agents render via Agg to files, so matplotlib-base loses nothing.
+  // F5.3: m2-bash (MSYS2 bash) is bundled so run_shell works on the
+  // direct-execution provider — Windows hosts have no system bash.
   assert.deepEqual(starterPackages("python"),
-    ["python=3.12", "numpy=2.0", "pandas=2.2", "scipy=1.14", "matplotlib-base=3.9"]);
+    ["python=3.12", "numpy=2.0", "pandas=2.2", "scipy=1.14", "matplotlib-base=3.9", "m2-bash"]);
   assert.deepEqual(starterPackages("r"), ["r-base=4.4", "r-tidyverse=2.0", "r-data.table=1.16"]);
+});
+
+test("environmentShellPath resolves the m2-bash location inside a win-64 prefix (F5.3)", () => {
+  // 已实证：m2-bash 装进 win-64 conda 前缀后落在 Library\usr\bin\bash.exe。
+  assert.equal(environmentShellPath("C:\\envs\\rev-1"), "C:\\envs\\rev-1\\Library\\usr\\bin\\bash.exe");
 });
 
 test("packageInstallGuidance explains missing win-64 builds with alternatives (F4.4)", () => {

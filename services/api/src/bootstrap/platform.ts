@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import { ExecutionRouter } from "@sciencediscovery/execution-router";
 import { createIdeaResearchClient } from "../idea-tree/research.js";
 import { resolve } from "node:path";
 
@@ -47,7 +48,7 @@ import { EvolveSidecarClient } from "../evolution/sidecar.js";
 import { EvolutionStore } from "../evolution/store.js";
 import { startProposedRun, summariseRun } from "../evolution/proposal.js";
 import type { EvolveRuntimeFactory } from "../runs/index.js";
-import { recoverSessionRuns, scheduleSessionRuns } from "../runs/index.js";
+import { publishApprovalModeChange, recoverSessionRuns, scheduleSessionRuns } from "../runs/index.js";
 import type { SkillLibraryCatalog } from "../skill-library-catalog.js";
 import { SkillCatalog } from "@sciencediscovery/specialist";
 import { SessionStore } from "../store.js";
@@ -144,6 +145,43 @@ export function createPlatformServices(
   }, config.memoryGraph.neo4jPassword, config.memoryGraph.available !== false);
   const skillCatalog = new SkillCatalog(config.dataDir, repositoryRoot);
   const runnerClient = new RunnerClient(config.runnerUrl, config.runnerToken);
+  // F5 执行路由层：注册表 + 能力探测（复用 runner 的 /execution-capability
+  // 与 /health，不新增 wire 格式）。B/C 在 P1 为留桩；refresh 重探走
+  // POST /api/execution-provider。
+  const executionRouter = new ExecutionRouter({
+    sources: {
+      runnerCapability: () => runnerClient.executionCapability(),
+      runnerHealth: () => runnerClient.health(),
+    },
+    probe: { log: (message) => apiLog.warn("execution_router_probe", { message }) },
+    onProviderDowngrade: async (event) => {
+      // 0.B1 §5 Provider 降级钩子：B/C → A 时全部 always_allow 会话强制降为
+      // ask_for_dangerous（复用 setApprovalMode 的 Permission Epoch 语义）。
+      let forced = 0;
+      for (const project of store.listProjects()) {
+        for (const session of store.listSessions(project.id, "all")) {
+          if (session.approvalMode !== "always_allow") continue;
+          const modeChange = await store.setApprovalMode(
+            session.id,
+            "ask_for_dangerous",
+            "Execution provider lost its sandbox; approval mode was tightened",
+          );
+          await publishApprovalModeChange(store, session.id, {
+            approvalMode: modeChange.session.approvalMode,
+            permissionEpochId: modeChange.permissionEpoch.id,
+            previousApprovalMode: "always_allow",
+          });
+          forced += 1;
+        }
+      }
+      event.forcedSessions = forced;
+      apiLog.warn("execution_provider_downgraded", {
+        forcedSessions: forced,
+        from: event.from.provider,
+        to: event.to.provider,
+      });
+    },
+  });
   const ideaTreeAuthorities = createIdeaTreeAuthorityRegistry();
 
   mgLog.setDataDir(config.dataDir);
@@ -444,6 +482,7 @@ export function createPlatformServices(
     evolveOrchestrator,
     evolveRunTokens,
     evolveRuntimeFactory,
+    executionRouter,
     ideaResearch,
     ideaTreeAuthorities,
     ideaTreeRepository,

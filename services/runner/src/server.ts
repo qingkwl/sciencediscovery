@@ -977,9 +977,9 @@ export function createRunnerServer(
         const accepted = managedExecutions.start(execution, (signal, log) => execution.environmentId
           ? environmentStore?.withRuntime(execution.environmentId, (runtime) => {
               if (signal.aborted) throw new Error("Execution cancelled before environment admission");
-              return executeShell(executorConfig, execution, signal, undefined, gateways, runtime, log);
+              return executeShell(executorConfig, execution, signal, undefined, gateways, runtime, log, environmentStore);
             }) ?? Promise.reject(new Error("Scientific environments are unavailable"))
-          : executeShell(executorConfig, execution, signal, undefined, gateways, undefined, log));
+          : executeShell(executorConfig, execution, signal, undefined, gateways, undefined, log, environmentStore));
         sendJson(response, 202, accepted);
         return;
       }
@@ -1011,9 +1011,9 @@ export function createRunnerServer(
           () => execution.environmentId
             ? environmentStore?.withRuntime(execution.environmentId, (runtime) => {
                 if (signal.aborted) throw new Error("Runner execution aborted before start");
-                return executeShell(executorConfig, execution, signal, undefined, gateways, runtime);
+                return executeShell(executorConfig, execution, signal, undefined, gateways, runtime, undefined, environmentStore);
               }) ?? Promise.reject(new Error("Scientific environments are unavailable"))
-            : executeShell(executorConfig, execution, signal, undefined, gateways),
+            : executeShell(executorConfig, execution, signal, undefined, gateways, undefined, undefined, environmentStore),
         )));
         return;
       }

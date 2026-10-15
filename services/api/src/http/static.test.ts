@@ -16,7 +16,9 @@ import { createTest } from "../../../../test/support/tagged/compat.mjs";
 // No os/arch tags: the containment check must hold on every platform.
 // On Windows mkdtemp hands us a backslash path, which is exactly the
 // regression shape from 炸点③-11 (SPA 400 on every path).
-const { test } = createTest(import.meta.url);
+// [windows-desktop] F5 顺手修复：tagged-test 改造（a680f60b）后 createTest
+// 要求第二参，此调用点是仓内唯一漏改的（基线 typecheck 即红，非 F5 引入）。
+const { test } = createTest(import.meta.url, { tags: [] });
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import type { ServerResponse } from "node:http";
