@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { chmod } from "node:fs/promises";
+import { chmod, rename } from "node:fs/promises";
+import { resolve } from "node:path";
 
-import type { OsAdaptation } from "./types.js";
+import { STARTER_PACKAGE_SPECS, type OsAdaptation } from "./types.js";
 
 export const posixAdaptation: OsAdaptation = {
   restrictToOwner(path, options) {
@@ -22,5 +23,22 @@ export const posixAdaptation: OsAdaptation = {
   },
   terminateTree(child) {
     return child.kill("SIGKILL");
+  },
+  micromambaBinaryName: "micromamba",
+  environmentInterpreterPath(prefixPath, language) {
+    return resolve(prefixPath, "bin", language === "python" ? "python" : "R");
+  },
+  condaActivationPaths(prefixPath) {
+    return [resolve(prefixPath, "bin")];
+  },
+  renameReplace(source, destination) {
+    return rename(source, destination);
+  },
+  starterPackages(language) {
+    return [...STARTER_PACKAGE_SPECS[language]];
+  },
+  packageInstallGuidance() {
+    // F4.4: posix keeps the upstream solver error verbatim.
+    return null;
   },
 };

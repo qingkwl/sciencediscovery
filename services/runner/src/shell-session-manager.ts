@@ -21,6 +21,7 @@ import {
   SYSTEM_SHELL_SEATBELT_ENVIRONMENT_REVISION_ID,
   epochSandboxNetworkAccess,
   type KernelSession,
+  type SandboxKind,
   type SandboxNetworkAccess,
   type ShellExecutionRequest,
   type ShellExecutionResult,
@@ -308,7 +309,7 @@ class ManagedShellSession {
 
 export interface ShellSessionManagerConfig {
   bwrapPath: string;
-  sandboxProvider?: "bubblewrap" | "seatbelt";
+  sandboxProvider?: SandboxKind;
   seatbeltPath?: string;
   dataDir: string;
   /** Wall-clock limit for a single evaluation inside a session. */
@@ -563,6 +564,11 @@ export class ShellSessionManager {
     // A fresh session always starts from the clearenv baseline: the profile is
     // produced by this shell, not consumed by it.
     const sandbox = executorSandboxKind(this.config);
+    if (sandbox === "none") {
+      // [windows-desktop] F4.3: no bash on a native Windows host; shell
+      // sessions return when the WSL sandbox plugin (Provider B) is installed.
+      throw new Error("Shell sessions require a sandboxed runner; the direct-execution provider (Windows) does not support shell");
+    }
     const launch = await prepareSandboxLaunch(this.config, {
       chdir: workspaceBinds.chdir,
       egress: await prepareSandboxEgress(this.config.dataDir, networkAccess, this.gateways, sandbox, request.sandboxEgressProxy),

@@ -22,7 +22,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TestContext } from "node:test";
 
-import { restrictToOwner, terminateTree } from "./index.js";
+import { condaActivationPaths, environmentInterpreterPath, micromambaBinaryName, packageInstallGuidance, renameReplace, restrictToOwner, starterPackages, terminateTree } from "./index.js";
 
 test("terminateTree keeps the upstream single-child SIGKILL semantics", async (context) => {
   const child = spawn(process.execPath, ["-e", "setInterval(()=>{},1e3)"], { stdio: "ignore" });
@@ -44,4 +44,27 @@ test("restrictToOwner chmods 0600 on a file", async (context) => {
   await restrictToOwner(file);
 
   assert.equal((await stat(file)).mode & 0o777, 0o600);
+});
+
+test("micromamba binary name has no extension on POSIX", () => {
+  assert.equal(micromambaBinaryName, "micromamba");
+});
+
+test("environmentInterpreterPath follows the POSIX conda layout", () => {
+  assert.equal(environmentInterpreterPath("/envs/rev-1", "python"), "/envs/rev-1/bin/python");
+  assert.equal(environmentInterpreterPath("/envs/rev-1", "r"), "/envs/rev-1/bin/R");
+});
+
+test("condaActivationPaths is just bin/ on POSIX", () => {
+  assert.deepEqual(condaActivationPaths("/envs/rev-1"), ["/envs/rev-1/bin"]);
+});
+
+test("starterPackages keep the upstream matplotlib spec on POSIX", () => {
+  assert.deepEqual(starterPackages("python"),
+    ["python=3.12", "numpy=2.0", "pandas=2.2", "scipy=1.14", "matplotlib=3.9"]);
+  assert.deepEqual(starterPackages("r"), ["r-base=4.4", "r-tidyverse=2.0", "r-data.table=1.16"]);
+});
+
+test("packageInstallGuidance passes solver errors through unchanged on POSIX (F4.4)", () => {
+  assert.equal(packageInstallGuidance("critical libmamba Could not solve for environment specs"), null);
 });

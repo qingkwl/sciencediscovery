@@ -22,6 +22,7 @@ import {
   type KernelSession,
   type PythonExecutionRequest,
   type PythonExecutionResult,
+  type SandboxKind,
   type SandboxNetworkAccess,
   type ScientificLanguage,
 } from "@sciencediscovery/schema";
@@ -272,7 +273,7 @@ class ManagedKernel {
 
 export interface KernelManagerConfig {
   bwrapPath: string;
-  sandboxProvider?: "bubblewrap" | "seatbelt";
+  sandboxProvider?: SandboxKind;
   seatbeltPath?: string;
   dataDir: string;
   /** Wall-clock limit for a single evaluation inside a kernel. */
@@ -556,6 +557,11 @@ export class KernelManager {
       request.permissionEpoch.id,
     );
     const sandbox = executorSandboxKind(this.config);
+    if (sandbox === "none") {
+      // [windows-desktop] F4.3: persistent kernels are not supported by the
+      // direct-execution provider; ephemeral execution stays available.
+      throw new Error("Persistent kernels require a sandboxed runner; the direct-execution provider (Windows) supports ephemeral Python only");
+    }
     const launch = await prepareSandboxLaunch(this.config, {
       chdir: await resolveProfileChdir(envProfile, workspaceBinds, workspaceRoot, readOnlyWorkspaceRoot),
       egress: await prepareSandboxEgress(this.config.dataDir, networkAccess, this.gateways, sandbox, request.sandboxEgressProxy),

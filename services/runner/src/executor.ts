@@ -15,7 +15,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { access, mkdir, mkdtemp, open, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { userInfo } from "node:os";
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { dirname, delimiter, isAbsolute, relative, resolve, sep } from "node:path";
 
 import {
   detectSandboxCapability,
@@ -58,7 +58,7 @@ import type { EnvironmentStore } from "./environment-store.js";
 import { buildSeatbeltProfile, canonicalPath, seatbeltPwdShim, seatbeltWorkspaceMapping } from "./seatbelt.js";
 // [windows-desktop] reason: F3.2 —— Windows 无 SIGKILL 语义与进程组，
 // 杀子进程统一走 platform/ 适配层（posix=child.kill 透传，win32=taskkill /T /F）。
-import { terminateTree } from "./platform/index.js";
+import { condaActivationPaths, terminateTree } from "./platform/index.js";
 import { RunnerSkillPackages } from "./skill-packages.js";
 
 import { RUNNER_VERSION } from "./version.js";
@@ -103,7 +103,7 @@ const OUTPUT_TRUNCATION_MARKER = (limit: number) =>
 export interface SandboxRuntimeConfig {
   bwrapPath: string;
   /** Resolved sandbox implementation. Defaults from the host platform. */
-  sandboxProvider?: "bubblewrap" | "seatbelt";
+  sandboxProvider?: SandboxKind;
   /** macOS Seatbelt launcher. */
   seatbeltPath?: string;
   dataDir: string;
@@ -515,6 +515,11 @@ async function localPythonPackagePath(config: ExecutorConfig): Promise<string | 
 
 async function nativePythonPath(config: ExecutorConfig, sandbox: SandboxKind): Promise<string> {
   if (config.pythonPath) return config.pythonPath;
+  if (sandbox === "none") {
+    // [windows-desktop] F4.3: no fixed system interpreter path on Windows;
+    // resolve `python` through PATH at spawn time.
+    return "python";
+  }
   if (sandbox === "seatbelt") {
     const commandLineToolsPython = "/Library/Developer/CommandLineTools/usr/bin/python3";
     try {
@@ -691,7 +696,10 @@ export async function prepareSandboxEgress(
   if (!gateways) {
     throw new EgressBridgeUnavailableError("this runner was started without an egress gateway registry");
   }
-  if (sandbox === "seatbelt") {
+  if (sandbox !== "bubblewrap") {
+    // [windows-desktop] F4.3: "none" (Windows direct execution) filters egress
+    // the same way Seatbelt does — a runner-owned loopback TCP gateway plus
+    // proxy environment variables; there are no namespace binds to set up.
     const gateway = await gateways.acquireTcp(access, proxy);
     return {
       bindArgs: [],
@@ -933,6 +941,54 @@ export interface PreparedSandboxOptions {
   workspaceRoot: string;
 }
 
+/**
+ * [windows-desktop] F4.3: direct (unsandboxed) launch. The child inherits the
+ * host environment — Windows processes need SystemRoot & co. — with the conda
+ * activation paths prepended to PATH (炸点③-18: win-64 interpreters
+ * delay-load DLLs from Library\bin) and the operator's own Python overrides
+ * stripped so they cannot leak into the managed environment.
+ */
+function buildDirectLaunch(options: {
+  chdir: string;
+  egress?: SandboxEgress;
+  envProfile?: SessionEnvProfile;
+  executable: string;
+  language: "python" | "r" | "shell";
+  pathEnv: string;
+  workspaceRoot: string;
+}): SandboxLaunch {
+  const env: Record<string, string> = {};
+  for (const [name, value] of Object.entries(process.env)) {
+    if (value !== undefined) env[name] = value;
+  }
+  // Windows environment variables are case-insensitive ("Path" vs "PATH").
+  const strip = (target: string) => {
+    for (const name of Object.keys(env)) {
+      if (name.toUpperCase() === target) delete env[name];
+    }
+  };
+  strip("PATH");
+  strip("PYTHONHOME");
+  strip("PYTHONPATH");
+  strip("PYTHONUSERBASE");
+  env.PATH = options.pathEnv;
+  env.HOME = options.workspaceRoot;
+  if (options.language === "python") env.PYTHONNOUSERSITE = "1";
+  Object.assign(env, options.egress?.env ?? {});
+  for (const [name, value] of Object.entries(options.envProfile?.variables ?? {})) {
+    if (profileKeyAllowed(name)) env[name] = value;
+  }
+  return {
+    args: [],
+    chdir: options.chdir,
+    commandPrefix: [],
+    env,
+    executable: options.executable,
+    hostCwd: options.chdir,
+    sandbox: "none",
+  };
+}
+
 /** Build one platform-neutral launch used by ephemeral and persistent tools. */
 export async function prepareSandboxLaunch(
   config: SandboxRuntimeConfig,
@@ -951,7 +1007,8 @@ export async function prepareSandboxLaunch(
 
 /** Host path for a command or injected runtime, preserving Linux mount paths. */
 export function sandboxCommandPath(launch: SandboxLaunch, linuxPath: string, hostPath: string): string {
-  return launch.sandbox === "seatbelt" ? hostPath : linuxPath;
+  // Bubblewrap sees the Linux mount path; Seatbelt and "none" run the host path.
+  return launch.sandbox === "bubblewrap" ? linuxPath : hostPath;
 }
 
 const sandboxProcessGroups = new WeakSet<ChildProcessWithoutNullStreams>();
@@ -977,12 +1034,29 @@ export async function spawnSandboxProcess(
   commandArguments: string[],
   seccompVariant: SeccompVariant,
 ): Promise<ChildProcessWithoutNullStreams> {
+  const kind = launch.sandbox ?? executorSandboxKind(config);
+  if (kind === "none") {
+    // [windows-desktop] F4.3: no namespace init, no seccomp — spawn the
+    // interpreter directly. killSandboxProcess routes this through
+    // terminateTree (taskkill /T on win32), so timeout/abort still work.
+    try {
+      return spawn(launch.executable!, [...launch.commandPrefix, ...commandArguments], {
+        cwd: launch.hostCwd,
+        env: launch.env,
+        stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true,
+      }) as ChildProcessWithoutNullStreams;
+    } catch (error) {
+      await launch.cleanup?.().catch(() => undefined);
+      throw error;
+    }
+  }
   let filter: Awaited<ReturnType<typeof open>> | undefined;
   try {
-    if ((launch.sandbox ?? executorSandboxKind(config)) === "bubblewrap") {
+    if (kind === "bubblewrap") {
       filter = await open(await ensureSeccompFilter(config.dataDir, seccompVariant), "r");
     }
-    const processGroup = (launch.sandbox ?? executorSandboxKind(config)) === "bubblewrap";
+    const processGroup = kind === "bubblewrap";
     const child = spawn(launch.executable ?? config.bwrapPath, [
       // Node establishes a new session before exec. Keep bwrap's namespace init
       // in that group: --new-session would move it out of reach of group kill.
@@ -1052,20 +1126,41 @@ export async function executePython(
   const environmentRevisionId = runtime?.revision.id
     ?? request.environmentRevisionId
     ?? request.permissionEpoch.environmentRevisionId;
-  const hostInterpreterMasks = runtime ? await hostInterpreterMaskArguments() : [];
+  const sandbox = executorSandboxKind(config);
+  if (sandbox === "none" && language !== "python") {
+    // [windows-desktop] F4.3: only the Python path is verified for direct
+    // execution; fail clearly instead of half-launching R.
+    throw new Error("R execution requires a sandboxed runner; the direct-execution provider (Windows) supports Python only");
+  }
+  // Host interpreter masks are bwrap bind arguments; Seatbelt and direct
+  // execution never consume them, and /usr/bin does not exist on Windows.
+  const hostInterpreterMasks = runtime && sandbox === "bubblewrap" ? await hostInterpreterMaskArguments() : [];
   const hostRuntimeSupport = await resolveHostRuntimeSupport(config.dataDir);
   const localPythonPackages = !runtime && language === "python"
     ? await localPythonPackagePath(config)
     : undefined;
   const workspaceBinds = workspaceBindArguments(workspaceRoot, readOnlyWorkspaceRoot);
-  const sandbox = executorSandboxKind(config);
   const hostPython = !runtime && language === "python" ? await nativePythonPath(config, sandbox) : undefined;
   const npu = await resolveExecutionNpu(config, request.npuDevices,
     async () => await sandboxLaunchProfile(config.bwrapPath));
-  const launch = await prepareSandboxLaunch(config, {
+  const egress = await prepareSandboxEgress(config.dataDir, networkAccess, gateways, sandbox, request.sandboxEgressProxy);
+  const launch = sandbox === "none"
+    ? buildDirectLaunch({
+        chdir: workspaceRoot,
+        egress,
+        envProfile,
+        executable: runtime ? runtime.interpreterPath : hostPython!,
+        language,
+        pathEnv: [
+          ...(runtime ? condaActivationPaths(runtime.prefixPath) : []),
+          process.env.PATH ?? "",
+        ].filter(Boolean).join(delimiter),
+        workspaceRoot,
+      })
+    : await prepareSandboxLaunch(config, {
     npu,
     chdir: await resolveProfileChdir(envProfile, workspaceBinds, workspaceRoot, readOnlyWorkspaceRoot),
-    egress: await prepareSandboxEgress(config.dataDir, networkAccess, gateways, sandbox, request.sandboxEgressProxy),
+    egress,
     environmentBinds: runtime
       ? environmentPrefixBindArguments(runtime.prefixPath)
       : localPythonPackageBindArguments(localPythonPackages),
@@ -1089,7 +1184,13 @@ export async function executePython(
     workspaceBindArgs: workspaceBinds.args,
     workspaceRoot,
   });
-  const commandArguments = [
+  const commandArguments = sandbox === "none"
+    ? [
+        // The interpreter is the launch executable; argv carries flags only.
+        ...(localPythonPackages ? [] : ["-I"]),
+        "-",
+      ]
+    : [
     runtime
       ? sandboxCommandPath(
           launch,
@@ -1157,6 +1258,11 @@ export async function executeShell(
 ): Promise<ShellExecutionResult> {
   if (!request.code.trim()) throw new Error("Shell code is required");
   if (!request.executionId?.trim()) throw new Error("Execution ID is required");
+  if (executorSandboxKind(config) === "none") {
+    // [windows-desktop] F4.3: no bash on a native Windows host; the agent's
+    // shell tool is disabled until the WSL sandbox plugin (F5 Provider B).
+    throw new Error("Shell execution requires a sandboxed runner; the direct-execution provider (Windows) does not support shell");
+  }
   const networkAccess = epochSandboxNetworkAccess(request.permissionEpoch);
   if (request.permissionEpoch.mounts.length !== 1
     || request.permissionEpoch.mounts[0]?.source !== "workspace"

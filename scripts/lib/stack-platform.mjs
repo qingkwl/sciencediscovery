@@ -148,10 +148,19 @@ export async function waitHealthy(name, url, { timeoutSeconds = 10, intervalMs =
   return false;
 }
 
+/** Resolve a service command against the environment its child will get:
+ *  callers pass *overrides* (e.g. { UV_PROJECT_ENVIRONMENT }), and looking up
+ *  the command in the overrides alone finds no PATH at all. */
+export function serviceCommand(command, env) {
+  return command.includes(sep) || command.includes("/")
+    ? command
+    : findOnPath(command, { ...process.env, ...env });
+}
+
 /** Spawn a long-lived stack process. argv[0] is an absolute interpreter or a
  *  bare command resolved through PATH (.cmd suffix handled by findOnPath). */
 export function spawnService(command, args, { env, cwd, stdio = "inherit" } = {}) {
-  const resolved = command.includes(sep) || command.includes("/") ? command : findOnPath(command, env);
+  const resolved = serviceCommand(command, env);
   if (!resolved) throw new Error(`command not found on PATH: ${command}`);
   return spawn(resolved, args, {
     cwd,

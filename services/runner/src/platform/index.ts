@@ -24,4 +24,10 @@ const adaptation: OsAdaptation = process.platform === "win32" ? win32Adaptation 
 
 export const restrictToOwner: OsAdaptation["restrictToOwner"] = adaptation.restrictToOwner;
 export const terminateTree: OsAdaptation["terminateTree"] = adaptation.terminateTree;
+export const micromambaBinaryName: OsAdaptation["micromambaBinaryName"] = adaptation.micromambaBinaryName;
+export const environmentInterpreterPath: OsAdaptation["environmentInterpreterPath"] = adaptation.environmentInterpreterPath;
+export const condaActivationPaths: OsAdaptation["condaActivationPaths"] = adaptation.condaActivationPaths;
+export const renameReplace: OsAdaptation["renameReplace"] = adaptation.renameReplace;
+export const starterPackages: OsAdaptation["starterPackages"] = adaptation.starterPackages;
+export const packageInstallGuidance: OsAdaptation["packageInstallGuidance"] = adaptation.packageInstallGuidance;
 export type { RestrictToOwnerOptions } from "./types.js";

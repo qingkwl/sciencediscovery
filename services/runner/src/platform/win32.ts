@@ -13,8 +13,10 @@
 // limitations under the License.
 
 import { spawn, spawnSync } from "node:child_process";
+import { rename } from "node:fs/promises";
+import { resolve } from "node:path";
 
-import type { OsAdaptation } from "./types.js";
+import { STARTER_PACKAGE_SPECS, type OsAdaptation } from "./types.js";
 
 /**
  * Windows equivalents (F3.2/F3.3): there is no SIGTERM/SIGKILL and no POSIX
@@ -55,5 +57,57 @@ export const win32Adaptation: OsAdaptation = {
     // SIGTERM's "please exit" has no console equivalent, so force is honest.
     const result = spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" });
     return result.status === 0;
+  },
+  micromambaBinaryName: "micromamba.exe",
+  environmentInterpreterPath(prefixPath, language) {
+    // win-64 conda layout: python.exe at the prefix root, R.exe under Scripts/.
+    return language === "python"
+      ? resolve(prefixPath, "python.exe")
+      : resolve(prefixPath, "Scripts", "R.exe");
+  },
+  condaActivationPaths(prefixPath) {
+    // 炸点③-18: win-64 python.exe delay-loads numpy/scipy DLLs from
+    // Library\bin; without these on PATH the import dies with 0xC06D007F.
+    return [prefixPath, resolve(prefixPath, "Library", "bin"), resolve(prefixPath, "Scripts")];
+  },
+  async renameReplace(source, destination) {
+    // 炸点③-13: AV scanners and search indexers briefly hold freshly written
+    // files; rename-over-existing then reports EPERM/EACCES/EBUSY. Back off
+    // and retry — the window is tens of milliseconds.
+    const retryable = new Set(["EPERM", "EACCES", "EBUSY"]);
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      try {
+        return await rename(source, destination);
+      } catch (error) {
+        lastError = error;
+        if (!retryable.has((error as NodeJS.ErrnoException).code ?? "")) throw error;
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 50 + attempt * 25));
+      }
+    }
+    throw lastError;
+  },
+  starterPackages(language) {
+    // 炸点③-17: matplotlib pulls qt6, whose qml test resources exceed MAX_PATH
+    // on any realistic prefix; matplotlib-base (Agg/file rendering, what agents
+    // actually use) drops the whole qt6 tree.
+    if (language === "python") {
+      return STARTER_PACKAGE_SPECS.python
+        .map((spec) => (spec === "matplotlib=3.9" ? "matplotlib-base=3.9" : spec));
+    }
+    return [...STARTER_PACKAGE_SPECS[language]];
+  },
+  packageInstallGuidance(rawErrorMessage) {
+    // F4.4: conda-forge win-64 has real gaps (pysam, jaxlib, modern
+    // tensorflow — see client/docs-dev/win64-包兼容清单.md). Detect the
+    // solver's "not found" shapes and point at the workable alternatives
+    // instead of leaving a raw libmamba dump.
+    const missing = /nothing provides|PackagesNotFound|could not be located|Could not solve for environment specs|The following packages are incompatible/i
+      .test(rawErrorMessage);
+    if (!missing) return null;
+    return "This package may have no conda-forge win-64 build (Windows native). "
+      + "Alternatives: retry with manager=\"pip\" if a PyPI wheel exists; "
+      + "install the local sandbox engine (WSL) plugin for the full Linux package set; "
+      + "or use a remote execution provider.";
   },
 };
