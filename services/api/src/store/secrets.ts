@@ -13,7 +13,12 @@
 // limitations under the License.
 
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
-import { chmod, readFile, writeFile } from "node:fs/promises";
+import { chmod, readFile, rm, writeFile } from "node:fs/promises";
+
+// [windows-desktop] reason: F9 —— 主密钥落盘格式按平台走 platform/os 适配
+// （posix=恒等裸 32B，win32=DPAPI 包裹）；业务层零平台分支。
+import { renameReplace, secretProtector } from "../platform/os/index.js";
+import type { SecretProtector } from "../platform/os/types.js";
 
 import type {
   CreateModelProfileRequest,
@@ -193,26 +198,70 @@ export function normalizeApiToken(value: string | null | undefined): string | un
   return token;
 }
 
-export async function loadOrCreateModelSecretKey(path: string): Promise<Buffer> {
-  const readExisting = async (): Promise<Buffer> => {
-    const key = await readFile(path);
-    if (key.length !== MODEL_SECRET_KEY_BYTES) throw new Error("The model credential key has an invalid length");
+/**
+ * Load the model-secret master key, creating it on first start (F9).
+ *
+ * At-rest format follows the platform's protector: POSIX keeps the raw 32
+ * bytes behind 0600; Windows stores a DPAPI blob (CurrentUser scope). A
+ * legacy raw-key file on a wrapping platform is upgraded in place — racing
+ * writers wrap the same bytes, so last-write-wins is lossless. A blob that
+ * fails to unwrap (copied from another account/machine) is an error, never a
+ * silent regeneration: the old ciphertext would become undecryptable.
+ */
+export async function loadOrCreateModelSecretKey(
+  path: string,
+  protector: SecretProtector = secretProtector,
+): Promise<Buffer> {
+  const readKey = async (): Promise<{ key: Buffer; raw: boolean }> => {
+    const bytes = await readFile(path);
+    if (protector.isWrapped(bytes)) {
+      let key: Buffer;
+      try {
+        key = await protector.unwrap(bytes);
+      } catch (error) {
+        throw new Error(
+          "The stored model credential key cannot be decrypted; it may belong to a different Windows account or be corrupted",
+          { cause: error },
+        );
+      }
+      if (key.length !== MODEL_SECRET_KEY_BYTES) throw new Error("The model credential key has an invalid length");
+      return { key, raw: false };
+    }
+    if (bytes.length !== MODEL_SECRET_KEY_BYTES) throw new Error("The model credential key has an invalid length");
     await chmod(path, 0o600);
-    return key;
+    return { key: bytes, raw: true };
   };
+
+  let existing: { key: Buffer; raw: boolean };
   try {
-    return await readExisting();
+    existing = await readKey();
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    // First start. `wx` keeps the create race-safe: the loser of two
+    // services starting at once reads the winner's file back.
+    const key = randomBytes(MODEL_SECRET_KEY_BYTES);
+    const wrapped = protector.wrapsAtRest ? await protector.wrap(key) : key;
+    try {
+      await writeFile(path, wrapped, { flag: "wx", mode: 0o600 });
+      return key;
+    } catch (error2) {
+      if ((error2 as NodeJS.ErrnoException).code !== "EEXIST") throw error2;
+      existing = await readKey();
+    }
   }
-  const key = randomBytes(MODEL_SECRET_KEY_BYTES);
-  try {
-    await writeFile(path, key, { flag: "wx", mode: 0o600 });
-    return key;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    return await readExisting();
+
+  if (existing.raw && protector.wrapsAtRest) {
+    // Legacy raw key on a wrapping platform: upgrade in place, atomically.
+    const wrapped = await protector.wrap(existing.key);
+    const temp = `${path}.tmp`;
+    try {
+      await writeFile(temp, wrapped, { flag: "wx", mode: 0o600 });
+      await renameReplace(temp, path);
+    } finally {
+      await rm(temp, { force: true });
+    }
   }
+  return existing.key;
 }
 
 /**

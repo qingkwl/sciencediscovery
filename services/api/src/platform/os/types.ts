@@ -37,4 +37,26 @@ export interface OsAdaptation {
    * retries with backoff before giving up (炸点③-13).
    */
   renameReplace(source: string, destination: string): Promise<void>;
+  /**
+   * At-rest secret wrapping (F9). POSIX is the identity protector — file
+   * permissions carry the protection there; Windows wraps secrets with DPAPI
+   * (CurrentUser scope) so a copied or synced file is useless off this
+   * account.
+   */
+  secretProtector: SecretProtector;
+}
+
+/**
+ * Wraps raw secret bytes for at-rest storage and unwraps them on read.
+ * `isWrapped` lets a reader distinguish a wrapped payload from a legacy raw
+ * one without knowing the platform, so secret file formats stay
+ * platform-agnostic in the store layer.
+ */
+export interface SecretProtector {
+  /** True when the bytes are a wrapped payload this protector can unwrap. */
+  isWrapped(bytes: Buffer): boolean;
+  /** False when wrap() is the identity (protection relies on file ACLs). */
+  readonly wrapsAtRest: boolean;
+  wrap(plain: Buffer): Promise<Buffer>;
+  unwrap(wrapped: Buffer): Promise<Buffer>;
 }
