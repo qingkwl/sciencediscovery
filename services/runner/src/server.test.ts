@@ -763,6 +763,38 @@ test("workspace validation accepts remote roots without local projects and rejec
   assert.equal(await validatedWorkspace(dataDir, local), local);
 });
 
+test("workspace validation honors explicitly authorized extra roots and still rejects the rest (F6.2)", async (context) => {
+  const dataDir = await mkdtemp(resolve(process.cwd(), ".tmp", "extra-roots-validation-"));
+  context.after(() => rm(dataDir, { recursive: true, force: true }));
+  const shared = resolve(dataDir, "shared-data");
+  const sharedSession = resolve(shared, "team", "session-workspace");
+  await mkdir(sharedSession, { recursive: true });
+  const extraRoots = [shared, resolve(dataDir, "does-not-exist")];
+  // 授权目录（含其子目录）放行；不存在条目跳过不炸；白名单外依旧拒绝。
+  assert.equal(await validatedWorkspace(dataDir, sharedSession, extraRoots), sharedSession);
+  assert.equal(await validatedWorkspace(dataDir, shared, extraRoots), shared);
+  const outside = resolve(dataDir, "scientific-envs");
+  await mkdir(outside);
+  await assert.rejects(validatedWorkspace(dataDir, outside, extraRoots), /workspace must be inside/i);
+  // 未传 extraRoots 时授权目录不放行（默认白名单不变）。
+  await assert.rejects(validatedWorkspace(dataDir, sharedSession), /workspace must be inside/i);
+});
+
+test("loadRunnerConfig parses SCIENCE_RUNNER_EXTRA_WORKSPACE_ROOTS as a semicolon list (F6.2)", () => {
+  const cwd = resolve(process.cwd(), ".tmp");
+  const config = loadRunnerConfig({
+    SCIENCE_AGENT_DATA_DIR: "data",
+    SCIENCE_RUNNER_EXTRA_WORKSPACE_ROOTS: `E:\\shared;relative-dir;; D:\\another `,
+  }, cwd);
+  assert.deepEqual(config.extraWorkspaceRoots, [
+    resolve(cwd, "E:\\shared"),
+    resolve(cwd, "relative-dir"),
+    resolve(cwd, "D:\\another"),
+  ]);
+  const unset = loadRunnerConfig({ SCIENCE_AGENT_DATA_DIR: "data" }, cwd);
+  assert.equal(unset.extraWorkspaceRoots, undefined);
+});
+
 test("managed Shell HTTP submission detaches, exposes incremental logs, queues writers and cancels without a second Shell", async (context) => {
   const { dataDir, workspaceRoot } = await workspaceFixture(context);
   const server = createRunnerServer(config(dataDir));

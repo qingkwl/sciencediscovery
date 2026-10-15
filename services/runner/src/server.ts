@@ -303,7 +303,7 @@ async function resolveExecutionWorkspace(
     execution.workspaceRoot = await remoteWorkspaceRoot(config.dataDir, execution.runnerWorkspaceKey);
     delete execution.readOnlyWorkspaceRoot;
   }
-  execution.workspaceRoot = await validatedWorkspace(config.dataDir, execution.workspaceRoot);
+  execution.workspaceRoot = await validatedWorkspace(config.dataDir, execution.workspaceRoot, config.extraWorkspaceRoots);
 }
 
 function currentExecutionUser(): string {
@@ -361,6 +361,14 @@ export function loadRunnerConfig(env: NodeJS.ProcessEnv = process.env, cwd = rep
     sandboxProvider,
     seatbeltPath: env.SCIENCE_AGENT_SEATBELT_PATH?.trim() || "/usr/bin/sandbox-exec",
     dataDir: resolve(cwd, env.SCIENCE_AGENT_DATA_DIR?.trim() || ".sciencediscovery-data"),
+    // [windows-desktop] F6.2: `;`-separated operator-authorized workspace roots
+    // (direct-execution whitelist extension). Relative entries resolve against
+    // the runner cwd, exactly like SCIENCE_AGENT_DATA_DIR.
+    ...((() => {
+      const roots = (env.SCIENCE_RUNNER_EXTRA_WORKSPACE_ROOTS?.trim() || "")
+        .split(";").map((entry) => entry.trim()).filter(Boolean).map((entry) => resolve(cwd, entry));
+      return roots.length ? { extraWorkspaceRoots: roots } : {};
+    })()),
     execTimeoutMs,
     maxOutputBytes: parseByteQuota("SCIENCE_AGENT_MAX_OUTPUT_BYTES", DEFAULT_MAX_OUTPUT_BYTES),
     maxWorkspaceBytes: parseByteQuota("SCIENCE_AGENT_MAX_WORKSPACE_BYTES", DEFAULT_MAX_WORKSPACE_BYTES),
@@ -916,7 +924,7 @@ export function createRunnerServer(
         const environmentId = decodeURIComponent(installMatch[1]!);
         const workspaceRoot = input.runnerWorkspaceKey
           ? await validatedWorkspace(config.dataDir, await remoteWorkspaceRoot(config.dataDir, input.runnerWorkspaceKey))
-          : input.workspaceRoot ? await validatedWorkspace(config.dataDir, input.workspaceRoot) : undefined;
+          : input.workspaceRoot ? await validatedWorkspace(config.dataDir, input.workspaceRoot, config.extraWorkspaceRoots) : undefined;
         const previousRevisionId = environmentStore.list().find((environment) => environment.id === environmentId)?.currentRevisionId;
         const revision = await environmentStore.install(
           environmentId,

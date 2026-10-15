@@ -125,6 +125,12 @@ export interface ExecutorConfig extends SandboxRuntimeConfig {
   maxWorkspaceBytes: number;
   /** Combined stdout+stderr retain budget; 0 disables truncation. */
   maxOutputBytes: number;
+  /**
+   * [windows-desktop] F6.2: operator-authorized workspace roots (in addition to
+   * the data dir's projects/remote-workspaces) accepted by the workspace
+   * whitelist; configured via SCIENCE_RUNNER_EXTRA_WORKSPACE_ROOTS.
+   */
+  extraWorkspaceRoots?: string[];
 }
 
 export function executorSandboxKind(config: SandboxRuntimeConfig): SandboxKind {
@@ -237,11 +243,21 @@ export function appendBounded(
   return { text: truncateToBudget(combined, room), truncated: true };
 }
 
-export async function validatedWorkspace(dataDir: string, requested: string): Promise<string> {
+export async function validatedWorkspace(
+  dataDir: string,
+  requested: string,
+  /**
+   * [windows-desktop] F6.2: directories the operator explicitly authorized for
+   * direct execution beyond the data dir's projects/remote-workspaces roots.
+   * Each entry is realpath'd and prefix-matched exactly like the built-ins.
+   */
+  extraRoots: readonly string[] = [],
+): Promise<string> {
   const workspaceRoot = await realpath(requested);
   // Remote runners have their own persistent workspace tree and need not have
   // the control API's local projects tree. Never authorize the whole data dir.
   const dataRoot = await realpath(dataDir);
+  const authorized: Array<string | undefined> = [];
   for (const directory of ["projects", "remote-workspaces"]) {
     const root = await realpath(resolve(dataRoot, directory)).catch((error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT") return undefined;
@@ -249,9 +265,20 @@ export async function validatedWorkspace(dataDir: string, requested: string): Pr
     });
     if (!root) continue;
     if (directory === "remote-workspaces" && root !== resolve(dataRoot, directory)) continue;
+    authorized.push(root);
+  }
+  for (const entry of extraRoots) {
+    if (!entry.trim()) continue;
+    const root = await realpath(entry).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return undefined;
+      throw error;
+    });
+    if (root) authorized.push(root);
+  }
+  for (const root of authorized) {
     if (workspaceRoot === root || workspaceRoot.startsWith(`${root}${sep}`)) return workspaceRoot;
   }
-  throw new Error("Runner workspace must be inside the configured projects or remote-workspaces directory");
+  throw new Error("Runner workspace must be inside the configured projects or remote-workspaces directory (or an explicitly authorized workspace root)");
 }
 
 function relativeDescendantPath(parent: string, child: string): string | undefined {
@@ -692,7 +719,7 @@ export async function prepareSandboxEgress(
    */
   proxy?: ResolvedProxy,
 ): Promise<SandboxEgress | undefined> {
-  if (access.mode === "none") return undefined;
+  if (access.mode === "none" && sandbox === "bubblewrap") return undefined;
   if (!gateways) {
     throw new EgressBridgeUnavailableError("this runner was started without an egress gateway registry");
   }
@@ -700,6 +727,10 @@ export async function prepareSandboxEgress(
     // [windows-desktop] F4.3: "none" (Windows direct execution) filters egress
     // the same way Seatbelt does — a runner-owned loopback TCP gateway plus
     // proxy environment variables; there are no namespace binds to set up.
+    // [windows-desktop] F6.3: with an unsandboxed launch there is no namespace
+    // isolation, so the "none" policy must still fail closed: acquire the
+    // deny-all gateway instead of returning no egress, otherwise the child
+    // would inherit unrestricted host network — the opposite of the policy.
     const gateway = await gateways.acquireTcp(access, proxy);
     return {
       bindArgs: [],
@@ -971,10 +1002,20 @@ function buildDirectLaunch(options: {
   strip("PYTHONHOME");
   strip("PYTHONPATH");
   strip("PYTHONUSERBASE");
+  // [windows-desktop] F6.3: the host's proxy slots must never leak into a
+  // direct launch. A host NO_PROXY="*" (or an inherited corporate proxy)
+  // would silently bypass the egress gateway the policy selected, so every
+  // proxy slot is stripped and, when a policy is in force, rebuilt from the
+  // egress environment alone. Loopback stays direct for local services.
+  strip("HTTP_PROXY");
+  strip("HTTPS_PROXY");
+  strip("ALL_PROXY");
+  strip("NO_PROXY");
   env.PATH = options.pathEnv;
   env.HOME = options.workspaceRoot;
   if (options.language === "python") env.PYTHONNOUSERSITE = "1";
   Object.assign(env, options.egress?.env ?? {});
+  if (options.egress) env.NO_PROXY = "127.0.0.1,localhost";
   for (const [name, value] of Object.entries(options.envProfile?.variables ?? {})) {
     if (profileKeyAllowed(name)) env[name] = value;
   }
@@ -1104,10 +1145,10 @@ export async function executePython(
 
   const maxWorkspaceBytes = resolveQuotaBytes(request.maxWorkspaceBytes, config.maxWorkspaceBytes, "maxWorkspaceBytes");
   const maxOutputBytes = resolveQuotaBytes(request.maxOutputBytes, config.maxOutputBytes, "maxOutputBytes");
-  const workspaceRoot = await validatedWorkspace(config.dataDir, request.workspaceRoot);
+  const workspaceRoot = await validatedWorkspace(config.dataDir, request.workspaceRoot, config.extraWorkspaceRoots);
   await assertWorkspaceWithinQuota(workspaceRoot, maxWorkspaceBytes);
   const readOnlyWorkspaceRoot = request.readOnlyWorkspaceRoot
-    ? await validatedWorkspace(config.dataDir, request.readOnlyWorkspaceRoot)
+    ? await validatedWorkspace(config.dataDir, request.readOnlyWorkspaceRoot, config.extraWorkspaceRoots)
     : undefined;
   const skillRoots = await resolveSandboxSkillRoots(config.dataDir, workspaceRoot, request.skillPackagesRoot);
   const before = await workspaceSnapshot(workspaceRoot);
@@ -1273,10 +1314,10 @@ export async function executeShell(
 
   const maxWorkspaceBytes = resolveQuotaBytes(request.maxWorkspaceBytes, config.maxWorkspaceBytes, "maxWorkspaceBytes");
   const maxOutputBytes = resolveQuotaBytes(request.maxOutputBytes, config.maxOutputBytes, "maxOutputBytes");
-  const workspaceRoot = await validatedWorkspace(config.dataDir, request.workspaceRoot);
+  const workspaceRoot = await validatedWorkspace(config.dataDir, request.workspaceRoot, config.extraWorkspaceRoots);
   await assertWorkspaceWithinQuota(workspaceRoot, maxWorkspaceBytes);
   const readOnlyWorkspaceRoot = request.readOnlyWorkspaceRoot
-    ? await validatedWorkspace(config.dataDir, request.readOnlyWorkspaceRoot)
+    ? await validatedWorkspace(config.dataDir, request.readOnlyWorkspaceRoot, config.extraWorkspaceRoots)
     : undefined;
   const skillRoots = await resolveSandboxSkillRoots(config.dataDir, workspaceRoot, request.skillPackagesRoot);
   const before = await workspaceSnapshot(workspaceRoot);
@@ -1415,7 +1456,7 @@ async function executeDirectShell(
 
   const maxWorkspaceBytes = resolveQuotaBytes(request.maxWorkspaceBytes, config.maxWorkspaceBytes, "maxWorkspaceBytes");
   const maxOutputBytes = resolveQuotaBytes(request.maxOutputBytes, config.maxOutputBytes, "maxOutputBytes");
-  const workspaceRoot = await validatedWorkspace(config.dataDir, request.workspaceRoot);
+  const workspaceRoot = await validatedWorkspace(config.dataDir, request.workspaceRoot, config.extraWorkspaceRoots);
   await assertWorkspaceWithinQuota(workspaceRoot, maxWorkspaceBytes);
   const before = await workspaceSnapshot(workspaceRoot);
   const startedAt = new Date().toISOString();

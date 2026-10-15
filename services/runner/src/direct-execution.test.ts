@@ -23,7 +23,8 @@ import type { TestContext } from "node:test";
 
 import type { PermissionEpoch } from "@sciencediscovery/schema";
 
-import { executePython, executeShell, spawnSandboxProcess } from "./executor.js";
+import { executePython, executeShell, spawnSandboxProcess, validatedWorkspace } from "./executor.js";
+import { EgressGatewayRegistry } from "./egress-gateway.js";
 import type { EnvironmentStore } from "./environment-store.js";
 import { condaActivationPaths } from "./platform/index.js";
 import { RunnerReadiness } from "./readiness.js";
@@ -39,6 +40,17 @@ function epoch(id = "epoch-test"): PermissionEpoch {
     secretRefs: [],
     sessionId: "session-test",
   };
+}
+
+/**
+ * F6.3: the none-sandbox direct paths now fail closed even for the "none"
+ * network policy (deny-all loopback gateway), so executions need a real
+ * gateway registry in tests, exactly as the server always provides one.
+ */
+function gatewaysFor(context: TestContext, dataDir: string): EgressGatewayRegistry {
+  const gateways = new EgressGatewayRegistry(dataDir, () => undefined);
+  context.after(() => gateways.close());
+  return gateways;
 }
 
 /** A real interpreter for the direct-execution run; the test skips without one. */
@@ -174,7 +186,7 @@ test("executeShell none runs the agent's code through the environment's m2-bash 
       permissionEpoch: epoch(),
       workspaceRoot,
     },
-    undefined, undefined, undefined, undefined, undefined, store,
+    undefined, undefined, gatewaysFor(context, dataDir), undefined, undefined, store,
   );
   assert.equal(result.exitCode, 0, result.stderr);
   assert.ok(result.stdout.includes("SHELL_OK"), result.stdout);
@@ -247,9 +259,157 @@ test("executePython none runs the interpreter directly with conda activation pat
     },
     undefined,
     store,
+    undefined,
+    gatewaysFor(context, dataDir),
   );
   assert.equal(result.exitCode, 0, result.stderr);
   assert.equal(result.stdout.includes(`PATH_HEAD=${condaActivationPaths(prefix).join("|")}`), true, result.stdout);
   assert.equal(result.stdout.includes("PYTHONHOME=None"), true, result.stdout);
   assert.ok(result.createdFiles.includes("out.txt"));
 });
+
+
+test("executePython none fails closed on network for the default none policy (F6.3)", async (context) => {
+  const python = hostPython();
+  if (!python) {
+    context.skip("no host python on PATH");
+    return;
+  }
+  const { dataDir, workspaceRoot } = await workspace(context);
+  const prefix = resolve(dataDir, "managed-env");
+  const store = {
+    capability: { available: true },
+    resolveRuntime: () => ({
+      interpreterPath: python,
+      prefixPath: prefix,
+      revision: { id: "rev-python" },
+    }),
+  } as unknown as EnvironmentStore;
+  // 默认 epoch 的网络策略就是 none：无沙箱直跑必须拿到 deny-all 网关的代理
+  // 环境（而不是继承宿主机网络），且宿主代理槽位（含 NO_PROXY）不得残留。
+  const result = await executePython(
+    { bwrapPath: "unused", dataDir, sandboxProvider: "none", execTimeoutMs: 60_000, maxOutputBytes: 1_000_000, maxWorkspaceBytes: 0 },
+    {
+      agentId: "main",
+      code: [
+        "import os",
+        "for key in ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY'):",
+        "    print(f'{key}=' + str(os.environ.get(key)))",
+      ].join("\n"),
+      environmentRevisionId: "rev-python",
+      executionId: "python-none-egress",
+      language: "python",
+      permissionEpoch: epoch(),
+      workspaceRoot,
+    },
+    undefined,
+    store,
+    undefined,
+    gatewaysFor(context, dataDir),
+  );
+  assert.equal(result.exitCode, 0, result.stderr);
+  const httpProxy = result.environmentVariables.HTTP_PROXY ?? "";
+  assert.match(httpProxy, /^http:\/\/127\.0\.0\.1:\d+$/, `HTTP_PROXY=${httpProxy}`);
+  assert.equal(result.environmentVariables.HTTPS_PROXY, httpProxy);
+  assert.equal(result.environmentVariables.ALL_PROXY, httpProxy);
+  assert.equal(result.environmentVariables.NO_PROXY, "127.0.0.1,localhost");
+  assert.ok(result.stdout.includes(`HTTP_PROXY=${httpProxy}`), result.stdout);
+  assert.ok(result.stdout.includes("NO_PROXY=127.0.0.1,localhost"), result.stdout);
+});
+
+test("executePython none blocks an outbound request through the deny-all gateway (F6.3)", async (context) => {
+  const python = hostPython();
+  if (!python) {
+    context.skip("no host python on PATH");
+    return;
+  }
+  const { dataDir, workspaceRoot } = await workspace(context);
+  const prefix = resolve(dataDir, "managed-env");
+  const store = {
+    capability: { available: true },
+    resolveRuntime: () => ({
+      interpreterPath: python,
+      prefixPath: prefix,
+      revision: { id: "rev-python" },
+    }),
+  } as unknown as EnvironmentStore;
+  const denied: Array<{ host?: string; reason?: string }> = [];
+  const gateways = new EgressGatewayRegistry(dataDir, (event, detail) => {
+    if (event === "denied") denied.push(detail);
+  });
+  context.after(() => gateways.close());
+  const result = await executePython(
+    { bwrapPath: "unused", dataDir, sandboxProvider: "none", execTimeoutMs: 60_000, maxOutputBytes: 1_000_000, maxWorkspaceBytes: 0 },
+    {
+      agentId: "main",
+      code: [
+        "import urllib.error, urllib.request",
+        "try:",
+        "    urllib.request.urlopen('http://example.com/', timeout=15)",
+        "    print('REQUEST_UNEXPECTEDLY_SUCCEEDED')",
+        "except urllib.error.HTTPError as error:",
+        "    body = error.read().decode('utf-8', 'replace').strip()",
+        "    print(f'HTTP_STATUS={error.code}')",
+        "    print(f'DENY_REASON={body}')",
+        "except Exception as error:  # noqa: BLE001",
+        "    print(f'OTHER_ERROR={error!r}')",
+      ].join("\n"),
+      environmentRevisionId: "rev-python",
+      executionId: "python-none-deny",
+      language: "python",
+      permissionEpoch: epoch(),
+      workspaceRoot,
+    },
+    undefined,
+    store,
+    undefined,
+    gateways,
+  );
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.ok(result.stdout.includes("HTTP_STATUS=403"), result.stdout);
+  assert.ok(result.stdout.includes("sandbox network access is disabled"), result.stdout);
+  assert.ok(!result.stdout.includes("REQUEST_UNEXPECTEDLY_SUCCEEDED"), result.stdout);
+  // 留痕：deny 事件带主机与原因落到注册表日志。
+  assert.ok(
+    denied.some((entry) => entry.host === "example.com" && /disabled/.test(entry.reason ?? "")),
+    JSON.stringify(denied),
+  );
+});
+
+
+test("workspace whitelist honors extra authorized roots and still rejects the rest (F6.2)", async (context) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "sd-extra-roots-"));
+  context.after(() => rm(dataDir, { force: true, recursive: true }));
+  const shared = resolve(dataDir, "shared-data");
+  const sharedSession = resolve(shared, "team", "session-workspace");
+  await mkdir(sharedSession, { recursive: true });
+  const extraRoots = [shared, resolve(dataDir, "does-not-exist")];
+  // 授权目录（含子目录）放行；不存在条目跳过不炸；白名单外依旧拒绝。
+  assert.equal(await validatedWorkspace(dataDir, sharedSession, extraRoots), sharedSession);
+  assert.equal(await validatedWorkspace(dataDir, shared, extraRoots), shared);
+  const outside = resolve(dataDir, "scientific-envs");
+  await mkdir(outside);
+  await assert.rejects(validatedWorkspace(dataDir, outside, extraRoots), /workspace must be inside/i);
+  // 不传 extraRoots 时授权目录不放行——默认白名单语义不变。
+  await assert.rejects(validatedWorkspace(dataDir, sharedSession), /workspace must be inside/i);
+});
+
+test("loadRunnerConfig parses SCIENCE_RUNNER_EXTRA_WORKSPACE_ROOTS (F6.2)", async () => {
+  const { loadRunnerConfig } = await import("./server.js");
+  const cwd = resolve(dataDirForConfig());
+  const config = loadRunnerConfig({
+    SCIENCE_AGENT_DATA_DIR: "data",
+    SCIENCE_RUNNER_EXTRA_WORKSPACE_ROOTS: `C:\\shared;relative-dir;; D:\\another `,
+  }, cwd);
+  assert.deepEqual(config.extraWorkspaceRoots, [
+    resolve(cwd, "C:\\shared"),
+    resolve(cwd, "relative-dir"),
+    resolve(cwd, "D:\\another"),
+  ]);
+  const unset = loadRunnerConfig({ SCIENCE_AGENT_DATA_DIR: "data" }, cwd);
+  assert.equal(unset.extraWorkspaceRoots, undefined);
+});
+
+function dataDirForConfig(): string {
+  return join(tmpdir(), "sd-load-config-");
+}

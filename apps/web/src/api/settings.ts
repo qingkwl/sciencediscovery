@@ -312,6 +312,12 @@ export class SettingsApiClient extends ArtifactsApiClient {
     return this.request("/api/sandbox-network-settings");
   }
 
+  /** [windows-desktop] F5/F6.4: execution-provider view; the UI only needs whether the current
+   * execution is sandboxed (false = host-direct, always-allow approval is server-side blocked). */
+  getExecutionProvider(): Promise<{ capability: { provider: string; sandboxed: boolean } }> {
+    return this.request("/api/execution-provider");
+  }
+
   replaceSandboxNetworkSettings(body: SandboxNetworkSettings): Promise<SandboxNetworkSettings> {
     return this.request("/api/sandbox-network-settings", { body: JSON.stringify(body), method: "PUT" });
   }

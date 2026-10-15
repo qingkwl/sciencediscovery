@@ -119,6 +119,19 @@ export const SUBAGENT_DELEGATION_SECTION = [
   "A sub-agent starts with no access to this conversation or its workspace: put everything it needs in task_description.",
 ].join("\n");
 
+/**
+ * [windows-desktop] F6 (gap 1a, 0.B0 审查#5): what the model is told when the run
+ * executes unsandboxed (Provider A). JiuwenSwarm's native subagent tools are
+ * hidden, not just undocumented, so this section replaces the delegation
+ * guidance and points at the sandbox plugin as the unlock.
+ */
+export const UNSANDBOXED_SUBAGENT_SECTION = [
+  "## Delegation is restricted in this execution mode",
+  "This run executes directly on the host without a sandbox, so JiuwenSwarm's own sub-agent tools (subagent_spawn, subagent_wait and their lifecycle tools) are disabled: those agents would run outside ScienceDiscovery's tools, approvals, workspace handoff and audit.",
+  "Use ScienceDiscovery's own `task` tool for delegation; it runs a fully governed nested run.",
+  "Installing the sandbox engine plugin (Provider B) re-enables the native sub-agent delegation.",
+].join("\n");
+
 /** ScienceDiscovery's web tools and the JiuwenSwarm tools that take their place. */
 export const JIUWENSWARM_WEB_TOOLS: Record<string, string> = { web_search: "free_search (or paid_search)", web_fetch: "fetch_webpage" };
 
@@ -308,7 +321,12 @@ class JiuwenSwarmAgent implements NativeAgentHandle {
     if (allJiuwenSwarmTools) for (const name of Object.keys(JIUWENSWARM_WEB_TOOLS)) tools.delete(name);
     // With JiuwenSwarm's own sub-agent tools the model does not also get ours: those sub-agents run inside
     // JiuwenSwarm, with none of ScienceDiscovery's tools, sandbox, handoff or provenance.
-    const jiuwenSwarmSubagents = allJiuwenSwarmTools && (this.config.subagents ?? "task") === "jiuwenswarm" && tools.has("task");
+    // [windows-desktop] F6 (gap 1a, 0.B0 审查#5): on an unsandboxed provider those
+    // native sub-agent tools are withheld entirely — a JiuwenSwarm-internal agent
+    // would bypass ScienceDiscovery's approvals and audit. ScienceDiscovery's own
+    // `task` bridge stays available.
+    const jiuwenSwarmSubagents = allJiuwenSwarmTools && this.options.unsandboxedExecution !== true
+      && (this.config.subagents ?? "task") === "jiuwenswarm" && tools.has("task");
     if (jiuwenSwarmSubagents) tools.delete("task");
     await this.installSkills(tools, allJiuwenSwarmTools);
     this.loadSkill = (id) => {
@@ -532,7 +550,9 @@ class JiuwenSwarmAgent implements NativeAgentHandle {
     const withHostRule = allJiuwenSwarmTools ? `${ours}\n\n${HOST_TOOLS_SECTION}` : ours;
     const replacementSections = keepJiuwenSwarmPrompt ? [] : [
       ...(jiuwenSwarmPlans ? [TODO_PLANNING_SECTION] : []),
-      ...(jiuwenSwarmSubagents ? [SUBAGENT_DELEGATION_SECTION] : []),
+      // Unsandboxed runs: hide the Swarm-native subagent tools and steer the model to the platform task tool
+      // (the sandbox plugin unlocks isolated subagent execution; see UNSANDBOXED_SUBAGENT_SECTION).
+      ...(jiuwenSwarmSubagents ? [SUBAGENT_DELEGATION_SECTION] : this.options.unsandboxedExecution === true ? [UNSANDBOXED_SUBAGENT_SECTION] : []),
     ];
     const delegationRule = jiuwenSwarmSubagents ? [] : [toolNames.has("task")
       ? "Delegation for this run uses only the platform task tool. Swarm-native subagent tools are unavailable; ignore any generic instructions recommending them. Use task to delegate and collect results."

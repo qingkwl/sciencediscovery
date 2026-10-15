@@ -59,3 +59,18 @@ test("archived sessions disable the toggle", () => {
   }));
   assert.match(markup, /disabled=""/);
 });
+
+test("unsandboxed execution pins the toggle to ask and disables it", () => {
+  // [windows-desktop] F6.4: host-direct execution — always-allow is server-side blocked (409),
+  // so the toggle must stay in ask mode, disabled, with the sandbox-plugin guidance.
+  const markup = renderToStaticMarkup(createElement(ApprovalModeToggle, {
+    mode: "always_allow",
+    onChange: () => undefined,
+    unsandboxed: true,
+  }));
+  assert.match(markup, /aria-label="Approvals: Ask for dangerous actions"/);
+  assert.match(markup, /aria-pressed="false"/);
+  assert.match(markup, /disabled=""/);
+  assert.match(markup, /This run executes directly on the host without a sandbox, so always-allow is disabled/);
+  assert.doesNotMatch(markup, /always-allow"/);
+});
