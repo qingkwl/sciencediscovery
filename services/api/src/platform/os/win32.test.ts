@@ -22,7 +22,7 @@ import { join } from "node:path";
 import type { TestContext } from "node:test";
 
 import { renameReplace, restrictToOwner, restrictToOwnerSync } from "./index.js";
-import { currentUserPrincipal } from "./win32.js";
+import { currentUserPrincipal, win32SecretProtector } from "./win32.js";
 
 function icaclsReport(path: string): string {
   const result = spawnSync("icacls", [path], { encoding: "utf8" });
@@ -44,8 +44,11 @@ test("a file ends up with an ACL granting only the current user", async (context
   restrictToOwnerSync(file);
 
   const report = icaclsReport(file);
-  const principal = currentUserPrincipal();
-  assert.ok(report.includes(`${principal}:F`) || report.includes(`${principal}:(F)`), report);
+  // whoami prints the principal lowercase; icacls echoes it back in its own
+  // case, so the grant comparison cannot be case-sensitive.
+  const principal = currentUserPrincipal().toLowerCase();
+  const acl = report.toLowerCase();
+  assert.ok(acl.includes(`${principal}:f`) || acl.includes(`${principal}:(f)`), report);
   // Built-in groups must not survive: that would be the Windows equivalent of world-readable.
   assert.ok(!/BUILTIN\\Users|Everyone|Authenticated Users/i.test(report), report);
 });
@@ -96,4 +99,44 @@ test("a child created after the restriction inherits the owner-only ACL", async 
 
   const report = icaclsReport(child);
   assert.ok(!/BUILTIN\\Users|Everyone|Authenticated Users/i.test(report), report);
+});
+
+// --- at-rest secret wrapping via DPAPI (F9) -----------------------------------
+
+/** The CryptProtectData header as documented by the blob format, spelled out
+ *  here independently of the implementation constant. */
+const DPAPI_SPEC_PREFIX = Buffer.from([
+  0x01, 0x00, 0x00, 0x00, 0xd0, 0x8c, 0x9d, 0xdf, 0x01, 0x15, 0xd1, 0x11,
+  0x8c, 0x7a, 0x00, 0xc0, 0x4f, 0xc2, 0x97, 0xeb,
+]);
+
+test("wrap round-trips a master key through real DPAPI", async () => {
+  const key = Buffer.from("0123456789abcdef0123456789abcdef");
+
+  const wrapped = await win32SecretProtector.wrap(key);
+
+  assert.equal(win32SecretProtector.wrapsAtRest, true);
+  assert.equal(win32SecretProtector.isWrapped(wrapped), true, "a CryptProtectData blob must carry the documented 20-byte header");
+  assert.ok(!wrapped.equals(key), "the master key must not be stored in the clear");
+  assert.deepEqual(await win32SecretProtector.unwrap(wrapped), key);
+
+  const again = await win32SecretProtector.wrap(key);
+  assert.ok(!again.equals(wrapped), "CryptProtectData is non-deterministic");
+  assert.deepEqual(await win32SecretProtector.unwrap(again), key);
+});
+
+test("isWrapped recognises the CryptProtectData header and nothing else", () => {
+  assert.equal(win32SecretProtector.isWrapped(Buffer.concat([DPAPI_SPEC_PREFIX, Buffer.alloc(48, 1)])), true);
+  assert.equal(win32SecretProtector.isWrapped(DPAPI_SPEC_PREFIX), true, "the header alone still claims the format");
+  assert.equal(win32SecretProtector.isWrapped(Buffer.alloc(32, 7)), false, "a legacy raw key is not a blob");
+  assert.equal(win32SecretProtector.isWrapped(Buffer.alloc(0)), false);
+  const corrupt = Buffer.from(DPAPI_SPEC_PREFIX);
+  corrupt[4] ^= 0xff;
+  assert.equal(win32SecretProtector.isWrapped(corrupt), false, "a one-byte difference must not pass");
+});
+
+test("unwrap fails loudly on a blob that DPAPI cannot decrypt", async () => {
+  const garbage = Buffer.concat([DPAPI_SPEC_PREFIX, Buffer.alloc(64, 9)]);
+  await assert.rejects(win32SecretProtector.unwrap(garbage), /ProtectedData unprotect failed/);
+  await assert.rejects(win32SecretProtector.unwrap(Buffer.alloc(32, 7)), /ProtectedData unprotect failed/);
 });

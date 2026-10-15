@@ -15,13 +15,29 @@
 import { chmodSync } from "node:fs";
 import { chmod, rename } from "node:fs/promises";
 
-import type { OsAdaptation, RestrictToOwnerOptions } from "./types.js";
+import type { OsAdaptation, RestrictToOwnerOptions, SecretProtector } from "./types.js";
 
 function modeFor(options?: RestrictToOwnerOptions): number {
   return options?.directory ? 0o700 : 0o600;
 }
 
+/**
+ * No wrapping on POSIX: the 0600 file permission is the at-rest protection,
+ * so raw bytes are stored and read back unchanged.
+ */
+export const identitySecretProtector: SecretProtector = {
+  wrapsAtRest: false,
+  isWrapped: () => false,
+  async wrap(plain) {
+    return plain;
+  },
+  async unwrap(wrapped) {
+    return wrapped;
+  },
+};
+
 export const posixAdaptation: OsAdaptation = {
+  secretProtector: identitySecretProtector,
   restrictToOwner(path, options) {
     return chmod(path, modeFor(options));
   },

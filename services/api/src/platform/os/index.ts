@@ -25,4 +25,5 @@ const adaptation: OsAdaptation = process.platform === "win32" ? win32Adaptation 
 export const restrictToOwner: OsAdaptation["restrictToOwner"] = adaptation.restrictToOwner;
 export const restrictToOwnerSync: OsAdaptation["restrictToOwnerSync"] = adaptation.restrictToOwnerSync;
 export const renameReplace: OsAdaptation["renameReplace"] = adaptation.renameReplace;
-export type { RestrictToOwnerOptions } from "./types.js";
+export const secretProtector: OsAdaptation["secretProtector"] = adaptation.secretProtector;
+export type { RestrictToOwnerOptions, SecretProtector } from "./types.js";
