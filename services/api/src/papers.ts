@@ -14,7 +14,9 @@
 
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+// [windows-desktop] reason: 炸点③-13 —— rename 覆盖的 EPERM 退避重试走 platform/os。
+import { renameReplace } from "./platform/os/index.js";
 import { dirname, extname, resolve } from "node:path";
 import { promisify } from "node:util";
 
@@ -399,7 +401,7 @@ export class PaperService {
         this.dataCas.put(manifestBytes),
       ]);
       await mkdir(resolve(targetRoot, ".."), { recursive: true });
-      await rename(stagingRoot, targetRoot);
+      await renameReplace(stagingRoot, targetRoot);
       const acquisition: PaperAcquisition = {
         connectorId: options.connectorId,
         createdAt: new Date().toISOString(),
