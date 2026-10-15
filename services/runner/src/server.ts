@@ -38,6 +38,7 @@ import type {
   RunnerRuntimeStatus,
   RemoteWorkspaceFile,
   RemoteWorkspaceSnapshot,
+  SandboxKind,
   SandboxNetworkCapability,
   ScientificEnvsCapability,
   SetupScientificEnvironmentsRequest,
@@ -346,12 +347,14 @@ export function loadRunnerConfig(env: NodeJS.ProcessEnv = process.env, cwd = rep
     return value;
   };
   const requestedProvider = env.SCIENCE_AGENT_SANDBOX_PROVIDER?.trim() || "auto";
-  if (!["auto", "bubblewrap", "seatbelt"].includes(requestedProvider)) {
-    throw new Error("SCIENCE_AGENT_SANDBOX_PROVIDER must be auto, bubblewrap, or seatbelt");
+  if (!["auto", "bubblewrap", "seatbelt", "none"].includes(requestedProvider)) {
+    throw new Error("SCIENCE_AGENT_SANDBOX_PROVIDER must be auto, bubblewrap, seatbelt, or none");
   }
+  // [windows-desktop] F4.3: Windows resolves to the direct-execution
+  // provider; the WSL sandbox (Provider B) stays an optional plugin.
   const sandboxProvider = requestedProvider === "auto"
-    ? (process.platform === "darwin" ? "seatbelt" : "bubblewrap")
-    : requestedProvider as "bubblewrap" | "seatbelt";
+    ? (process.platform === "darwin" ? "seatbelt" : process.platform === "win32" ? "none" : "bubblewrap")
+    : requestedProvider as "bubblewrap" | "seatbelt" | "none";
   return {
     authToken: env.SCIENCE_AGENT_RUNNER_TOKEN?.trim() || "sciencediscovery-runner-local",
     bwrapPath: env.SCIENCE_AGENT_BWRAP_PATH?.trim() || "bwrap",
@@ -1071,8 +1074,10 @@ export function createRunnerServer(
  * the process-wide interpreter probe: no subprocess per request, and no data
  * directory writes. Staging the bridge script stays on the launch path.
  */
-async function sandboxNetworkCapability(sandbox: "bubblewrap" | "seatbelt"): Promise<SandboxNetworkCapability> {
-  if (sandbox === "seatbelt") return { available: true, modes: ["none", "domain-allowlist", "open"] };
+async function sandboxNetworkCapability(sandbox: SandboxKind): Promise<SandboxNetworkCapability> {
+  // [windows-desktop] F4.3: "none" filters through the same runner-owned TCP
+  // gateway as Seatbelt (env-injected proxy), so every mode stays available.
+  if (sandbox !== "bubblewrap") return { available: true, modes: ["none", "domain-allowlist", "open"] };
   try {
     await resolveEgressInterpreter();
     return { available: true, modes: ["none", "domain-allowlist", "open"] };

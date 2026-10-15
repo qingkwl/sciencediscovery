@@ -16,7 +16,7 @@ import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { constants } from "node:fs";
-import { access, chmod, copyFile, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { basename, isAbsolute, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
@@ -37,6 +37,9 @@ import {
 
 import micromambaManifest from "./micromamba-releases.json" with { type: "json" };
 import { EnvironmentAccess } from "./environment-access.js";
+// [windows-desktop] F4.1: win-64 binary name (.exe), conda interpreter layout
+// and rename retry live in the platform adaptation layer (0.B2 §2).
+import { environmentInterpreterPath, micromambaBinaryName, packageInstallGuidance, renameReplace, starterPackages } from "./platform/index.js";
 
 const execFileAsync = promisify(execFile);
 const CATALOG_VERSION = 1;
@@ -44,16 +47,16 @@ const MANAGED_MICROMAMBA_VERSION = micromambaManifest.version;
 const MANAGED_MICROMAMBA_BASE_URL = `${micromambaManifest.baseUrl}/${MANAGED_MICROMAMBA_VERSION}`;
 const MANAGED_MICROMAMBA_RELEASES = micromambaManifest.releases;
 const MANAGED_MICROMAMBA_DARWIN_RELEASES = micromambaManifest.darwinReleases;
+// [windows-desktop] F4.1: pinned win-64 release (炸点③-7 — win32 was refused).
+const MANAGED_MICROMAMBA_WIN32_RELEASES = micromambaManifest.win32Releases;
 const MAX_PROVISIONER_BYTES = 64 * 1024 * 1024;
 /** One provisioner download; long enough for a slow mirror, short enough to fail. */
 const MANAGED_PROVISIONER_TIMEOUT_MS = 120_000;
 const BUILT_IN_CONDA_CHANNELS = new Set<string>(
   ENVIRONMENT_PACKAGE_SOURCE_PRESETS.flatMap((preset) => [...preset.condaChannels]),
 );
-const STARTER_PACKAGES: Record<ScientificLanguage, string[]> = {
-  python: ["python=3.12", "numpy=2.0", "pandas=2.2", "scipy=1.14", "matplotlib=3.9"],
-  r: ["r-base=4.4", "r-tidyverse=2.0", "r-data.table=1.16"],
-};
+// [windows-desktop] F4.2: starter specs are platform-dispatched (win32 uses
+// matplotlib-base, see platform/win32.ts 炸点③-17). POSIX list unchanged.
 
 interface EnvironmentCatalog {
   environments: Environment[];
@@ -114,7 +117,7 @@ export function managedMicromambaBaseUrl(env: NodeJS.ProcessEnv = process.env): 
 
 /** Where a Runner keeps the managed provisioner inside its data directory. */
 export function managedProvisionerPath(dataDir: string): string {
-  return resolve(dataDir, "scientific-envs", "bin", "micromamba");
+  return resolve(dataDir, "scientific-envs", "bin", micromambaBinaryName);
 }
 
 export function managedMicromambaRelease(
@@ -124,7 +127,9 @@ export function managedMicromambaRelease(
 ) {
   const releases = platform === "linux"
     ? MANAGED_MICROMAMBA_RELEASES
-    : platform === "darwin" ? MANAGED_MICROMAMBA_DARWIN_RELEASES : undefined;
+    : platform === "darwin"
+      ? MANAGED_MICROMAMBA_DARWIN_RELEASES
+      : platform === "win32" ? MANAGED_MICROMAMBA_WIN32_RELEASES : undefined;
   if (!releases) throw new Error(`Managed micromamba installation is unavailable for platform ${platform}`);
   const release = releases[architecture as keyof typeof releases];
   if (!release) {
@@ -192,6 +197,18 @@ export function describeFetchFailure(error: unknown): string {
   return parts.find((part) => part !== "fetch failed") ?? "the connection failed";
 }
 
+/**
+ * [windows-desktop] F4.4: append platform guidance to a failed package
+ * install when the platform layer recognizes a "package not found" solver
+ * error. Non-Error values and non-matching messages pass through unchanged.
+ */
+export function withPackageInstallGuidance(error: unknown): unknown {
+  if (!(error instanceof Error)) return error;
+  const guidance = packageInstallGuidance(error.message);
+  if (!guidance) return error;
+  return new Error(`${error.message}\n${guidance}`, { cause: error });
+}
+
 export async function installManagedMicromamba(
   destination: string,
   fetcher: typeof fetch = fetch,
@@ -235,7 +252,7 @@ export async function installManagedMicromamba(
       await mkdir(resolve(destination, ".."), { recursive: true });
       await writeFile(temporary, bytes, { flag: "wx", mode: 0o700 });
       await chmod(temporary, 0o700);
-      await rename(temporary, destination);
+      await renameReplace(temporary, destination);
     } catch (error) {
       throw new ManagedProvisionerError("write", release.url,
         `${destination} could not be written: ${(error as NodeJS.ErrnoException).code ?? String(error)}`, error);
@@ -336,7 +353,7 @@ export class EnvironmentStore {
     this.revisionsRoot = resolve(config.root, "revisions");
     this.snapshotsRoot = resolve(config.root, "snapshots");
     this.wheelsRoot = resolve(config.root, "wheels");
-    this.provisionerPath = config.provisionerPath ?? resolve(config.root, "bin", "micromamba");
+    this.provisionerPath = config.provisionerPath ?? resolve(config.root, "bin", micromambaBinaryName);
     this.setupState = config.enabled ? "not-configured" : "disabled";
     this.setupPhase = config.enabled ? "pending" : "disabled";
     this.setupMessage = config.enabled
@@ -413,7 +430,7 @@ export class EnvironmentStore {
         ? managedMicromambaRelease().version
         : null,
       startedAt: this.setupStartedAt,
-      starterPackages: structuredClone(STARTER_PACKAGES),
+      starterPackages: { python: starterPackages("python"), r: starterPackages("r") },
       state: this.setupState,
       updatedAt: this.setupUpdatedAt,
     };
@@ -565,7 +582,7 @@ export class EnvironmentStore {
     const prefixPath = this.revisionPath(environment.id, environment.runtimeRevisionId ?? revision.id);
     return {
       environment: { ...environment },
-      interpreterPath: resolve(prefixPath, "bin", language === "python" ? "python" : "R"),
+      interpreterPath: environmentInterpreterPath(prefixPath, language),
       prefixPath,
       revision: { ...revision },
     };
@@ -684,7 +701,13 @@ export class EnvironmentStore {
       : externalUrl("package_indexes.pypi_simple");
     if (manager !== "conda") {
       const executable = manager === "pip" ? "python" : "R";
-      await access(resolve(this.revisionPath(id, environment.runtimeRevisionId ?? environment.currentRevisionId), "bin", executable), constants.X_OK)
+      // [windows-desktop] F4.4: win-64 prefixes keep python.exe at the root
+      // and R.exe under Scripts/ — the POSIX bin/ layout does not exist.
+      const interpreter = environmentInterpreterPath(
+        this.revisionPath(id, environment.runtimeRevisionId ?? environment.currentRevisionId),
+        manager === "pip" ? "python" : "r",
+      );
+      await access(interpreter, constants.X_OK)
         .catch(() => { throw new Error(`Environment lacks ${executable}; install it with manager=conda first`); });
     }
     if (this.config.packageCacheDir && (manager === "cran" || manager === "bioconductor")) {
@@ -733,7 +756,9 @@ export class EnvironmentStore {
         }
         const wheelPaths = localWheels.map((wheel) => resolve(this.wheelsRoot, wheel.content.hash, wheel.filename));
         await this.runManagedCommand(
-          resolve(prefix, "bin", "python"),
+          // [windows-desktop] F4.4: platform-aware interpreter path (win-64
+          // has no bin/python).
+          environmentInterpreterPath(prefix, "python"),
           [...pipArguments, ...normalizedPackages, ...wheelPaths],
           `pip-${revisionId}`,
         );
@@ -744,7 +769,7 @@ export class EnvironmentStore {
         const expression = manager === "cran"
           ? `install.packages(${packageVector}, repos=${JSON.stringify(cranRepository)}, Ncpus=1)`
           : `if (!requireNamespace("BiocManager", quietly=TRUE)) install.packages("BiocManager", repos=${JSON.stringify(cranRepository)}); BiocManager::install(${packageVector}, ask=FALSE, update=FALSE)`;
-        await this.runManagedCommand(resolve(prefix, "bin", "R"), ["--vanilla", "--slave", "-e", expression], `${manager}-${revisionId}`);
+        await this.runManagedCommand(environmentInterpreterPath(prefix, "r"), ["--vanilla", "--slave", "-e", expression], `${manager}-${revisionId}`);
         revisionChannels = [manager === "cran" ? cranRepository : externalUrl("package_indexes.bioconductor")];
       }
       const revisionLocalWheels = mergeLocalWheels(previousRevision.localWheels, localWheels);
@@ -765,7 +790,9 @@ export class EnvironmentStore {
       return { ...revision };
     } catch (error) {
       await this.failUpdate(environment, previousRevision.id);
-      throw error;
+      // [windows-desktop] F4.4: on win32 a missing conda-forge build gets
+      // actionable guidance appended; elsewhere the error passes through.
+      throw withPackageInstallGuidance(error);
     }
   }
 
@@ -846,7 +873,7 @@ export class EnvironmentStore {
       await this.runProvisioner([
         "create", "--yes", ...this.offlineArguments(), "--strict-channel-priority", "--override-channels", "--prefix", prefix,
         ...this.config.allowedChannels.flatMap((channel) => ["--channel", channel]),
-        ...STARTER_PACKAGES[language],
+        ...starterPackages(language),
       ], `bootstrap-${language}`);
       const revision = await this.recordRevision(id, revisionId, language, prefix, this.config.allowedChannels);
       const createdAt = new Date().toISOString();
@@ -904,7 +931,7 @@ export class EnvironmentStore {
         }
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        await rename(incoming, storedPath);
+        await renameReplace(incoming, storedPath);
       }
       return {
         content: { hash: copiedHash, size: copiedMetadata.size },
@@ -952,8 +979,8 @@ export class EnvironmentStore {
   ): Promise<EnvironmentRevision> {
     const listOutput = await this.runProvisioner(["list", "--json", "--prefix", prefix], `snapshot-${revisionId}`);
     const listed = parseProvisionedPackageList(listOutput);
-    const pythonPath = resolve(prefix, "bin", "python");
-    const rPath = resolve(prefix, "bin", "R");
+    const pythonPath = environmentInterpreterPath(prefix, "python");
+    const rPath = environmentInterpreterPath(prefix, "r");
     const pythonInstalled = await access(pythonPath, constants.X_OK).then(() => true, () => false);
     const rInstalled = await access(rPath, constants.X_OK).then(() => true, () => false);
     const python = pythonInstalled ? JSON.parse(await this.runManagedCommand(pythonPath, ["-I", "-c",
@@ -1197,9 +1224,12 @@ export class EnvironmentStore {
   private async saveCatalog(): Promise<void> {
     const temporary = `${this.catalogPath}.${process.pid}.${randomUUID()}.tmp`;
     await writeFile(temporary, `${JSON.stringify(this.catalog, null, 2)}\n`, { mode: 0o600 });
-    await rename(temporary, this.catalogPath);
+    await renameReplace(temporary, this.catalogPath);
   }
 }
 
-export const SCIENTIFIC_STARTER_PACKAGES = STARTER_PACKAGES;
+export const SCIENTIFIC_STARTER_PACKAGES: Record<ScientificLanguage, string[]> = {
+  python: starterPackages("python"),
+  r: starterPackages("r"),
+};
 export const MANAGED_MICROMAMBA_ARCHITECTURE_RELEASES = MANAGED_MICROMAMBA_RELEASES;

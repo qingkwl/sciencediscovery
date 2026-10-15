@@ -20,6 +20,15 @@ export interface RestrictToOwnerOptions {
 }
 
 /**
+ * Base starter-environment package specs (shared by both adaptations).
+ * Platform files may substitute individual entries — see win32.ts.
+ */
+export const STARTER_PACKAGE_SPECS = {
+  python: ["python=3.12", "numpy=2.0", "pandas=2.2", "scipy=1.14", "matplotlib=3.9"],
+  r: ["r-base=4.4", "r-tidyverse=2.0", "r-data.table=1.16"],
+} as const;
+
+/**
  * OS adaptation surface for services/runner (0.B2 分层约定 §2).
  * Consumers import only index.ts; platform files are never imported directly.
  */
@@ -37,4 +46,51 @@ export interface OsAdaptation {
    * also covers grandchildren, which a bare `child.kill()` would orphan.
    */
   terminateTree(child: ChildProcess): boolean;
+
+  /**
+   * Managed micromamba binary file name (F4.1). Windows can only execute a
+   * file whose extension is in PATHEXT, so the managed binary is
+   * `micromamba.exe` there and `micromamba` elsewhere.
+   */
+  micromambaBinaryName: string;
+
+  /**
+   * Interpreter path inside a conda environment prefix (F4.1). POSIX conda
+   * layout keeps python/R under `bin/`; the win-64 layout puts `python.exe`
+   * at the prefix root and `R.exe` under `Scripts/`.
+   */
+  environmentInterpreterPath(prefixPath: string, language: "python" | "r"): string;
+
+  /**
+   * Directories a direct (unsandboxed) execution must prepend to PATH so a
+   * conda environment works without activation (F4.3, 炸点③-18). win-64
+   * interpreters delay-load DLLs from `Library\bin`, so win32 needs
+   * `[prefix, prefix\Library\bin, prefix\Scripts]`; posix needs `[prefix/bin]`.
+   */
+  condaActivationPaths(prefixPath: string): string[];
+
+  /**
+   * Rename over an existing destination (F4.1, same 炸点③-13 shape as the
+   * API layer): Windows AV scanners/indexers briefly hold freshly written
+   * files, so win32 backs off and retries EPERM/EACCES/EBUSY; posix passes
+   * straight through to fs.rename.
+   */
+  renameReplace(source: string, destination: string): Promise<void>;
+
+  /**
+   * Starter environment package specs for a language (F4.2). win32 substitutes
+   * matplotlib-base for matplotlib: the qt6 dependency tree contains internal
+   * paths deeper than MAX_PATH (炸点③-17) even under a shallow prefix, and
+   * agents render figures to files (Agg) rather than interactively.
+   */
+  starterPackages(language: "python" | "r"): string[];
+
+  /**
+   * Guidance appended to a failed package install (F4.4). conda-forge win-64
+   * covers fewer packages than linux-64, so when a solve reports a missing
+   * package win32 points at the alternatives (pip name, WSL sandbox plugin,
+   * remote execution) instead of leaving a raw solver dump. posix returns
+   * null: the error passes through unchanged.
+   */
+  packageInstallGuidance(rawErrorMessage: string): string | null;
 }

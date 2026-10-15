@@ -42,6 +42,29 @@ test("findHostPython honours SCIENCE_AGENT_PYTHON_PATH override", () => {
   assert.equal(findHostPython(env), process.execPath);
 });
 
+test("serviceCommand resolves bare commands through the merged environment PATH", async () => {
+  // Regression: spawnService looked the command up in the caller's *overrides*
+  // alone (no PATH key there at all) and threw "command not found on PATH: uv"
+  // even when uv was installed.
+  const { serviceCommand } = await import("./lib/stack-platform.mjs");
+  const dir = await mkdtemp(join(tmpdir(), "sd-stack-path-"));
+  try {
+    const name = isWindows ? "sd-probe-cmd.exe" : "sd-probe-cmd";
+    await writeFile(join(dir, name), "probe");
+    const saved = process.env.PATH;
+    process.env.PATH = dir + (isWindows ? ";" : ":") + (saved ?? "");
+    try {
+      assert.equal(serviceCommand("sd-probe-cmd", { SD_PROBE_OVERRIDE: "1" }), join(dir, name));
+      // An override PATH wins over the process one.
+      assert.equal(serviceCommand("sd-probe-cmd", { PATH: dir }), join(dir, name));
+    } finally {
+      process.env.PATH = saved;
+    }
+  } finally {
+    await rm(dir, { force: true, recursive: true });
+  }
+});
+
 test("loadDotEnv parses KEY=VALUE, quotes, export prefix; existing env wins", async () => {
   const dir = await mkdtemp(join(tmpdir(), "sd-dotenv-"));
   try {

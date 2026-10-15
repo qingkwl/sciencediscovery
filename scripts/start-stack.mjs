@@ -195,9 +195,9 @@ const envsDir = join(dataDir, "envs");
 
 // 构建（--no-build 跳过）。镜像变量只作用于本进程，不写用户/全局配置。
 const runOpts = { cwd: repositoryRoot };
-async function runStep(label, command, args, extraEnv = {}) {
+async function runStep(label, command, args, extraEnv = {}, cwd) {
   say(`==> ${label}`);
-  const child = spawnService(command, args, { ...runOpts, env: extraEnv });
+  const child = spawnService(command, args, { ...runOpts, ...(cwd ? { cwd } : {}), env: extraEnv });
   const code = await new Promise(resolveExit => child.once("exit", resolveExit));
   if (code !== 0) fail(`${label} failed with exit code ${code}.`);
 }
@@ -207,18 +207,19 @@ async function uvSyncProject(projectDir, envDir, { locked, extraArgs = [] }) {
   if (process.env.SCIENCE_AGENT_PYPI_INDEX) env.UV_DEFAULT_INDEX = process.env.SCIENCE_AGENT_PYPI_INDEX;
   // 自定义 PyPI 时 --locked 必失败（uv.lock 记录索引 URL）；备份/恢复锁文件，
   // 镜像永不弄脏工作树（与 bash 版 uv_sync_project 同语义）。
+  // bash 版在子 shell 里 cd 进项目目录再 sync（`uv sync` 按 cwd 找 pyproject）。
   if (process.env.SCIENCE_AGENT_PYPI_INDEX && locked) {
     const lockfile = join(projectDir, "uv.lock");
     const backup = join(projectDir, "uv.lock.stack-backup");
     await rename(lockfile, backup);
     try {
-      await runStep(`uv sync ${projectDir}`, "uv", ["sync", ...extraArgs], env);
+      await runStep(`uv sync ${projectDir}`, "uv", ["sync", ...extraArgs], env, projectDir);
     } finally {
       await rename(backup, lockfile);
     }
     return;
   }
-  await runStep(`uv sync ${projectDir}`, "uv", ["sync", ...(locked ? ["--locked"] : []), ...extraArgs], env);
+  await runStep(`uv sync ${projectDir}`, "uv", ["sync", ...(locked ? ["--locked"] : []), ...extraArgs], env, projectDir);
 }
 
 if (!options.noBuild) {

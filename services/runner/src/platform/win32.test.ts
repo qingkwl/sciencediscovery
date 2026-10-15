@@ -21,7 +21,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TestContext } from "node:test";
 
-import { restrictToOwner, terminateTree } from "./index.js";
+import { condaActivationPaths, environmentInterpreterPath, micromambaBinaryName, packageInstallGuidance, renameReplace, restrictToOwner, starterPackages, terminateTree } from "./index.js";
 
 function processAlive(pid: number): boolean {
   // tasklist exit code stays 0 even for no match, so inspect the output.
@@ -72,4 +72,68 @@ test("restrictToOwner removes inherited group access from a file", async (contex
   const report = spawnSync("icacls", [file], { encoding: "utf8" });
   assert.equal(report.status, 0);
   assert.ok(!/BUILTIN\\Users|Everyone|Authenticated Users/i.test(report.stdout), report.stdout);
+});
+
+test("micromamba binary name carries the .exe Windows needs to execute", () => {
+  assert.equal(micromambaBinaryName, "micromamba.exe");
+});
+
+test("environmentInterpreterPath follows the win-64 conda layout", () => {
+  // win-64 conda: python.exe at the prefix root, R.exe under Scripts/.
+  assert.equal(environmentInterpreterPath("C:\\envs\\rev-1", "python"), "C:\\envs\\rev-1\\python.exe");
+  assert.equal(environmentInterpreterPath("C:\\envs\\rev-1", "r"), "C:\\envs\\rev-1\\Scripts\\R.exe");
+});
+
+test("condaActivationPaths cover the win-64 delay-load DLL directories (炸点③-18)", () => {
+  // Without Library\bin on PATH, importing numpy/scipy dies with 0xC06D007F.
+  assert.deepEqual(condaActivationPaths("C:\\envs\\rev-1"),
+    ["C:\\envs\\rev-1", "C:\\envs\\rev-1\\Library\\bin", "C:\\envs\\rev-1\\Scripts"]);
+});
+
+test("renameReplace replaces an existing destination", async (context) => {
+  const dir = await mkdtemp(join(tmpdir(), "sd-runner-platform-"));
+  context.after(() => rm(dir, { force: true, recursive: true }));
+  const source = join(dir, "incoming");
+  const destination = join(dir, "existing");
+  await writeFile(source, "new");
+  await writeFile(destination, "old");
+
+  await renameReplace(source, destination);
+
+  const { readFile } = await import("node:fs/promises");
+  assert.equal(await readFile(destination, "utf8"), "new");
+});
+
+test("starterPackages swaps matplotlib for matplotlib-base on win32 (炸点③-17)", () => {
+  // qt6's in-package qml test resources exceed MAX_PATH even under a shallow
+  // prefix; agents render via Agg to files, so matplotlib-base loses nothing.
+  assert.deepEqual(starterPackages("python"),
+    ["python=3.12", "numpy=2.0", "pandas=2.2", "scipy=1.14", "matplotlib-base=3.9"]);
+  assert.deepEqual(starterPackages("r"), ["r-base=4.4", "r-tidyverse=2.0", "r-data.table=1.16"]);
+});
+
+test("packageInstallGuidance explains missing win-64 builds with alternatives (F4.4)", () => {
+  for (const raw of [
+    "critical libmamba Could not solve for environment specs\nThe following package could not be located: pysam",
+    "error    libmamba nothing provides requested jaxlib",
+    "PackagesNotFoundError: The following packages are not available from current channels: tensorflow",
+  ]) {
+    const guidance = packageInstallGuidance(raw);
+    assert.ok(guidance, `guidance expected for: ${raw.slice(0, 60)}`);
+    assert.match(guidance, /win-64/);
+    assert.match(guidance, /pip/);
+    assert.match(guidance, /sandbox/);
+  }
+  assert.equal(packageInstallGuidance("error    libmamba SSL certificate verify failed"), null);
+  assert.equal(packageInstallGuidance("disk full"), null);
+});
+
+test("withPackageInstallGuidance appends guidance only to recognized solver failures (F4.4)", async () => {
+  const { withPackageInstallGuidance } = await import("../environment-store.js");
+  const recognized = withPackageInstallGuidance(new Error("nothing provides requested pysam")) as Error;
+  assert.match(recognized.message, /nothing provides/);
+  assert.match(recognized.message, /win-64/);
+  const plain = new Error("permission denied");
+  assert.equal(withPackageInstallGuidance(plain), plain);
+  assert.equal(withPackageInstallGuidance("not an error"), "not an error");
 });
