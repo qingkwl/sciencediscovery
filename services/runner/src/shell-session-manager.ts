@@ -565,9 +565,10 @@ export class ShellSessionManager {
     // produced by this shell, not consumed by it.
     const sandbox = executorSandboxKind(this.config);
     if (sandbox === "none") {
-      // [windows-desktop] F4.3: no bash on a native Windows host; shell
-      // sessions return when the WSL sandbox plugin (Provider B) is installed.
-      throw new Error("Shell sessions require a sandboxed runner; the direct-execution provider (Windows) does not support shell");
+      // [windows-desktop] F4.3/F5.3: 短程（ephemeral）shell 已走环境内
+      // m2-bash（executor.executeDirectShell）；这里守卫的是 persistent
+      // shell 会话（worker 常驻进程），等 WSL 沙箱插件（Provider B）再开。
+      throw new Error("Persistent shell sessions require a sandboxed runner; the direct-execution provider (Windows) supports ephemeral shell only");
     }
     const launch = await prepareSandboxLaunch(this.config, {
       chdir: workspaceBinds.chdir,

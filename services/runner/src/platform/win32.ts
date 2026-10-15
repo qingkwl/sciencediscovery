@@ -92,8 +92,13 @@ export const win32Adaptation: OsAdaptation = {
     // on any realistic prefix; matplotlib-base (Agg/file rendering, what agents
     // actually use) drops the whole qt6 tree.
     if (language === "python") {
-      return STARTER_PACKAGE_SPECS.python
-        .map((spec) => (spec === "matplotlib=3.9" ? "matplotlib-base=3.9" : spec));
+      return [
+        ...STARTER_PACKAGE_SPECS.python
+          .map((spec) => (spec === "matplotlib=3.9" ? "matplotlib-base=3.9" : spec)),
+        // F5.3: run_shell 的唯一执行载体——Windows 宿主无 bash，starter 环境
+        // 预装 MSYS2 移植的 m2-bash（~3MB，已实证 Library\usr\bin\bash.exe）。
+        "m2-bash",
+      ];
     }
     return [...STARTER_PACKAGE_SPECS[language]];
   },
@@ -109,5 +114,10 @@ export const win32Adaptation: OsAdaptation = {
       + "Alternatives: retry with manager=\"pip\" if a PyPI wheel exists; "
       + "install the local sandbox engine (WSL) plugin for the full Linux package set; "
       + "or use a remote execution provider.";
+  },
+  environmentShellPath(prefixPath) {
+    // F5.3: 已实证——m2-bash 装进 win-64 conda 前缀后落在
+    // Library\usr\bin\bash.exe（MSYS2 移植，含 msys2 runtime DLL）。
+    return resolve(prefixPath, "Library", "usr", "bin", "bash.exe");
   },
 };

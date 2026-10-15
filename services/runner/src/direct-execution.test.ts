@@ -16,9 +16,9 @@ import { createTest } from "../../../test/support/tagged/compat.mjs";
 const { test } = createTest(import.meta.url, { tags: ["category:ut", "os:windows"] });
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, dirname, resolve } from "node:path";
 import type { TestContext } from "node:test";
 
 import type { PermissionEpoch } from "@sciencediscovery/schema";
@@ -96,14 +96,94 @@ test("spawnSandboxProcess none branch runs the executable directly with the laun
   assert.equal(stdout, `marker-value|${dataDir}`);
 });
 
-test("executeShell fails closed under the none provider", async () => {
+test("executeShell none fails closed without the scientific environment capability", async () => {
   await assert.rejects(
     executeShell(
       { bwrapPath: "unused", dataDir: "unused", sandboxProvider: "none", execTimeoutMs: 1000, maxOutputBytes: 0, maxWorkspaceBytes: 0 },
       { agentId: "main", code: "echo hi", executionId: "shell-none", permissionEpoch: epoch(), workspaceRoot: "unused" },
     ),
-    /requires a sandboxed runner/,
+    /requires the scientific environment capability/,
   );
+});
+
+test("executeShell none fails clearly when the environment lacks m2-bash", async (context) => {
+  const { dataDir, workspaceRoot } = await workspace(context);
+  // 前缀里没有任何 shell：报错必须点名 m2-bash 与修复动作，而不是裸 ENOENT。
+  const store = {
+    capability: { available: true },
+    resolveRuntime: () => ({
+      interpreterPath: resolve(dataDir, "managed-env", "python.exe"),
+      prefixPath: resolve(dataDir, "managed-env"),
+      revision: { id: "rev-python" },
+    }),
+  } as unknown as EnvironmentStore;
+  await assert.rejects(
+    executeShell(
+      { bwrapPath: "unused", dataDir, sandboxProvider: "none", execTimeoutMs: 1000, maxOutputBytes: 0, maxWorkspaceBytes: 0 },
+      { agentId: "main", code: "echo hi", executionId: "shell-none", permissionEpoch: epoch(), workspaceRoot },
+      undefined, undefined, undefined, undefined, undefined, store,
+    ),
+    /requires m2-bash.*Recreate or update the starter environment/s,
+  );
+});
+
+/** A real bash.exe for the direct-shell run; the test skips without one. */
+function hostBash(): string | undefined {
+  const result = spawnSync("where", ["bash"], { encoding: "utf8" });
+  if (result.status !== 0) return undefined;
+  return result.stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+}
+
+test("executeShell none runs the agent's code through the environment's m2-bash (F5.3)", async (context) => {
+  const bash = hostBash();
+  if (!bash) {
+    context.skip("no bash.exe on PATH");
+    return;
+  }
+  const { dataDir, workspaceRoot } = await workspace(context);
+  // 复刻 m2-bash 的 conda 布局：<prefix>\Library\usr\bin\bash.exe（已实证）。
+  // 用 Git Bash 的真身充当环境内 bash，连同其 msys-*.dll 一起拷进假前缀。
+  const prefix = resolve(dataDir, "managed-env");
+  const shellDir = resolve(prefix, "Library", "usr", "bin");
+  await mkdir(shellDir, { recursive: true });
+  await copyFile(bash, resolve(shellDir, "bash.exe"));
+  const msysLibs = spawnSync("cmd", ["/c", "dir", "/b", resolve(dirname(bash), "msys-*.dll")], { encoding: "utf8" });
+  if (msysLibs.status === 0) {
+    for (const name of msysLibs.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)) {
+      await copyFile(resolve(dirname(bash), name), resolve(shellDir, name));
+    }
+  }
+  const store = {
+    capability: { available: true },
+    resolveRuntime: () => ({
+      interpreterPath: resolve(prefix, "python.exe"),
+      prefixPath: prefix,
+      revision: { id: "rev-python" },
+    }),
+  } as unknown as EnvironmentStore;
+  const result = await executeShell(
+    { bwrapPath: "unused", dataDir, sandboxProvider: "none", execTimeoutMs: 60_000, maxOutputBytes: 1_000_000, maxWorkspaceBytes: 0 },
+    {
+      agentId: "main",
+      code: [
+        "echo SHELL_OK",
+        "pwd",
+        "mkdir -p sub && echo text > sub/out.txt",
+      ].join("\n"),
+      executionId: "shell-none",
+      permissionEpoch: epoch(),
+      workspaceRoot,
+    },
+    undefined, undefined, undefined, undefined, undefined, store,
+  );
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.ok(result.stdout.includes("SHELL_OK"), result.stdout);
+  // MSYS2 把 Windows cwd 翻成 /e/... 形态：断言它报告的是工作区即可。
+  assert.ok(result.stdout.includes("/"), result.stdout);
+  assert.ok(result.createdFiles.includes("sub/out.txt") || result.createdFiles.includes("sub\\out.txt"), result.createdFiles.join(","));
+  assert.equal(result.environmentRevisionId, "rev-python");
+  assert.equal(result.sandbox, "none");
+  assert.equal(result.kernelMode, "ephemeral");
 });
 
 test("executePython rejects R under the none provider", async (context) => {

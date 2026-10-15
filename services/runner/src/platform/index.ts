@@ -30,4 +30,5 @@ export const condaActivationPaths: OsAdaptation["condaActivationPaths"] = adapta
 export const renameReplace: OsAdaptation["renameReplace"] = adaptation.renameReplace;
 export const starterPackages: OsAdaptation["starterPackages"] = adaptation.starterPackages;
 export const packageInstallGuidance: OsAdaptation["packageInstallGuidance"] = adaptation.packageInstallGuidance;
+export const environmentShellPath: OsAdaptation["environmentShellPath"] = adaptation.environmentShellPath;
 export type { RestrictToOwnerOptions } from "./types.js";
