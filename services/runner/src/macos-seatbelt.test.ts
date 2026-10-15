@@ -68,6 +68,11 @@ test("macOS Seatbelt writes only the workspace and denies direct network", async
     return;
   }
   const secret = join(dataDir, "not-mounted-secret.txt");
+  // [windows-desktop] F6.3: mode-none policies now fail closed through a
+  // deny-all gateway on host-network sandboxes too, so executions need the
+  // gateway registry the server always provides.
+  const gateways = new EgressGatewayRegistry(dataDir);
+  context.after(() => gateways.close());
   const result = await executePython(config(), {
     agentId: "main",
     code: [
@@ -80,7 +85,7 @@ test("macOS Seatbelt writes only the workspace and denies direct network", async
     executionId: "macos-seatbelt-python",
     permissionEpoch: epoch("macos-python"),
     workspaceRoot,
-  });
+  }, undefined, undefined, undefined, gateways);
   assert.equal(result.exitCode, 0, result.stderr);
   assert.equal(result.sandbox, "seatbelt");
   assert.match(result.stdout, /secret=denied/);
@@ -139,7 +144,9 @@ test("macOS persistent shell retains cwd and exports inside one Seatbelt", async
     return;
   }
   const profiles = new SessionEnvProfileStore();
-  const manager = new ShellSessionManager({ ...config(), idleTimeoutMs: 0 }, profiles);
+  const gateways = new EgressGatewayRegistry(dataDir);
+  context.after(() => gateways.close());
+  const manager = new ShellSessionManager({ ...config(), idleTimeoutMs: 0 }, profiles, gateways);
   const permissionEpoch = epoch("macos-shell");
   try {
     const first = await manager.execute({
@@ -172,13 +179,15 @@ test("macOS ephemeral shell reports logical workspace provenance", async (contex
     assert.fail("Seatbelt is unavailable on this host");
     return;
   }
+  const gateways = new EgressGatewayRegistry(dataDir);
+  context.after(() => gateways.close());
   const result = await executeShell(config(), {
     agentId: "main",
     code: "printf shell-ok > shell.txt",
     executionId: "macos-seatbelt-shell",
     permissionEpoch: epoch("macos-ephemeral-shell"),
     workspaceRoot,
-  });
+  }, undefined, undefined, gateways);
   assert.equal(result.exitCode, 0, result.stderr);
   assert.equal(result.workingDirectory, "/workspace");
   assert.equal(result.environmentRevisionId, "system-shell-seatbelt-v1");

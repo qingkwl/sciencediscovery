@@ -791,6 +791,12 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
     const capability: ExecutionCapability = await platform.executionRouter.capability();
     if (currentExecutionSandboxed(capability)) return null;
     const badge: ExecutionBadge = platform.executionRouter.providers().find((entry) => entry.id === capability.provider)?.badge ?? "direct";
+    // [windows-desktop] F6.1: every downgrade attempt lands in the operational log (0.B0 审查#4).
+    runLog.warn("unsandboxed_approval_mode_blocked", {
+      approvalMode,
+      provider: capability.provider,
+      badge,
+    });
     return unsandboxedApprovalModeMessage(badge);
   };
 

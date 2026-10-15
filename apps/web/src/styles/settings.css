@@ -997,3 +997,6 @@
   gap: 6px;
   white-space: nowrap;
 }
+
+/* [windows-desktop] F6.4: host-direct execution hint under the sandbox-network settings group. */
+.settings-sandbox-plugin-hint { display: flex; align-items: center; gap: 6px; margin: 12px 0 0; padding: 8px 10px; border: 1px solid var(--warning-border); border-radius: var(--radius-s); background: var(--warning-soft); color: var(--warning-strong); font-size: 12px; line-height: 1.5; }

@@ -144,6 +144,8 @@ button.session-bar-project:hover { color: var(--accent-strong); }
 .approval-mode-toggle.always-allow:hover { border-color: var(--warning-accent); }
 .approval-mode-toggle:disabled { cursor: not-allowed; opacity: 0.55; }
 .approval-mode-toggle-state { font-weight: 650; white-space: nowrap; }
+/* [windows-desktop] F6.4: composer badge for host-direct (unsandboxed) execution. */
+.composer-unsandboxed-badge { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 4px; min-height: 30px; border: 1px solid var(--warning-border); border-radius: var(--radius-s); background: var(--warning-soft); color: var(--warning-strong); padding: 4px 8px; font-size: 11px; font-weight: 650; white-space: nowrap; }
 .connector-picker-popover { position: absolute; z-index: var(--z-panel); left: 12px; bottom: calc(100% + 8px); width: min(340px, calc(100% - 24px)); max-height: min(50vh, 420px); overflow-y: auto; border: 1px solid var(--border-strong); border-radius: var(--radius-l); background: var(--surface); box-shadow: var(--shadow-3); padding: 10px 12px; }
 .connector-picker-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; color: var(--text-heading); font-size: 12px; }
 .connector-picker-heading span { color: var(--muted); font-weight: 650; }

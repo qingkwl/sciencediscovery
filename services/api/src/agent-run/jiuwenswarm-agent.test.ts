@@ -1220,6 +1220,25 @@ test("default delegation uses platform task and hides the Swarm-native lifecycle
   }
 });
 
+test("unsandboxed execution hides Swarm-native subagent tools even with explicit jiuwenswarm delegation", async () => {
+  let sent: any;
+  const adapter = await fakeAdapter(async ({ body }, response) => { sent = body; response.writeHead(200); response.end(line({ done: { finalText: "ok" } })); });
+  try {
+    await createJiuwenSwarmAgentFactory({ adapterUrl: adapter.url, subagents: "jiuwenswarm" })(
+      withRunSubagent({ unsandboxedExecution: true })).execute("go");
+    // Native subagent delegation is withheld: the model must use the governed platform task tool.
+    assert.equal("nativeTools" in sent, false);
+    for (const name of ["subagent_spawn", "subagent_wait", "task_tool", "subagent_list", "subagent_send_input", "subagent_close", "subagent_resume"]) {
+      assert.ok(sent.hiddenJiuwenSwarmTools.includes(name), `${name} must be hidden in unsandboxed execution`);
+    }
+    assert.ok(sent.tools.some((tool: { name: string }) => tool.name === "task"));
+    assert.match(sent.systemPrompt, /Delegation is restricted in this execution mode/);
+    assert.match(sent.systemPrompt, /sandbox engine plugin/);
+  } finally {
+    await adapter.close();
+  }
+});
+
 test("with ScienceDiscovery's own tools, task stays even with explicit jiuwenswarm delegation", async () => {
   let sent: any;
   const adapter = await fakeAdapter(async ({ body }, response) => { sent = body; response.writeHead(200); response.end(line({ done: { finalText: "ok" } })); });

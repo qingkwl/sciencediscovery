@@ -25,21 +25,28 @@ export function ApprovalModeToggle({
   disabled = false,
   mode,
   onChange,
+  unsandboxed = false,
 }: {
   disabled?: boolean;
   mode: ApprovalMode;
   onChange: (mode: ApprovalMode) => void;
+  /** [windows-desktop] F6.4: host-direct execution (no sandbox) — always-allow is server-side blocked (409), so
+   * the toggle is pinned to "ask" and disabled, with guidance toward the sandbox plugin. */
+  unsandboxed?: boolean;
 }) {
   const { t } = useLocale();
-  const asking = mode === "ask_for_dangerous";
-  const tooltip = asking ? t("composer.approvalAskTooltip") : t("composer.approvalAlwaysTooltip");
+  // Unsandboxed runs can never be in always-allow: pin the display even if an old session row still carries it.
+  const asking = unsandboxed || mode === "ask_for_dangerous";
+  const tooltip = unsandboxed
+    ? t("composer.approvalUnsandboxedTooltip")
+    : asking ? t("composer.approvalAskTooltip") : t("composer.approvalAlwaysTooltip");
   const modeLabel = asking ? t("composer.askDangerous") : t("composer.alwaysAllow");
   return (
     <button
       aria-label={`${t("composer.approvals")}: ${modeLabel}`}
       aria-pressed={!asking}
       className={asking ? "approval-mode-toggle" : "approval-mode-toggle always-allow"}
-      disabled={disabled}
+      disabled={disabled || unsandboxed}
       onClick={() => onChange(nextApprovalMode(mode))}
       title={tooltip}
       type="button"

@@ -157,6 +157,7 @@ import {
   TableIcon,
   TargetIcon,
   UploadIcon,
+  WarningIcon,
 } from "./icons.js";
 import { CopyButton } from "./CopyButton.js";
 import { findMarkdownFigureArtifact, KIND_TO_LABEL, MarkdownRenderer } from "./Markdown.js";
@@ -1155,6 +1156,8 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
   const [timeoutSettings, setTimeoutSettings] = useState<SystemTimeoutSettings>();
   const [quotaSettings, setQuotaSettings] = useState<SystemQuotaSettings>();
   const [sandboxNetworkSettings, setSandboxNetworkSettings] = useState<SandboxNetworkSettings>();
+  // [windows-desktop] F6.4: null = not loaded yet; false = host-direct execution (no sandbox).
+  const [executionSandboxed, setExecutionSandboxed] = useState<boolean | null>(null);
   const [proxySettings, setProxySettings] = useState<ProxySettingsDetails>();
   const [mcpProxyPolicies, setMcpProxyPolicies] = useState<McpProxyPolicies>({});
   const [mcpSources, setMcpSources] = useState<McpSourceManifest[]>([]);
@@ -1464,7 +1467,8 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
       client.getWebSettings(),
       client.getMemoryGraphSettings(),
       client.getIdeaTreeSettings(),
-    ]).then(([modelItems, connectorItems, skillItems, skillLibraryItems, settings, timeouts, quotas, sandboxNetwork, web, memoryGraph, ideaTree]) => {
+      client.getExecutionProvider(),
+    ]).then(([modelItems, connectorItems, skillItems, skillLibraryItems, settings, timeouts, quotas, sandboxNetwork, web, memoryGraph, ideaTree, executionProvider]) => {
       if (!active) return;
       setModels(modelItems);
       setConnectors(connectorItems);
@@ -1477,6 +1481,7 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
       setWebSettings(web);
       setMemoryGraphSettings(memoryGraph);
       setIdeaTreeSettings(ideaTree);
+      setExecutionSandboxed(executionProvider.capability.sandboxed);
       setWorkspaceCapabilities({
         maxFileBytes: quotas.uploadMaxFileBytes,
         maxRequestBytes: quotas.uploadMaxRequestBytes,
@@ -1834,7 +1839,8 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
       client.getWebSettings(),
       client.getMemoryGraphSettings(),
       client.getIdeaTreeSettings(),
-    ]).then(([projectItems, modelItems, catalog, connectorItems, skillItems, skillLibraryItems, settings, timeouts, quotas, sandboxNetwork, proxies, mcpPolicyDetails, mcpSourceDetails, web, memoryGraph, ideaTree]) => {
+      client.getExecutionProvider(),
+    ]).then(([projectItems, modelItems, catalog, connectorItems, skillItems, skillLibraryItems, settings, timeouts, quotas, sandboxNetwork, proxies, mcpPolicyDetails, mcpSourceDetails, web, memoryGraph, ideaTree, executionProvider]) => {
       setProjects(projectItems);
       setModels(modelItems);
       applyModelCatalog(catalog);
@@ -1845,6 +1851,7 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
       setTimeoutSettings(timeouts);
       setQuotaSettings(quotas);
       setSandboxNetworkSettings(sandboxNetwork);
+      setExecutionSandboxed(executionProvider.capability.sandboxed);
       setProxySettings(proxies);
       setMcpProxyPolicies(mcpPolicyDetails.policies);
       setMcpSources(mcpSourceDetails.map((item) => item.manifest));
@@ -4653,7 +4660,11 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
                       disabled={sessionArchived}
                       mode={session.approvalMode}
                       onChange={(approvalMode) => void updateSessionSettings({ approvalMode })}
+                      unsandboxed={executionSandboxed === false}
                     />
+                    {executionSandboxed === false ? <span className="composer-unsandboxed-badge" role="note" title={t("composer.approvalUnsandboxedTooltip")}>
+                      <WarningIcon size={13} /> {t("composer.unsandboxedBadge")}
+                    </span> : null}
                     <ComposerRunButton action={composerRunAction} onStop={() => void stopRun()} />
                   </div>
                 </form>
@@ -5020,11 +5031,16 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
               ) : null}
               {systemSettingsGroup === "sandbox-network" ? (
                 sandboxNetworkSettings
-                  ? <SandboxNetworkSettingsEditor
-                    onChange={setSandboxNetworkSettingsEdit}
-                    proxySettings={proxySettings}
-                    settings={sandboxNetworkSettingsEdit ?? sandboxNetworkSettings}
-                  />
+                  ? <>
+                    <SandboxNetworkSettingsEditor
+                      onChange={setSandboxNetworkSettingsEdit}
+                      proxySettings={proxySettings}
+                      settings={sandboxNetworkSettingsEdit ?? sandboxNetworkSettings}
+                    />
+                    {executionSandboxed === false ? <p className="settings-sandbox-plugin-hint" role="note">
+                      <WarningIcon size={13} /> {t("settings.sandboxPluginHint")}
+                    </p> : null}
+                  </>
                   : <p className="muted">{t("settings.loadingSandboxNetwork")}</p>
               ) : null}
               {systemSettingsGroup === "runtime" ? <RuntimeStatusPanel
