@@ -83,6 +83,12 @@ if (options.mode === "docker") {
   fail("docker mode is not supported by start-stack.mjs; use scripts/start-stack.sh --mode docker.");
 }
 
+// [windows-desktop] F10 —— packaged 模式（安装包内的负载树，无 pnpm/uv/宿主 Python）：
+// 跳过源码模式的依赖检查与自举，只复用服务顺序/监督契约（产品契约单点维护）。
+// 壳负责注入 SCIENCE_AGENT_PYTHON_PATH（内置解释器）并在首启解包 envs。
+const packaged = process.env.SCIENCE_AGENT_PACKAGED === "1";
+if (packaged) options.noBuild = true;
+
 // ---------------------------------------------------------------------------
 // 准备（prepare_local 等价物）
 
@@ -119,36 +125,44 @@ const dependencyProblems = [];
 const noteProblem = (headline, ...remedies) =>
   dependencyProblems.push([headline, ...remedies].map(line => `    ${line}`).join("\n"));
 
-const nodeVersion = process.versions.node.split(".").map(Number);
-if (!(nodeVersion[0] > 22 || (nodeVersion[0] === 22 && nodeVersion[1] >= 19))) {
-  noteProblem(`Node.js 22.19+ is required; found ${process.versions.node}.`,
-    "Upgrade it, for example: nvm install 22 && nvm use 22");
+if (packaged) {
+  // packaged 模式只依赖本进程（壳自带 node）+ 壳注入的内置 Python；
+  // pnpm/uv/宿主发现链一概不适用（干净机上它们不存在，也不需要存在）。
+  const bundled = process.env.SCIENCE_AGENT_PYTHON_PATH;
+  if (!bundled || !existsSync(bundled)) {
+    fail("SCIENCE_AGENT_PACKAGED=1 requires SCIENCE_AGENT_PYTHON_PATH to point at the bundled Python interpreter.");
+  }
+} else {
+  const nodeVersion = process.versions.node.split(".").map(Number);
+  if (!(nodeVersion[0] > 22 || (nodeVersion[0] === 22 && nodeVersion[1] >= 19))) {
+    noteProblem(`Node.js 22.19+ is required; found ${process.versions.node}.`,
+      "Upgrade it, for example: nvm install 22 && nvm use 22");
+  }
+  if (!findOnPath("pnpm")) {
+    noteProblem("pnpm 11.1.2 is required to install and build the workspace, but no 'pnpm' is on PATH.",
+      "Enable it through the bundled corepack: corepack enable && corepack prepare pnpm@11.1.2 --activate");
+  }
+  const hostPython = findHostPython();
+  if (!hostPython) {
+    noteProblem("Python 3 is required for workspace analysis, but no python interpreter was found.",
+      isWindows
+        ? "Install it from https://www.python.org/downloads/ (the py launcher, python3 or python are all recognised)."
+        : "Install your distribution's python3 package (Debian/Ubuntu: sudo apt-get install -y python3).");
+  }
+  if (!findOnPath("uv")) {
+    noteProblem("uv 0.9+ is required to build the Python service environments, but no 'uv' is on PATH.",
+      isWindows
+        ? "Install it: winget install astral-sh.uv  (or see https://docs.astral.sh/uv/)"
+        : "Install it: curl -LsSf https://astral.sh/uv/install.sh | sh");
+  }
+  if (dependencyProblems.length) {
+    process.stderr.write(`ScienceDiscovery cannot start from source: ${dependencyProblems.length} host dependency problem(s).\n\n`);
+    for (const problem of dependencyProblems) process.stderr.write(`  - ${problem}\n\n`);
+    process.stderr.write("  Requirements table: README.md#requirements\n  Local source mode:  docs/en/how-to/deployment.md#local-mode-host-processes\n");
+    process.exit(1);
+  }
+  process.env.SCIENCE_AGENT_PYTHON_PATH ??= hostPython;
 }
-if (!findOnPath("pnpm")) {
-  noteProblem("pnpm 11.1.2 is required to install and build the workspace, but no 'pnpm' is on PATH.",
-    "Enable it through the bundled corepack: corepack enable && corepack prepare pnpm@11.1.2 --activate");
-}
-const hostPython = findHostPython();
-if (!hostPython) {
-  noteProblem("Python 3 is required for workspace analysis, but no python interpreter was found.",
-    isWindows
-      ? "Install it from https://www.python.org/downloads/ (the py launcher, python3 or python are all recognised)."
-      : "Install your distribution's python3 package (Debian/Ubuntu: sudo apt-get install -y python3).");
-}
-if (!findOnPath("uv")) {
-  noteProblem("uv 0.9+ is required to build the Python service environments, but no 'uv' is on PATH.",
-    isWindows
-      ? "Install it: winget install astral-sh.uv  (or see https://docs.astral.sh/uv/)"
-      : "Install it: curl -LsSf https://astral.sh/uv/install.sh | sh");
-}
-if (dependencyProblems.length) {
-  process.stderr.write(`ScienceDiscovery cannot start from source: ${dependencyProblems.length} host dependency problem(s).\n\n`);
-  for (const problem of dependencyProblems) process.stderr.write(`  - ${problem}\n\n`);
-  process.stderr.write("  Requirements table: README.md#requirements\n  Local source mode:  docs/en/how-to/deployment.md#local-mode-host-processes\n");
-  process.exit(1);
-}
-
-process.env.SCIENCE_AGENT_PYTHON_PATH ??= hostPython;
 if (isMac) process.env.SCIENCE_AGENT_SHELL_PATH ??= "/bin/bash";
 else if (isWindows) {
   // [windows-desktop] Windows 无 /usr/bin/bash 语义：优先 Git Bash，退回 cmd。
@@ -244,12 +258,15 @@ if (!gatewayPython || !existsSync(gatewayPython)) {
   gatewayPython = candidates.find(existsSync);
 }
 if (!gatewayPython) {
-  fail(`${join(envsDir, "gateway")} is missing (needed for the bundled Python MCP servers). Run without --no-build once to provision it.`);
+  fail(packaged
+    ? `${join(envsDir, "gateway")} is missing; the packaged installation is incomplete — reinstall ScienceDiscovery.`
+    : `${join(envsDir, "gateway")} is missing (needed for the bundled Python MCP servers). Run without --no-build once to provision it.`);
 }
 
 // memory-graph：无条件 provision（功能开关在 System Settings，环境必须就绪）
 let memoryGraphPython = venvPython(join(envsDir, "memory-graph"));
 if (!existsSync(memoryGraphPython)) {
+  if (packaged) fail(`${join(envsDir, "memory-graph")} is missing; the packaged installation is incomplete — reinstall ScienceDiscovery.`);
   say("Provisioning the memory-graph Python environment...");
   await uvSyncProject(join(repositoryRoot, "services", "memory-graph"), join(envsDir, "memory-graph"), { locked: false });
 }
@@ -258,6 +275,7 @@ if (!existsSync(memoryGraphPython)) memoryGraphPython = "";
 // evolve：--extra candidates 装候选运行时（AST gate 放行 pandas/numpy/scipy/sklearn）
 let evolvePython = venvPython(join(envsDir, "evolve"));
 if (!existsSync(evolvePython)) {
+  if (packaged) fail(`${join(envsDir, "evolve")} is missing; the packaged installation is incomplete — reinstall ScienceDiscovery.`);
   say("Provisioning the evolve Python environment...");
   const extraArgs = process.env.SCIENCE_AGENT_EVOLVE_STUB_ONLY === "1" ? [] : ["--extra", "candidates"];
   await uvSyncProject(join(repositoryRoot, "services", "evolve"), join(envsDir, "evolve"), { locked: false, extraArgs });
@@ -269,6 +287,7 @@ let adapterPython = "";
 if (process.env.SCIENCE_AGENT_ADAPTER === "1") {
   adapterPython = venvPython(join(envsDir, "adapter"));
   if (!existsSync(adapterPython)) {
+    if (packaged) fail(`${join(envsDir, "adapter")} is missing; the packaged installation is incomplete — reinstall ScienceDiscovery.`);
     say("Provisioning the adapter Python environment...");
     await uvSyncProject(join(repositoryRoot, "services", "adapter"), join(envsDir, "adapter"), { locked: false });
   }

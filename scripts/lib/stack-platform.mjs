@@ -50,7 +50,10 @@ export function findOnPath(command, env = process.env) {
   const names = isWindows && !pathExt.some(ext => command.toUpperCase().endsWith(ext))
     ? pathExt.map(ext => command + ext.toLowerCase())
     : [command];
-  for (const dir of (env.PATH ?? "").split(delimiter)) {
+  // Windows: a reconstructed env (e.g. under `node --test`) may carry the
+  // variable as "Path" — the lookup itself stays case-sensitive in JS.
+  const pathValue = env.PATH ?? env.Path ?? "";
+  for (const dir of pathValue.split(delimiter)) {
     if (!dir) continue;
     for (const name of names) {
       const candidate = join(dir, name);
