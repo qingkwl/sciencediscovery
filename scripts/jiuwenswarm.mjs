@@ -182,6 +182,16 @@ export async function cmdStart(cfg = jwConfig()) {
   if (!existsSync(jwBin(cfg, "jiuwenswarm-start"))) {
     throw new Error("Not installed; run: node scripts/jiuwenswarm.mjs setup");
   }
+  // [windows-desktop] F10 —— packaged 首启（或源码模式忘记 init）没有 instance
+  // workspace：applyConfig 需要它的 config.yaml。jiuwenswarm-init 是离线脚手架
+  // （从包内模板生成 config），与 cmdSetup 末段同一条命令，幂等。
+  if (!existsSync(instanceWorkspace(cfg))) {
+    process.stderr.write(`Creating instance ${cfg.instance}...\n`);
+    await mkdir(cfg.dataDir, { recursive: true });
+    await run(jwBin(cfg, "jiuwenswarm-init"), ["--name", cfg.instance], {
+      env: { JIUWENSWARM_DATA_DIR: cfg.dataDir, ...(cfg.home ? { JIUWENSWARM_HOME: cfg.home } : {}) },
+    });
+  }
   await applyConfig(cfg);
   if (await isUp(cfg)) {
     process.stderr.write(`JiuwenSwarm instance ${cfg.instance} is already up.\n`);
