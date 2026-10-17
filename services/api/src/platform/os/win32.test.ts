@@ -131,7 +131,7 @@ test("isWrapped recognises the CryptProtectData header and nothing else", () => 
   assert.equal(win32SecretProtector.isWrapped(Buffer.alloc(32, 7)), false, "a legacy raw key is not a blob");
   assert.equal(win32SecretProtector.isWrapped(Buffer.alloc(0)), false);
   const corrupt = Buffer.from(DPAPI_SPEC_PREFIX);
-  corrupt[4] ^= 0xff;
+  corrupt[4] = corrupt[4]! ^ 0xff;
   assert.equal(win32SecretProtector.isWrapped(corrupt), false, "a one-byte difference must not pass");
 });
 

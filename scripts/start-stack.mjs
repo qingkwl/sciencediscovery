@@ -379,57 +379,67 @@ const healthTimeoutSeconds = Number(process.env.SCIENCE_DISCOVERY_HEALTH_TIMEOUT
 const runnerUrl = process.env.SCIENCE_AGENT_RUNNER_URL ?? `http://${runnerHost}:${runnerPort}`;
 
 try {
-say("Starting the sandbox runner daemon...");
-children.push(spawnService(process.execPath, [join("services", "runner", "dist", "server.js")], { env: runnerEnv }));
-if (!await waitHealthy("runner", `${runnerUrl}/health`, { timeoutSeconds: healthTimeoutSeconds })) {
-  say("WARNING: local compute is unavailable; the workbench will remain accessible. Configure a remote Runner or repair local execution.");
-}
-
-if (process.env.SCIENCE_AGENT_MEMORY_GRAPH_AVAILABLE !== "0" && memoryGraphPython) {
-  say("Starting the memory-graph service...");
-  children.push(spawnService(memoryGraphPython, ["-m", "sciencediscovery_memory_graph.server"], {
-    env: {
-      SCIENCE_AGENT_DATA_DIR: dataDir,
-      SCIENCE_AGENT_MEMORY_GRAPH_NEO4J_HTTP: process.env.SCIENCE_AGENT_MEMORY_GRAPH_NEO4J_HTTP ?? "http://127.0.0.1:7474",
-      SCIENCE_AGENT_MEMORY_GRAPH_INTERNAL_TOKEN: process.env.SCIENCE_AGENT_MEMORY_GRAPH_INTERNAL_TOKEN ?? "sciencediscovery-memory-graph-local",
-    },
-  }));
-  if (!await waitHealthy("memory-graph", `http://127.0.0.1:${memoryGraphPort}/health`, { timeoutSeconds: healthTimeoutSeconds })) {
-    throw new Error("memory-graph sidecar failed to start; stopping the stack.");
+  say("Starting the sandbox runner daemon...");
+  children.push(spawnService(process.execPath, [join("services", "runner", "dist", "server.js")], { env: runnerEnv }));
+  if (!await waitHealthy("runner", `${runnerUrl}/health`, { timeoutSeconds: healthTimeoutSeconds })) {
+    say("WARNING: local compute is unavailable; the workbench will remain accessible. Configure a remote Runner or repair local execution.");
   }
-}
 
-if (evolvePython) {
-  say("Starting the evolve service...");
-  children.push(spawnService(evolvePython, ["-m", "sciencediscovery_evolve.server"], {
-    env: {
-      SCIENCE_AGENT_DATA_DIR: dataDir,
-      SCIENCE_AGENT_EVOLVE_INTERNAL_TOKEN: process.env.SCIENCE_AGENT_EVOLVE_INTERNAL_TOKEN ?? "sciencediscovery-evolve-local",
-    },
-  }));
-  if (!await waitHealthy("evolve", `http://127.0.0.1:${evolvePort}/health`, { timeoutSeconds: healthTimeoutSeconds })) {
-    throw new Error("evolve sidecar failed to start; stopping the stack.");
-  }
-}
-
-if (useJiuwenswarm) {
-  if (!adapterPython) {
+  // [windows-desktop] F10.6 —— 产品契约变更（owner 2026-10-16 拍板，原 F2 逐串行）：
+  // {memory-graph, evolve, JiuwenSwarm} 并行拉起，全部健康后再放 adapter/api
+  //（adapter 全量继承 process.env，必须等 jwEnv 注入完成）。
+  // 失败语义保持 fail-fast：任一 reject → 外层 catch → cleanup() 杀全部兄弟。
+  if (useJiuwenswarm && !adapterPython) {
     fail("SCIENCE_AGENT_EXECUTOR=jiuwenswarm needs the adapter: also set SCIENCE_AGENT_ADAPTER=1.");
   }
-  const cfg = jwConfig();
-  if (!process.env.JIUWENSWARM_GATEWAY_URL || !process.env.JIUWENSWARM_MGMT_URL) {
-    const env = await jwEnv(cfg).catch(() => null);
-    if (env) Object.assign(process.env, env);
+  const parallel = [];
+  if (process.env.SCIENCE_AGENT_MEMORY_GRAPH_AVAILABLE !== "0" && memoryGraphPython) {
+    parallel.push((async () => {
+      say("Starting the memory-graph service...");
+      children.push(spawnService(memoryGraphPython, ["-m", "sciencediscovery_memory_graph.server"], {
+        env: {
+          SCIENCE_AGENT_DATA_DIR: dataDir,
+          SCIENCE_AGENT_MEMORY_GRAPH_NEO4J_HTTP: process.env.SCIENCE_AGENT_MEMORY_GRAPH_NEO4J_HTTP ?? "http://127.0.0.1:7474",
+          SCIENCE_AGENT_MEMORY_GRAPH_INTERNAL_TOKEN: process.env.SCIENCE_AGENT_MEMORY_GRAPH_INTERNAL_TOKEN ?? "sciencediscovery-memory-graph-local",
+        },
+      }));
+      if (!await waitHealthy("memory-graph", `http://127.0.0.1:${memoryGraphPort}/health`, { timeoutSeconds: healthTimeoutSeconds })) {
+        throw new Error("memory-graph sidecar failed to start; stopping the stack.");
+      }
+    })());
   }
-  const gatewayPort = Number(new URL(process.env.JIUWENSWARM_GATEWAY_URL ?? "ws://127.0.0.1:0/").port || 0);
-  if (!gatewayPort || !await jwIsUp(cfg)) {
-    say("JiuwenSwarm is not running; starting it (node scripts/jiuwenswarm.mjs start)...");
-    await jwStart(cfg);
-    Object.assign(process.env, await jwEnv(cfg));
+  if (evolvePython) {
+    parallel.push((async () => {
+      say("Starting the evolve service...");
+      children.push(spawnService(evolvePython, ["-m", "sciencediscovery_evolve.server"], {
+        env: {
+          SCIENCE_AGENT_DATA_DIR: dataDir,
+          SCIENCE_AGENT_EVOLVE_INTERNAL_TOKEN: process.env.SCIENCE_AGENT_EVOLVE_INTERNAL_TOKEN ?? "sciencediscovery-evolve-local",
+        },
+      }));
+      if (!await waitHealthy("evolve", `http://127.0.0.1:${evolvePort}/health`, { timeoutSeconds: healthTimeoutSeconds })) {
+        throw new Error("evolve sidecar failed to start; stopping the stack.");
+      }
+    })());
   }
-}
+  if (useJiuwenswarm) {
+    parallel.push((async () => {
+      const cfg = jwConfig();
+      if (!process.env.JIUWENSWARM_GATEWAY_URL || !process.env.JIUWENSWARM_MGMT_URL) {
+        const env = await jwEnv(cfg).catch(() => null);
+        if (env) Object.assign(process.env, env);
+      }
+      const gatewayPort = Number(new URL(process.env.JIUWENSWARM_GATEWAY_URL ?? "ws://127.0.0.1:0/").port || 0);
+      if (!gatewayPort || !await jwIsUp(cfg)) {
+        say("JiuwenSwarm is not running; starting it (node scripts/jiuwenswarm.mjs start)...");
+        await jwStart(cfg);
+        Object.assign(process.env, await jwEnv(cfg));
+      }
+    })());
+  }
+  await Promise.all(parallel);
 
-if (adapterPython) {
+  if (adapterPython) {
   say(`Starting the adapter on port ${publicPort} (legacy API on ${legacyPort})...`);
   children.push(spawnService(adapterPython, ["-m", "sciencediscovery_adapter.server"], {
     env: { SCIENCE_AGENT_LEGACY_PORT: String(legacyPort) },

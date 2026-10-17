@@ -8,7 +8,7 @@
 import { execFile, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile, appendFile } from "node:fs/promises";
-import { delimiter, join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
@@ -44,13 +44,69 @@ const venvDir = cfg => join(cfg.src, ".venv");
 const jwBin = (cfg, name) => venvEntry(venvDir(cfg), name);
 const jwPython = cfg => venvEntry(venvDir(cfg), "python");
 
-function run(command, args, { cwd, env } = {}) {
+// [windows-desktop] F10.6 —— 启动链加固（owner 2026-10-16：新机器首启卡 8/10
+// 600s+，是"卡住"不是"慢"）。三处根因对应三处修复：
+//   1) 旧等待环上限是"90 次"而非"180 秒"——每次探测 spawn 冷 python 完整
+//      import jw（冷机+杀软 30-60s/次），实际预算 45-90 分钟 → 改真·墙钟 deadline；
+//   2) 探测靠 python `--status` → 改 TCP 直探 instance .env 的 GATEWAY_PORT，
+//      python 只在终态确认时跑一次；
+//   3) 子命令无超时、等待期零日志 → exec 一律加超时，环内定期打点，全链
+//      阶段/耗时/退出码落 startup-diagnostics.log（新机器卡住时取回即可定位）。
+const EXEC_TIMEOUT_MS = 180_000;   // 单条子命令（python）的墙钟上限
+const PROBE_DEADLINE_MS = 240_000; // 等待 jw 就绪的总墙钟上限
+const PROBE_INTERVAL_MS = 2_000;
+const PROBE_PROGRESS_MS = 15_000;  // 打点间隔（stderr → shell.log → loading 页文案）
+
+/** 诊断日志路径：随 jw root 落盘（打包模式 = %LOCALAPPDATA%\ScienceDiscovery\jiuwenswarm\）。 */
+export function startupDiagPath(cfg) {
+  return join(cfg.root, "startup-diagnostics.log");
+}
+
+/** 追加一行时间戳诊断。fire-and-forget：诊断写失败绝不影响启动链本身。 */
+export function diag(cfg, message) {
+  const line = `${new Date().toISOString()} ${message}\n`;
+  return appendFile(startupDiagPath(cfg), line, "utf8").catch(() => {});
+}
+
+/** 错误摘要：message + 命令退出信息 + stderr 尾部（截断），供诊断文件定位"卡在哪条命令"。 */
+export function stderrTail(text, maxChars = 600) {
+  if (!text) return "";
+  const clean = String(text).replace(/\s+/g, " ").trim();
+  return clean.length <= maxChars ? clean : `…${clean.slice(-maxChars)}`;
+}
+
+function errSummary(error) {
+  const e = error ?? {};
+  const parts = [String(e.message ?? e)];
+  if (e.killed || e.signal) parts.push(`killed=${e.killed ?? false} signal=${e.signal ?? ""}`);
+  if (e.code) parts.push(`code=${e.code}`);
+  const tail = stderrTail(e.stderr ?? "");
+  if (tail) parts.push(`stderr: ${tail}`);
+  return parts.join(" | ");
+}
+
+function run(command, args, { cwd, env, timeoutMs = EXEC_TIMEOUT_MS } = {}) {
   return execFileAsync(command, args, {
     cwd,
     env: { ...process.env, ...env },
     encoding: "utf8",
     maxBuffer: 16 * 1024 * 1024,
+    timeout: timeoutMs,
   });
+}
+
+/** run() 的诊断版：起止/耗时/失败摘要（含 stderr 尾部）都落诊断文件。 */
+async function runLogged(cfg, label, command, args, opts = {}) {
+  const started = Date.now();
+  await diag(cfg, `▶ ${label}: ${command} ${args.map(a => `"${a}"`).join(" ")}`);
+  try {
+    const result = await run(command, args, opts);
+    await diag(cfg, `✔ ${label}: ok in ${((Date.now() - started) / 1000).toFixed(1)}s`);
+    return result;
+  } catch (error) {
+    await diag(cfg, `✖ ${label}: failed in ${((Date.now() - started) / 1000).toFixed(1)}s — ${errSummary(error)}`);
+    throw error;
+  }
 }
 
 function instanceWorkspace(cfg) {
@@ -59,7 +115,7 @@ function instanceWorkspace(cfg) {
 
 /** `jiuwenswarm-start --status` → { raw, running, ports: {gateway, web, agent_server} } */
 export async function instanceStatus(cfg) {
-  const { stdout } = await run(jwBin(cfg, "jiuwenswarm-start"), ["--status", cfg.instance], {
+  const { stdout } = await runLogged(cfg, "status", jwBin(cfg, "jiuwenswarm-start"), ["--status", cfg.instance], {
     env: { JIUWENSWARM_DATA_DIR: cfg.dataDir, ...(cfg.home ? { JIUWENSWARM_HOME: cfg.home } : {}) },
   });
   const ports = {};
@@ -81,6 +137,32 @@ export async function isUp(cfg) {
   }
 }
 
+/**
+ * [windows-desktop] F10.6 —— Parse the bootstrap .env that jiuwenswarm-init
+ * writes into the instance workspace (AGENT_SERVER_PORT / WEB_PORT /
+ * GATEWAY_PORT). Pure — the probe loop reads these to TCP-probe the gateway
+ * without spawning a cold python per attempt. Null when nothing parses.
+ */
+export function parseInstanceEnvPorts(text) {
+  if (!text) return null;
+  const get = name => {
+    const match = new RegExp(`^\\s*${name}=(\\d+)\\s*$`, "m").exec(text);
+    return match ? Number(match[1]) : undefined;
+  };
+  const ports = {
+    gateway: get("GATEWAY_PORT"),
+    web: get("WEB_PORT"),
+    agentServer: get("AGENT_SERVER_PORT"),
+  };
+  return ports.gateway || ports.web || ports.agentServer ? ports : null;
+}
+
+/** This instance's ports from its bootstrap .env (no python spawn). */
+export async function readInstancePorts(cfg) {
+  const text = await readTextIfExists(join(instanceWorkspace(cfg), ".env"));
+  return parseInstanceEnvPorts(text);
+}
+
 async function applyCompatibilityPatches(cfg) {
   const python = findHostPython();
   if (!python) throw new Error("python3/python is required to apply the compatibility patches.");
@@ -88,10 +170,10 @@ async function applyCompatibilityPatches(cfg) {
 }
 
 async function verifyCompatibilityPatches(cfg) {
-  const { stdout } = await run(jwPython(cfg), [
+  const { stdout } = await runLogged(cfg, "verify-locate", jwPython(cfg), [
     "-c", "import importlib.util,pathlib; print(pathlib.Path(importlib.util.find_spec('jiuwenswarm').origin).parent.parent)",
   ]);
-  await run(jwPython(cfg), [join(scriptDir, "swarm-patches.py"), "verify", stdout.trim().split(/\r?\n/).pop(), cfg.tag]);
+  await runLogged(cfg, "verify", jwPython(cfg), [join(scriptDir, "swarm-patches.py"), "verify", stdout.trim().split(/\r?\n/).pop(), cfg.tag]);
 }
 
 /** The three settings the adapter depends on, applied idempotently.
@@ -179,49 +261,105 @@ export async function cmdSetup(cfg = jwConfig()) {
 }
 
 export async function cmdStart(cfg = jwConfig()) {
-  if (!existsSync(jwBin(cfg, "jiuwenswarm-start"))) {
-    throw new Error("Not installed; run: node scripts/jiuwenswarm.mjs setup");
-  }
-  // [windows-desktop] F10 —— packaged 首启（或源码模式忘记 init）没有 instance
-  // workspace：applyConfig 需要它的 config.yaml。jiuwenswarm-init 是离线脚手架
-  // （从包内模板生成 config），与 cmdSetup 末段同一条命令，幂等。
-  if (!existsSync(instanceWorkspace(cfg))) {
-    process.stderr.write(`Creating instance ${cfg.instance}...\n`);
-    await mkdir(cfg.dataDir, { recursive: true });
-    await run(jwBin(cfg, "jiuwenswarm-init"), ["--name", cfg.instance], {
-      env: { JIUWENSWARM_DATA_DIR: cfg.dataDir, ...(cfg.home ? { JIUWENSWARM_HOME: cfg.home } : {}) },
-    });
-  }
-  await applyConfig(cfg);
-  if (await isUp(cfg)) {
-    process.stderr.write(`JiuwenSwarm instance ${cfg.instance} is already up.\n`);
-    return;
-  }
-  await verifyCompatibilityPatches(cfg);
-  // Detach completely (the nohup/disown equivalent): a background job that
-  // keeps the caller's stdout open makes piping scripts wait forever.
-  const bootstrapPath = join(repositoryRoot, "services", "adapter", "src", "sciencediscovery_adapter");
-  spawnDetached(jwBin(cfg, "jiuwenswarm-start"), ["--name", cfg.instance, "app"], {
-    cwd: cfg.root,
-    logFile: cfg.logFile,
-    env: {
-      SCIENCE_AGENT_JIUWENSWARM_BOOTSTRAP: "1",
-      PYTHONPATH: [bootstrapPath, process.env.PYTHONPATH].filter(Boolean).join(delimiter),
-      JIUWENSWARM_DATA_DIR: cfg.dataDir,
-      ...(cfg.home ? { JIUWENSWARM_HOME: cfg.home } : {}),
-    },
-  });
-  for (let attempt = 1; attempt <= 90; attempt += 1) {
-    if (await isUp(cfg)) {
-      // The gateway accepts connections a few seconds before the agent server answers.
-      await delay(6000);
-      const status = await instanceStatus(cfg);
-      process.stderr.write(`JiuwenSwarm instance ${cfg.instance} is up (gateway ${status.ports.gateway}, web ${status.ports.web}).\n`);
+  const startedAt = Date.now();
+  await diag(cfg, `──── start begin: instance=${cfg.instance} pid=${process.pid}`);
+  await diag(cfg, `config: root=${cfg.root} src=${cfg.src} dataDir=${cfg.dataDir} log=${cfg.logFile} home=${cfg.home ?? "(unset)"}`);
+  try {
+    if (!existsSync(jwBin(cfg, "jiuwenswarm-start"))) {
+      throw new Error("Not installed; run: node scripts/jiuwenswarm.mjs setup");
+    }
+    // [windows-desktop] F10 —— packaged 首启（或源码模式忘记 init）没有 instance
+    // workspace：applyConfig 需要它的 config.yaml。jiuwenswarm-init 是离线脚手架
+    // （从包内模板生成 config），与 cmdSetup 末段同一条命令，幂等。
+    if (!existsSync(instanceWorkspace(cfg))) {
+      process.stderr.write(`Creating instance ${cfg.instance}...\n`);
+      await mkdir(cfg.dataDir, { recursive: true });
+      await runLogged(cfg, "init", jwBin(cfg, "jiuwenswarm-init"), ["--name", cfg.instance], {
+        env: { JIUWENSWARM_DATA_DIR: cfg.dataDir, ...(cfg.home ? { JIUWENSWARM_HOME: cfg.home } : {}) },
+      });
+    }
+    const configStarted = Date.now();
+    await applyConfig(cfg);
+    await diag(cfg, `applyConfig: ok in ${((Date.now() - configStarted) / 1000).toFixed(1)}s`);
+
+    // [windows-desktop] F10.6 —— 起前快查：TCP 直探 .env 里的 GATEWAY_PORT；
+    // 不通直接视为未启动（省一次冷 python status —— 冷机一次就是一个完整
+    // jw import，30-60s+）。TCP 通了才用 python status 确认真在跑（防端口
+    // 恰好被别的进程占用）。
+    const ports = await readInstancePorts(cfg);
+    await diag(cfg, `instance ports (.env): ${ports ? `gateway=${ports.gateway} web=${ports.web} agent=${ports.agentServer}` : "unavailable (fallback: python status probes)"}`);
+    let alreadyUp;
+    if (ports?.gateway) {
+      alreadyUp = (await probeTcp("127.0.0.1", ports.gateway)) && (await isUp(cfg));
+    } else {
+      alreadyUp = await isUp(cfg);
+    }
+    if (alreadyUp) {
+      process.stderr.write(`JiuwenSwarm instance ${cfg.instance} is already up.\n`);
+      await diag(cfg, "pre-check: already up");
       return;
     }
-    await delay(2000);
+    await verifyCompatibilityPatches(cfg);
+    // Detach completely (the nohup/disown equivalent): a background job that
+    // keeps the caller's stdout open makes piping scripts wait forever.
+    // [windows-desktop] F10.6 —— spawnDetached 以追加模式打开日志文件；当
+    // instance 工作区还在但 jw root（打包模式 = dataDir\jiuwenswarm）被清空
+    // 时该目录可能不存在，openSync 直接抛错 → 先确保目录存在。
+    await mkdir(dirname(cfg.logFile), { recursive: true });
+    const bootstrapPath = join(repositoryRoot, "services", "adapter", "src", "sciencediscovery_adapter");
+    const child = spawnDetached(jwBin(cfg, "jiuwenswarm-start"), ["--name", cfg.instance, "app"], {
+      cwd: cfg.root,
+      logFile: cfg.logFile,
+      env: {
+        SCIENCE_AGENT_JIUWENSWARM_BOOTSTRAP: "1",
+        PYTHONPATH: [bootstrapPath, process.env.PYTHONPATH].filter(Boolean).join(delimiter),
+        JIUWENSWARM_DATA_DIR: cfg.dataDir,
+        ...(cfg.home ? { JIUWENSWARM_HOME: cfg.home } : {}),
+      },
+    });
+    await diag(cfg, `spawn: detached pid=${child.pid ?? "?"} log=${cfg.logFile}`);
+
+    // [windows-desktop] F10.6 —— 等待环：真·墙钟 deadline（240s）+ TCP 直探
+    // （毫秒级，替代旧的"每 2s 一个冷 python status"）+ 每 15s 打点（stderr →
+    // shell.log → loading 页显示"已等 Ns"，卡住不再表现为冻结）。旧行为的
+    // "90 次 × 冷 python" 在杀软机器上实为 45-90 分钟假死，见文件头注释。
+    const loopStartedAt = Date.now();
+    const deadline = loopStartedAt + PROBE_DEADLINE_MS;
+    let attempt = 0;
+    let lastProgressAt = 0;
+    for (;;) {
+      if (Date.now() >= deadline) break;
+      attempt += 1;
+      const listening = ports?.gateway
+        ? await probeTcp("127.0.0.1", ports.gateway, 2000)
+        : await isUp(cfg); // 无 .env 端口的兜底：python status（单次有超时，总时长被 deadline 罩住）
+      if (listening) {
+        // The gateway accepts connections a few seconds before the agent server answers.
+        await delay(6000);
+        const status = await instanceStatus(cfg);
+        if (status.running && status.ports.gateway) {
+          process.stderr.write(`JiuwenSwarm instance ${cfg.instance} is up (gateway ${status.ports.gateway}, web ${status.ports.web}).\n`);
+          await diag(cfg, `up: attempt #${attempt} gateway=${status.ports.gateway} web=${status.ports.web}`);
+          return;
+        }
+        await diag(cfg, `probe #${attempt}: gateway answered but status says not running; continuing`);
+      } else {
+        const elapsedSec = Math.round((Date.now() - loopStartedAt) / 1000);
+        if (Date.now() - lastProgressAt >= PROBE_PROGRESS_MS) {
+          lastProgressAt = Date.now();
+          process.stderr.write(`JiuwenSwarm: still starting (${elapsedSec}s elapsed, probe #${attempt})...\n`);
+          await diag(cfg, `probe #${attempt}: gateway ${ports?.gateway ?? "?"} not listening after ${elapsedSec}s`);
+        }
+      }
+      await delay(PROBE_INTERVAL_MS);
+    }
+    throw new Error(
+      `JiuwenSwarm did not come up within ${PROBE_DEADLINE_MS / 1000}s (probes: ${attempt}); ` +
+      `diagnostics: ${startupDiagPath(cfg)}; instance log: ${cfg.logFile}`,
+    );
+  } finally {
+    await diag(cfg, `──── start end: total=${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
   }
-  throw new Error(`JiuwenSwarm did not come up within 180s; see ${cfg.logFile}`);
 }
 
 export async function cmdStop(cfg = jwConfig()) {
