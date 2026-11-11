@@ -341,6 +341,32 @@ these bytes, do NOT hand-fix; rerun this gate after checking the notary log
     printf '%s\n' "$SPCTL_APP" | grep -q 'accepted' \
       || die "spctl rejected the .app: $SPCTL_APP"
     echo "spctl accepted DMG + .app — notarized release OK"
+
+    # --- 5f. release asset manifest (B4-2: upload is manual, this gates) ---
+    # The zip target emits latest-mac.yml + .blockmap alongside the carrier
+    # zip (ArchiveTarget isWriteUpdateInfo=true — requires the publish
+    # section to exist, which is why electron-builder.yml carries it).
+    # Gate: all four assets must exist; upload itself is MANUAL (gh CLI or
+    # the GitHub web UI) — commands printed below, run after review.
+    LATEST_YML="$SHELL_ROOT/release/latest-mac.yml"
+    [ -f "$LATEST_YML" ] || die "5f: missing latest-mac.yml (zip target did not write update info — is the publish section present in electron-builder.yml?)"
+    BLOCKMAP="${ZIP%.zip}.blockmap"
+    [ -f "$BLOCKMAP" ] || die "5f: missing ${BLOCKMAP##*/} (differential update data)"
+    echo ""
+    echo "=== release asset manifest (upload manually, D4 §1) ==================="
+    for asset in "$DMG" "$ZIP" "$LATEST_YML" "$BLOCKMAP"; do
+      printf '  %s  (%s bytes)\n' "$(basename "$asset")" "$(stat -f%z "$asset")"
+    done
+    echo "======================================================================="
+    echo "Create a draft release (v${SD_RELEASE_TAG:-<version>}), upload all four assets,"
+    echo "verify Gatekeeper on a clean machine, then publish. gh CLI:"
+    echo "  gh release create v<version> \\"
+    echo "    '$DMG' '$ZIP' '$LATEST_YML' '$BLOCKMAP' --draft --title 'v<version>'"
+    echo "or with the API token electron-builder knows:"
+    echo "  GH_TOKEN=<token> npx electron-builder --mac --publish always \\"
+    echo "    --config.mac.identity='$SD_MAC_IDENTITY'"
+    echo "(update-source URL is frozen from first public release — D4 §5 iron rule;"
+    echo " the publish block in electron-builder.yml IS that source of truth)"
   fi
 fi
 

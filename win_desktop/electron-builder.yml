@@ -87,3 +87,23 @@ dmg:
   # verified in dmg-builder@26.15.3 dmg.js signDmg(): no error, just a skip.
   # DMG signing is what lets `spctl -a -vv` pass on the installer itself.
   sign: true
+
+# --- Update source & release publishing (B4-2, D4 §1/§5) --------------------
+# IRON RULE (D4 §5): the update-source URL is frozen from the first public
+# release and never changed — this publish block IS that source of truth:
+# the same config feeds electron-builder's asset upload (B4-2) and will feed
+# electron-updater in the shell (B4-3). Changing owner/repo after release
+# strands every installed updater.
+publish:
+  - provider: github
+    owner: qingkwl
+    repo: sciencediscovery
+    # vPrefixedTagName default (v0.3.1) + releaseType draft keep the Windows
+    # release cadence. Note: with provider=github the channel file is always
+    # `latest-mac.yml` (arch suffix only applies on Linux) — v1 is arm64-only
+    # so there is exactly one; when x64 ships it MUST go to a separate
+    # release/directory or the two latest-mac.yml overwrite each other (D4 §1).
+    # upload is MANUAL by default: build-mac.sh 5f prints the asset manifest
+    # and the exact gh CLI commands; `--publish always` + GH_TOKEN flips
+    # electron-builder into auto-upload if ever wanted.
+    releaseType: draft
