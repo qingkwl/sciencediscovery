@@ -1,8 +1,8 @@
-# Packaging config (electron-builder): NSIS-only, per-user install without
-# UAC, an assisted first-run wizard, frozen artifact name, and the page flow
-# license → directory → progress → finish. The backend payload tree rides
-# extraResources as plain files (no physical split), so unchanged big pieces
-# keep their blockmap blocks and differential updates never re-download them.
+# Packaging config (electron-builder): NSIS (win32) + DMG/zip (darwin, macOS
+# adaptation D4 §2). Per-user install without UAC, an assisted first-run
+# wizard, frozen artifact names. The backend payload tree rides extraResources
+# as plain files (no physical split), so unchanged big pieces keep their
+# blockmap blocks and differential updates never re-download them.
 appId: cn.sciencediscovery.desktop
 productName: ScienceDiscovery
 copyright: Apache-2.0
@@ -15,7 +15,8 @@ directories:
 afterPack: scripts/after-pack-trim-locales.cjs
 
 # Only the shell code goes into the asar; the backend payload is plain files
-# under resources/ (staged by scripts/assemble-backend.mjs).
+# under resources/ (staged by scripts/assemble-backend.mjs — on darwin build
+# it with `--platform darwin-arm64` first, or the payload layout is win32's).
 files:
   - dist/**
   - package.json
@@ -51,3 +52,32 @@ nsis:
   # Installer presentation tweaks (progress bar behavior) live in
   # build/installer.nsh.
   include: build/installer.nsh
+
+# --- macOS (D4 §1/§2) -------------------------------------------------------
+# v1 ships arm64 only (D3 §4 per-arch plan C; darwin-x64 awaits real demand,
+# then Rosetta plan B). zip is the electron-updater carrier — on darwin the
+# updater only consumes zip, the DMG never rides the update flow.
+# NOTE: zip has no dedicated config section (schema rejects a top-level
+# `zip:` key); both targets take their names from mac.artifactName's
+# ${arch} substitution, which resolves to arm64 here.
+mac:
+  target:
+    - target: dmg
+      arch: [arm64]
+    - target: zip
+      arch: [arm64]
+  icon: build/icon.icns
+  category: public.app-category.productivity
+  # Notarization prerequisites (D4 §3); B4-1 wires the Developer ID identity,
+  # until then builds sign ad-hoc for local smoke only.
+  hardenedRuntime: true
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  artifactName: ScienceDiscovery-${version}-mac-${arch}.${ext}
+
+dmg:
+  # Standard drag-to-Applications layout: app on the left, /Applications alias
+  # on the right (D4 §2).
+  contents:
+    - { x: 120, y: 160, type: file }
+    - { x: 400, y: 160, type: link, path: /Applications }
