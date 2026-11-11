@@ -13,6 +13,9 @@ import { createConnection, createServer } from "node:net";
 import { dirname, join } from "node:path";
 import { bootstrapPackaged, needsUnpack, packagedEnv, packagedPaths, type PackagedPaths } from "./bootstrap.ts";
 import { healthUrl, resolveDataDir, resolveRepoRoot, tokenFilePath, uiUrl } from "./config.ts";
+import {
+  darwinRoleMenu, IS_DARWIN, shellLogDirFor, shouldInstallRoleMenu, shouldQuitOnAllWindowsClosed, wantsTray,
+} from "./shell-platform.ts";
 import { FIRST_CHAT_WARMUP_PATH, runFirstChatWarmup } from "./first-chat-warmup.ts";
 import { provisioningLineToStage, STAGE_TEXTS, stackLineToStage, stageProgress } from "./loading-stage.ts";
 import {
@@ -76,9 +79,13 @@ const SHELL_LOG_MAX_BYTES = 5 * 1024 * 1024;
 let shellLogFile: string | null = null;
 
 function shellLogDir(): string {
-  return app.isPackaged
-    ? join(dirname(app.getPath("exe")), "logs")
-    : join(app.getPath("userData"), "logs");
+  // Platform decision lives in shell-platform.ts (D-mac-01: notarized .app
+  // bundles must not write inside the bundle — logs go to ~/Library/Logs).
+  return shellLogDirFor(IS_DARWIN ? "darwin" : "win32", app.isPackaged, {
+    exe: app.getPath("exe"),
+    userData: app.getPath("userData"),
+    logs: app.getPath("logs"),
+  });
 }
 
 /**
@@ -1385,6 +1392,10 @@ function attachAuthFallback(endpoints: Endpoints): void {
 }
 
 function buildTray(): void {
+  // darwin: no system-tray culture (top-level v1 decision) — quitting and
+  // window management live in the Dock + application menu. Guard INSIDE the
+  // builder so no future call site can resurrect the tray on darwin.
+  if (!wantsTray(IS_DARWIN ? "darwin" : "win32")) return;
   // Real icon from the bundled dist/icon.png (build.mjs copies
   // build/icon-256.png there; electron-builder packs dist/ into the asar).
   // Windows auto-scales for the tray; the old inline 16x16 blue square was
@@ -1516,8 +1527,10 @@ void app.whenReady().then(async () => {
   // module load; never start windows/stack in a process that is leaving.
   if (!gotSingleInstanceLock) return;
   SD_PERF("app-ready", `sinceModuleLoad=${Date.now() - sdPerfT0}ms`);
-  // Be explicit that renderer traffic follows the Windows system proxy
-  // (Chromium default, stated here so no one "fixes" it to direct).
+  // Be explicit that renderer traffic follows the OS system proxy
+  // (Chromium default, stated here so no one "fixes" it to direct; the
+  // system source differs per platform — registry on win32, scutil on
+  // darwin — but Chromium's "system" mode means the same thing).
   void session.defaultSession.setProxy({ mode: "system" }).catch(() => { /* keep default */ });
 
   const systemProxy = await readSystemProxy();
@@ -1545,11 +1558,26 @@ void app.whenReady().then(async () => {
   persistedWizard = wizardState;
   wizardMode = needsWizard(wizardState);
 
-  // No app menu bar — production users need none of it (reload/devtools/
-  // zoom are developer affordances; quitting stays on the tray). null
-  // clears the menu bar entirely; the tray context menu below is
+  // win32: no app menu bar — production users need none of it (reload/
+  // devtools/zoom are developer affordances; quitting stays on the tray).
+  // null clears the menu bar entirely; the tray context menu below is
   // unaffected.
-  Menu.setApplicationMenu(null);
+  // darwin: a minimal role menu is mandatory (Cmd+Q/Cmd+W bindings,
+  // clipboard key equivalents, "bring all to front"); viewMenu (reload/
+  // devtools) is dev-only, same developer-affordance call as win32.
+  if (shouldInstallRoleMenu(IS_DARWIN ? "darwin" : "win32")) {
+    const spec = darwinRoleMenu(!app.isPackaged);
+    const entry = (e: { role?: string; separator?: boolean }): Electron.MenuItemConstructorOptions =>
+      e.separator === true ? { type: "separator" } : { role: e.role as Electron.MenuItemConstructorOptions["role"] };
+    Menu.setApplicationMenu(Menu.buildFromTemplate([
+      { ...spec.appMenu, submenu: spec.appMenu.submenu.map(entry) },
+      { ...spec.editMenu, submenu: spec.editMenu.submenu.map(entry) },
+      ...(spec.viewMenu ? [{ ...spec.viewMenu, submenu: spec.viewMenu.submenu.map(entry) }] : []),
+      { ...spec.windowMenu, submenu: spec.windowMenu.submenu.map(entry) },
+    ]));
+  } else {
+    Menu.setApplicationMenu(null);
+  }
   buildTray();
   createWindow();
   SD_PERF("window-created");
@@ -1573,8 +1601,10 @@ void app.whenReady().then(async () => {
 });
 
 app.on("window-all-closed", () => {
-  // Windows convention: stay alive in tray until the user quits from the tray.
-  if (!tray) app.quit();
+  // win32 convention: stay alive in tray until the user quits from the
+  // tray. darwin: stay alive too — Dock icon + backend keep running; the
+  // activate handler recreates the window (decision in shell-platform.ts).
+  if (shouldQuitOnAllWindowsClosed(IS_DARWIN ? "darwin" : "win32", tray !== null)) app.quit();
 });
 
 app.on("will-quit", event => {
