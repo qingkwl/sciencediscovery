@@ -74,7 +74,10 @@ test("runSelfCheck: all green", async () => {
     { pattern: /\/api\/settings$/, reply: () => ({ status: 200, body: { effective: { modelId: "m" } } }) },
   ]);
   const res = await runSelfCheck(BASE, TOKEN, "http://127.0.0.1:4311", fetchImpl);
-  assert.deepEqual(res, { api: true, runner: true, runnerChecked: true, modelConfigured: true, ok: true });
+  assert.deepEqual(res, {
+    api: true, runner: true, runnerChecked: true, modelConfigured: true,
+    seatbelt: "unknown", ok: true,
+  });
 });
 
 test("runSelfCheck: runner not ready fails the gate", async () => {
@@ -147,4 +150,61 @@ test("an unconfigured model never blocks entry (just-in-time config)", async () 
   const res = await runSelfCheck(BASE, TOKEN, "http://127.0.0.1:4311", fetchImpl);
   assert.equal(res.modelConfigured, false);
   assert.equal(res.ok, true, "modelConfigured is informational — ok must not depend on it");
+});
+
+// --- Seatbelt gate (B2-2, D2 §8) -----------------------------------------------
+
+test("a failed Seatbelt verdict gates entry fail-closed and skips backend probes", async () => {
+  // Every route would answer green; the failed probe must never ask.
+  const { fetchImpl, calls } = makeFetch([
+    { pattern: /\/api\/health$/, reply: () => ({ status: 200, body: { status: "ok" } }) },
+    { pattern: /\/health$/, reply: () => ({ status: 200, body: { execution: { ready: true } } }) },
+    { pattern: /\/api\/settings$/, reply: () => ({ status: 200, body: { effective: { modelId: "m" } } }) },
+  ]);
+  const res = await runSelfCheck(BASE, TOKEN, "http://127.0.0.1:4311", fetchImpl, {
+    kind: "failed",
+    reason: "沙箱探测失败（sandbox-exec 退出码 71）",
+    diagnostics: ["sandbox-exec -p '(version 1)(allow default)' /usr/bin/true"],
+  });
+  assert.equal(res.seatbelt, "failed");
+  assert.equal(res.ok, false, "upstream red line: a failed probe never passes go");
+  assert.equal(res.api, false);
+  assert.equal(res.modelConfigured, false);
+  assert.equal(res.seatbeltReason?.includes("71"), true);
+  assert.deepEqual(res.seatbeltDiagnostics, ["sandbox-exec -p '(version 1)(allow default)' /usr/bin/true"]);
+  assert.equal(calls.length, 0, "fail-closed short-circuits before any backend round-trip");
+});
+
+test("an ok Seatbelt verdict passes through and never gates", async () => {
+  const { fetchImpl } = makeFetch([
+    apiHealth(READY_DETAIL),
+    { pattern: /\/api\/settings$/, reply: () => ({ status: 200, body: { effective: { modelId: "m" } } }) },
+  ]);
+  const res = await runSelfCheck(BASE, TOKEN, "http://127.0.0.1:4311", fetchImpl, { kind: "ok" });
+  assert.equal(res.seatbelt, "ok");
+  assert.equal(res.ok, true);
+});
+
+test("not-applicable (Windows) never gates and carries no reason", async () => {
+  const { fetchImpl } = makeFetch([
+    apiHealth(READY_DETAIL),
+    { pattern: /\/api\/settings$/, reply: () => ({ status: 200, body: { effective: { modelId: "m" } } }) },
+  ]);
+  const res = await runSelfCheck(BASE, TOKEN, "http://127.0.0.1:4311", fetchImpl, {
+    kind: "not-applicable", reason: "ignored",
+  });
+  assert.equal(res.seatbelt, "not-applicable");
+  assert.equal(res.ok, true);
+  assert.equal(res.seatbeltReason, undefined);
+  assert.equal(res.seatbeltDiagnostics, undefined);
+});
+
+test("no probe argument (plain-browser path) reports unknown and never gates", async () => {
+  const { fetchImpl } = makeFetch([
+    apiHealth(READY_DETAIL),
+    { pattern: /\/api\/settings$/, reply: () => ({ status: 200, body: { effective: { modelId: "m" } } }) },
+  ]);
+  const res = await runSelfCheck(BASE, TOKEN, "http://127.0.0.1:4311", fetchImpl);
+  assert.equal(res.seatbelt, "unknown");
+  assert.equal(res.ok, true);
 });
