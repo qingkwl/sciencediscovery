@@ -106,6 +106,14 @@ export function packagedEnv(paths: PackagedPaths, dataDir: string, platform: She
     // belongs in the data dir per the "never write user data into the install
     // tree" discipline.
     JIUWENSWARM_ROOT: join(dataDir, "jiuwenswarm"),
+    // HOME-class anchor for the jw workspace/registry/logs (.jiuwenswarm-instances,
+    // .jiuwenswarm, jiuwenswarm-<instance>.log all hang off it). Without this,
+    // scripts/jiuwenswarm.mjs jwConfig falls back to process.env.HOME and the
+    // instance workspace lands in ~/.jiuwenswarm-instances — violating the data
+    // dir discipline on both Windows (P2 legacy) and macOS (W1). Shaped after
+    // services/launcher's embedded form (dataDir/jiuwenswarm-home) so both
+    // deployment modes put the dot-dirs under the same subdirectory.
+    JIUWENSWARM_HOME: join(dataDir, "jiuwenswarm-home"),
     JIUWENSWARM_SRC: paths.jwSrc,
     // The api defaults paper's interpreter to a POSIX-style venv path that
     // never exists on Windows; point it at the shared sidecar venv
