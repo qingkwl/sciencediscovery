@@ -88,6 +88,11 @@ const exportFile = {
 
 contextBridge.exposeInMainWorld("sdShell", {
   tokenInjected: injected,
+  /** Platform tag for the shell's own pages ("win32" | "darwin" | "linux"),
+   *  so Windows-specific copy (antivirus hints, MAX_PATH advice) can be
+   *  swapped without UA sniffing. Truth comes from the main process's world,
+   *  not the renderer. */
+  platform: process.platform,
   /** Takeover: the shell wizard (data directory) and the startup flow
    *  always complete before any SPA is loaded in this app — loadUi happens
    *  only after the stack is healthy, which only happens after the data-dir

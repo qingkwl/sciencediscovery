@@ -208,10 +208,16 @@
       lastCheckOk = res.ok;
       $("next").disabled = !res.ok;
       if (!path.trim()) { box.innerHTML = ""; return; }
+      // Windows-specific copy (antivirus) swaps per platform; the main
+      // process's own `reason` for the blocking case is already
+      // platform-aware since B1-7 (see wizard-data-dir.ts evaluateDataDir).
+      const notWritable = (window.sdShell && window.sdShell.platform === "darwin")
+        ? "✗ 目录不可写（请检查权限）"
+        : "✗ 目录不可写（请检查权限或杀毒软件）";
       const lines = [];
       lines.push(res.writable
         ? '<span class="is-ok">✓ 目录可写</span>'
-        : '<span class="is-err">✗ 目录不可写（请检查权限或杀毒软件）</span>');
+        : '<span class="is-err">' + notWritable + "</span>");
       if (res.freeBytes === null || res.freeBytes === undefined) {
         lines.push('<span class="is-warn">⚠ 无法读取磁盘剩余空间</span>');
       } else if (res.freeOk) {
