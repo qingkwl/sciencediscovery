@@ -134,17 +134,35 @@ test("waitHealthyOrExited times out when the process lives but never turns healt
 // and stacked another zombie on top.
 
 test("killStackTree terminates a spawned process tree", async () => {
-  // A real tree: cmd.exe with a ping child, like start-stack.mjs parenting
-  // its services. taskkill /PID <pid> /T /F must take down the whole tree.
-  const child = spawn("cmd.exe", ["/c", "ping -n 60 127.0.0.1"], { windowsHide: true });
+  // A real tree, like start-stack.mjs parenting its services. The kill
+  // mechanism differs per platform (taskkill /PID /T /F on win32, group
+  // SIGKILL on darwin — the spawn below mirrors the shell's own detached
+  // semantics), but both must take down the whole tree.
+  //
+  // Sandbox caveat (same family as the sandbox-exec exit 71 finding):
+  // restricted test environments can silently swallow PROCESS-GROUP
+  // signals (kill(-pid) "succeeds" but nothing dies) while direct-pid
+  // kills keep working. killStackTree's darwin branch sends BOTH a group
+  // kill and a direct leader kill, so the tree dies either way; the
+  // grandchildren reaping under a swallowed group signal is a real-machine
+  // property verified at B5-1 (M3) on actual macOS, not here.
+  const IS_DARWIN = process.platform === "darwin";
+  const child = IS_DARWIN
+    ? spawn("/bin/sh", ["-c", "sleep 30 & sleep 30 & wait"], { detached: true, stdio: "ignore" })
+    : spawn("cmd.exe", ["/c", "ping -n 60 127.0.0.1"], { windowsHide: true });
   const pid = child.pid;
   assert.ok(pid, "spawned child must have a pid");
   const exited = new Promise<number | null>((resolve) => child.once("exit", (code) => resolve(code)));
-  // Give the tree a moment to actually start (ping child must exist too).
+  // Give the tree a moment to actually start (child processes must exist too).
   await new Promise((done) => setTimeout(done, 400));
   assert.equal(child.exitCode, null, "tree should still be alive before the kill");
 
   await killStackTree(pid, () => {});
   const code = await exited;
-  assert.notEqual(code, null, "killStackTree must have terminated the tree");
+  // POSIX signal deaths report code=null + signal=SIGKILL; win32 taskkill
+  // deaths report a numeric code. Either way the process must be GONE.
+  assert.ok(
+    code !== null || child.signalCode !== null,
+    `killStackTree must have terminated the tree (code=${code} signal=${child.signalCode})`,
+  );
 });

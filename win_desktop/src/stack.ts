@@ -6,6 +6,7 @@
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { stackEntry } from "./config.ts";
+import { IS_DARWIN } from "./shell-platform.ts";
 
 /** Arguments for the stack child process. Pure. */
 export function stackArgs(repoRoot: string): { entry: string; args: string[] } {
@@ -38,7 +39,9 @@ export interface StackHandle {
 /**
  * Spawn the stack detached from the shell's stdio but owned by the shell's
  * process group semantics: on Windows a console-less GUI app cannot send
- * Ctrl-C, so we signal via taskkill /T on the child tree after a grace window.
+ * Ctrl-C, so we signal via taskkill /T on the child tree after a grace
+ * window. On darwin the child gets its own process group (detached) so a
+ * wedged group can later be killed with kill(-pid) wholesale.
  */
 export function spawnStack(
   execPath: string,
@@ -55,6 +58,10 @@ export function spawnStack(
     env: { ...process.env, ...extraEnv, ELECTRON_RUN_AS_NODE: "1" },
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
+    // darwin: own process group — stop() can then SIGTERM the leader (its
+    // handler killTrees the whole stack) and, if the grace window runs
+    // out, SIGKILL the group without orphaning grandchildren.
+    detached: IS_DARWIN,
   });
   child.stdout?.on("data", d => log(`[stack] ${String(d).trimEnd()}`));
   child.stderr?.on("data", d => log(`[stack:err] ${String(d).trimEnd()}`));
@@ -68,16 +75,27 @@ export function spawnStack(
       if (stopping) return;
       stopping = true;
       if (child.exitCode !== null || child.signalCode !== null) return;
-      // start-stack.mjs installs SIGINT/SIGTERM handlers that kill the whole
-      // stack, but a GUI app has no console to signal, and the /F below is
-      // TerminateProcess: no handler runs at all. That is why start-stack.mjs
-      // also restores a leftover uv.lock.stack-backup on its next entry — this
-      // path leaves no chance for any in-process cleanup.
-      const kill = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true });
-      await new Promise<number | null>(resolve => kill.once("exit", code => resolve(code)));
+      // start-stack.mjs installs SIGINT/SIGTERM handlers that killTree the whole
+      // stack. A GUI app has no console to signal, so win32 uses taskkill /T: it
+      // terminates the process tree (/F is TerminateProcess — no handler runs,
+      // which is why start-stack.mjs also restores a leftover uv.lock.stack-backup
+      // on its next entry). darwin SIGTERMs the group leader instead: its handler
+      // cleans up the whole stack (start-stack.mjs L350-351), and the grace
+      // window below SIGKILLs the process group if it runs out.
+      if (!IS_DARWIN) {
+        const kill = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true });
+        await new Promise<number | null>(resolve => kill.once("exit", code => resolve(code)));
+      } else if (child.pid) {
+        try { process.kill(child.pid, "SIGTERM"); } catch { /* already gone */ }
+      }
       const done = await Promise.race([exited.then(() => true), new Promise(r => setTimeout(() => r(false), timeoutMs))]);
       if (!done && child.pid) {
-        log("stack did not exit in time; already force-killed by taskkill /T");
+        if (IS_DARWIN) {
+          log("stack did not exit after SIGTERM within the grace window; SIGKILLing the process group");
+          try { process.kill(-child.pid, "SIGKILL"); } catch { /* group already gone */ }
+        } else {
+          log("stack did not exit in time; already force-killed by taskkill /T");
+        }
       }
     },
   };
@@ -92,6 +110,15 @@ export function spawnStack(
  * rotation PermissionError storm).
  */
 export async function killStackTree(pid: number, log: (line: string) => void): Promise<void> {
+  if (IS_DARWIN) {
+    // Group kill (negative pid): the recorded spawn was made detached, so it
+    // leads its own process group. ESRCH = group already gone — the zombie
+    // we were asked to reap died on its own; not an error.
+    log(`killing stack tree pid ${pid} (SIGKILL process group)`);
+    try { process.kill(-pid, "SIGKILL"); } catch { /* group already gone */ }
+    try { process.kill(pid, 0); process.kill(pid, "SIGKILL"); } catch { /* leader already gone */ }
+    return;
+  }
   log(`killing stack tree pid ${pid} (taskkill /T /F)`);
   const kill = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true });
   await new Promise<number | null>(resolve => kill.once("exit", code => resolve(code)));
