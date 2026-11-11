@@ -17,6 +17,11 @@ export function shellPlatform(platform: NodeJS.Platform): ShellPlatform | null {
 /** Host platform, resolved once at module load (main.ts consumes this). */
 export const IS_DARWIN = shellPlatform(process.platform) === "darwin";
 
+/** The shell platform this process runs on, pre-narrowed. Callers that
+ * want injectable platform decisions take a ShellPlatform parameter and
+ * default it to this (tests inject the other side explicitly). */
+export const CURRENT_SHELL_PLATFORM: ShellPlatform = IS_DARWIN ? "darwin" : "win32";
+
 // --- shell.log location (D-mac-01) ---------------------------------------------
 
 /**
@@ -56,6 +61,59 @@ function joinWindows(a: string, b: string): string {
 function dirnameWindows(p: string): string {
   const idx = Math.max(p.lastIndexOf("\\"), p.lastIndexOf("/"));
   return idx <= 0 ? p.slice(0, 1) : p.slice(0, idx);
+}
+
+// --- bundled payload layout (bootstrap.ts path families) ------------------------
+
+/** The venv layout keys that differ between the win32 and darwin payloads.
+ *  Python itself: win32 ships python-build-standalone's python.exe with
+ *  Lib\ and Scripts\; darwin ships the same distribution's POSIX layout
+ *  (python3, bin/, lib/python3.<minor>/). */
+export interface VenvLayout {
+  /** Base interpreter executable name in <resources>/python. */
+  basePython: string;
+  /** Executable directory inside a venv. */
+  venvBin: string;
+  /** Main venv python executable (bin/python3 on darwin, python.exe on win32). */
+  venvPython: string;
+  /** Library directory name inside a venv ("Lib" vs "lib/python3.<minor>"). */
+  venvLib: (pythonMinor: string) => string;
+  /** Site-packages path inside a venv. */
+  sitePackages: (pythonMinor: string) => string;
+  /** stdlib lib directory in the bundled base interpreter. */
+  stdlibLib: (pythonMinor: string) => string;
+  /** micromamba executable name. */
+  micromamba: string;
+}
+
+export function venvLayoutFor(platform: ShellPlatform): VenvLayout {
+  if (platform === "darwin") {
+    return {
+      basePython: "python3",
+      venvBin: "bin",
+      venvPython: "python3",
+      venvLib: minor => `lib/python3.${minor}`,
+      sitePackages: minor => `lib/python3.${minor}/site-packages`,
+      stdlibLib: minor => `lib/python3.${minor}`,
+      micromamba: "micromamba",
+    };
+  }
+  return {
+    basePython: "python.exe",
+    venvBin: "Scripts",
+    venvPython: "python.exe",
+    venvLib: () => "Lib",
+    sitePackages: () => joinWindows("Lib", "site-packages"),
+    stdlibLib: () => "Lib",
+    micromamba: "micromamba.exe",
+  };
+}
+
+/** Parse the CPython minor version ("12" for 3.12) out of a pyvenv.cfg
+ *  `version_info = 3.12.x` line. Pure; null when absent/unreadable. */
+export function pythonMinorFromPyvenvCfg(cfgText: string): string | null {
+  const m = cfgText.match(/^version_info\s*=\s*(\d+)\.(\d+)/m);
+  return m ? m[2] : null;
 }
 
 // --- tray -----------------------------------------------------------------------
