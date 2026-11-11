@@ -22,7 +22,7 @@ import {
   epochFromEnv, firstFreeEpoch, healthUrlForPorts, MAX_PORT_EPOCH,
   portsForEpoch, probeHealthyEpoch, stackEnvForPorts, uiUrlForPorts, type StackPorts,
 } from "./ports.ts";
-import { parseRegDword, parseRegQueryValue, proxyEnvFromSystem } from "./proxy.ts";
+import { parseRegDword, parseRegQueryValue, parseScutilProxy, proxyEnvFromSystem, type SystemProxySettings as SystemProxySettingsT } from "./proxy.ts";
 import { COLD_BACKEND_TIMEOUT_MS, killStackTree, spawnStack, startupBudgetMs, summarizeStackFailure, waitHealthy, waitHealthyOrExited, type StackHandle } from "./stack.ts";
 import { shouldRetryUiLoad, UI_LOAD_RETRY_LIMIT, uiLoadRetryDelayMs, waitForUiOrigin } from "./ui-retry.ts";
 import { loadWindowState, saveWindowState } from "./window-state.ts";
@@ -446,8 +446,21 @@ function isPortBindFree(port: number): Promise<boolean> {
   });
 }
 
-/** Read the IE/system proxy from HKCU. Best-effort: any failure → null. */
-async function readSystemProxy(): Promise<{ enabled: boolean; server: string } | null> {
+/** Read the system proxy (win32: HKCU registry; darwin: scutil --proxy).
+ * Best-effort: any failure → null. */
+async function readSystemProxy(): Promise<SystemProxySettingsT | null> {
+  if (IS_DARWIN) {
+    try {
+      const out = await new Promise<string>((resolve, reject) => {
+        execFile("scutil", ["--proxy"], { timeout: 5_000 }, (err, stdout) => {
+          if (err) reject(err); else resolve(stdout);
+        });
+      });
+      return parseScutilProxy(out);
+    } catch {
+      return null;
+    }
+  }
   const key = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
   try {
     const out = await new Promise<string>((resolve, reject) => {
