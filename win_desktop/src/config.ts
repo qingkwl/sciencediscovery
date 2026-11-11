@@ -1,6 +1,7 @@
 // sd-shell configuration resolution. Pure functions only — everything here is
 // unit-tested without Electron.
-import { join } from "node:path";
+import { join, posix, win32 } from "node:path";
+import { CURRENT_SHELL_PLATFORM } from "./shell-platform.ts";
 
 /** Where the shell looks for the SD backend checkout.
  *  Packaged layout: <resources>/backend (app.isPackaged); dev: sibling
@@ -15,9 +16,17 @@ export function resolveRepoRoot(
   return join(shellDir, "..", "sciencediscovery");
 }
 
-/** Data dir: explicit env wins; otherwise the SD default (user profile). */
-export function resolveDataDir(env: NodeJS.ProcessEnv): string {
-  return env.SCIENCE_DISCOVERY_DATA_DIR ?? join(env.USERPROFILE ?? ".", ".sciencediscovery");
+/** Data dir: explicit env wins; otherwise the SD default (user profile).
+ *  darwin: HOME/.sciencediscovery (the wizard default is the full
+ *  ~/Library/Application Support path — this is only the dev/legacy fallback
+ *  for runs without wizard state, and it matches the dev-stack convention
+ *  on POSIX). The join follows the TARGET platform's dialect, so an
+ *  injected win32 branch produces backslashes on a darwin host and vice
+ *  versa — same expectation on every test machine. */
+export function resolveDataDir(env: NodeJS.ProcessEnv, platform: "win32" | "darwin" = CURRENT_SHELL_PLATFORM): string {
+  if (env.SCIENCE_DISCOVERY_DATA_DIR) return env.SCIENCE_DISCOVERY_DATA_DIR;
+  if (platform === "darwin") return posix.join(env.HOME ?? ".", ".sciencediscovery");
+  return win32.join(env.USERPROFILE ?? ".", ".sciencediscovery");
 }
 
 /** Token file inside the data dir (same layout the stack writes at bootstrap). */

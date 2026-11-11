@@ -17,17 +17,28 @@ import {
 // thing on every host), while every case that TOUCHES the filesystem builds its
 // paths from tmpdir() so a Linux runner probes /tmp instead of C:\.
 
-test("default: env override wins, then %LocalAppData%\\ScienceDiscovery", () => {
+test("default: env override wins, then the platform default", () => {
   assert.equal(defaultDataDir({ SCIENCE_DISCOVERY_DATA_DIR: "E:\\sd-data" }), "E:\\sd-data");
+  // win32 branch: dialect joins spelled literally so the expectation holds
+  // on a POSIX runner too (win32.join produces backslashes on every host).
   assert.equal(
-    defaultDataDir({ LOCALAPPDATA: "C:\\Users\\x\\AppData\\Local" }),
-    join("C:\\Users\\x\\AppData\\Local", "ScienceDiscovery"),
+    defaultDataDir({ LOCALAPPDATA: "C:\\Users\\x\\AppData\\Local" }, "win32"),
+    "C:\\Users\\x\\AppData\\Local\\ScienceDiscovery",
   );
-  assert.ok(defaultDataDir({ USERPROFILE: "C:\\Users\\x" }).endsWith(".sciencediscovery"));
+  assert.ok(defaultDataDir({ USERPROFILE: "C:\\Users\\x" }, "win32").endsWith(".sciencediscovery"));
+  // darwin: ~/Library/Application Support/ScienceDiscovery (same folder
+  // app.getPath("userData") resolves to).
+  assert.equal(
+    defaultDataDir({ HOME: "/Users/x" }, "darwin"),
+    "/Users/x/Library/Application Support/ScienceDiscovery",
+  );
+  // darwin ignores the win32 env vars even if a stray one leaks in.
+  assert.ok(defaultDataDir({ LOCALAPPDATA: "C:\\Users\\x\\AppData\\Local", HOME: "/Users/x" }, "darwin")
+    .startsWith("/Users/x"), "darwin default must be HOME-rooted");
 });
 
 test("evaluate: healthy directory passes with no warnings", () => {
-  const res = evaluateDataDir("C:\\Data\\SD", MIN_FREE_BYTES, true);
+  const res = evaluateDataDir("C:\\Data\\SD", MIN_FREE_BYTES, true, null, "win32");
   assert.equal(res.ok, true);
   assert.equal(res.reason, undefined);
   assert.deepEqual(res.warnings, []);
@@ -36,37 +47,45 @@ test("evaluate: healthy directory passes with no warnings", () => {
 });
 
 test("evaluate: low disk blocks with a reason", () => {
-  const res = evaluateDataDir("C:\\Data\\SD", 1024 ** 3, true);
+  const res = evaluateDataDir("C:\\Data\\SD", 1024 ** 3, true, null, "win32");
   assert.equal(res.ok, false);
   assert.ok(res.reason?.includes("磁盘剩余空间不足"), res.reason);
   assert.equal(res.freeOk, false);
 });
 
 test("evaluate: unknown free space also blocks (fail closed)", () => {
-  const res = evaluateDataDir("C:\\Data\\SD", null, true);
+  const res = evaluateDataDir("C:\\Data\\SD", null, true, null, "win32");
   assert.equal(res.ok, false);
 });
 
 test("evaluate: unwritable blocks", () => {
-  const res = evaluateDataDir("C:\\Data\\SD", MIN_FREE_BYTES, false);
+  const res = evaluateDataDir("C:\\Data\\SD", MIN_FREE_BYTES, false, null, "win32");
   assert.equal(res.ok, false);
   assert.ok(res.reason?.includes("不可写"), res.reason);
 });
 
-test("evaluate: path length warns at 180 and blocks past 240", () => {
+test("evaluate: path length warns at 180 and blocks past 240 (win32 gate)", () => {
   const warnPath = "C:\\" + "a".repeat(DATA_DIR_WARN_LENGTH);
   assert.equal(warnPath.length, DATA_DIR_WARN_LENGTH + 3);
-  const warned = evaluateDataDir(warnPath, MIN_FREE_BYTES, true);
+  const warned = evaluateDataDir(warnPath, MIN_FREE_BYTES, true, null, "win32");
   assert.equal(warned.ok, true, "180–240 is a warning, not a block");
   assert.equal(warned.pathLengthWarn, true);
   assert.ok(warned.warnings.some(w => w.includes("260")));
 
   const longPath = "C:\\" + "a".repeat(DATA_DIR_MAX_LENGTH);
   assert.ok(longPath.length > DATA_DIR_MAX_LENGTH);
-  const blocked = evaluateDataDir(longPath, MIN_FREE_BYTES, true);
+  const blocked = evaluateDataDir(longPath, MIN_FREE_BYTES, true, null, "win32");
   assert.equal(blocked.ok, false);
   assert.equal(blocked.pathTooLong, true);
   assert.ok(blocked.reason?.includes("路径过长"), blocked.reason);
+
+  // darwin: no MAX_PATH — the same absurdly long path neither warns nor blocks
+  // (APFS caps a single component at 255 chars, and Python reports a
+  // too-long component clearly on its own).
+  const darwinVerdict = evaluateDataDir(longPath, MIN_FREE_BYTES, true, null, "darwin");
+  assert.equal(darwinVerdict.pathLengthWarn, false);
+  assert.equal(darwinVerdict.pathTooLong, false);
+  assert.equal(darwinVerdict.ok, true, "length alone must not block a darwin data dir");
 });
 
 test("freeBytesForPath: existing dir → positive; deep nonexistent path → ancestor's stat", () => {
@@ -215,7 +234,7 @@ test("installRootCollision: no install root means nothing to collide with", () =
 
 test("evaluateDataDir: a colliding dir blocks even when it is writable with room", () => {
   const install = "C:\\Apps\\ScienceDiscoveryApp";
-  const res = evaluateDataDir(`${install}\\envs`, MIN_FREE_BYTES, true, install);
+  const res = evaluateDataDir(`${install}\\envs`, MIN_FREE_BYTES, true, install, "win32");
   assert.equal(res.ok, false, "collision must block");
   assert.equal(res.collidesWithInstall, true);
   assert.ok(res.reason?.includes("位于安装目录内"), res.reason);
@@ -231,23 +250,23 @@ test("evaluateDataDir: reason precedence keeps the fixable message last", () => 
   const colliding = `${install}\\envs`;
   // Unwritable outranks the collision: no path choice fixes a permission
   // problem, so saying "pick another dir" would send the user nowhere.
-  const unwritable = evaluateDataDir(colliding, MIN_FREE_BYTES, false, install);
+  const unwritable = evaluateDataDir(colliding, MIN_FREE_BYTES, false, install, "win32");
   assert.equal(unwritable.ok, false);
   assert.equal(unwritable.collidesWithInstall, true);
   assert.ok(unwritable.reason?.includes("不可写"), unwritable.reason);
   // A too-long path outranks the collision for the same reason, and the length
   // check is what actually predicts a broken environment.
   const longColliding = `${install}\\${"a".repeat(DATA_DIR_MAX_LENGTH)}`;
-  const long = evaluateDataDir(longColliding, MIN_FREE_BYTES, true, install);
+  const long = evaluateDataDir(longColliding, MIN_FREE_BYTES, true, install, "win32");
   assert.equal(long.pathTooLong, true);
   assert.ok(long.reason?.includes("路径过长"), long.reason);
   // …but a healthy colliding dir reports the collision.
-  assert.ok(evaluateDataDir(colliding, MIN_FREE_BYTES, true, install).reason?.includes("安装目录"));
+  assert.ok(evaluateDataDir(colliding, MIN_FREE_BYTES, true, install, "win32").reason?.includes("安装目录"));
 });
 
 test("evaluateDataDir: without an install root nothing changes", () => {
   // The default parameter must keep every pre-W16 caller's verdict identical.
-  const res = evaluateDataDir("C:\\Data\\SD", MIN_FREE_BYTES, true);
+  const res = evaluateDataDir("C:\\Data\\SD", MIN_FREE_BYTES, true, null, "win32");
   assert.equal(res.ok, true);
   assert.equal(res.collidesWithInstall, false);
   assert.deepEqual(res.warnings, []);
