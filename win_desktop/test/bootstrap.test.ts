@@ -6,13 +6,22 @@ import { test } from "node:test";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 
 import {
   bootstrapPackaged, compileallArgs, copyTreeConcurrent, countBytecode, needsUnpack, packagedEnv, packagedPaths,
   precompileTargets, readPayloadBytecodeManifest, rewriteEditablePth, rewritePyvenvHome, stampPath, treeHasPycache,
 } from "../src/bootstrap.ts";
 import { resolveRepoRoot } from "../src/config.ts";
+import { pythonMinorFromPyvenvCfg, venvLayoutFor } from "../src/shell-platform.ts";
+
+// Platform-aware fixtures: the tests below exercise the CURRENT host's
+// payload layout, so they are meaningful on both win32 (Windows dev/test
+// machines) and darwin (Mac dev machines). Cross-platform branch coverage
+// (the darwin path families on a win32 host and vice versa) is injected
+// explicitly via the platform parameter.
+const IS_DARWIN = process.platform === "darwin";
+const SEP = sep; // host separator — fixtures build paths that match the code's output on THIS machine
 
 // --- resolveRepoRoot: packaged vs dev ----------------------------------------
 
@@ -26,8 +35,8 @@ test("resolveRepoRoot prefers env, then packaged layout, then dev sibling", () =
 
 // --- packagedPaths ------------------------------------------------------------
 
-test("packagedPaths maps the installer layout", () => {
-  const p = packagedPaths("C:\\Program Files\\SD\\resources");
+test("packagedPaths maps the installer layout (win32)", () => {
+  const p = packagedPaths("C:\\Program Files\\SD\\resources", "win32");
   assert.equal(p.backend, join("C:\\Program Files\\SD\\resources", "backend"));
   assert.equal(p.python, join("C:\\Program Files\\SD\\resources", "python"));
   assert.equal(p.micromamba, join("C:\\Program Files\\SD\\resources", "micromamba", "micromamba.exe"));
@@ -39,11 +48,20 @@ test("packagedPaths maps the installer layout", () => {
   assert.equal(p.jwSrc, join("C:\\Program Files\\SD\\resources", "backend", "jw"));
 });
 
+test("packagedPaths maps the darwin payload layout (no .exe suffixes)", () => {
+  const p = packagedPaths("/Applications/ScienceDiscovery.app/Contents/Resources", "darwin");
+  assert.equal(p.micromamba, join("/Applications/ScienceDiscovery.app/Contents/Resources", "micromamba", "micromamba"));
+  assert.ok(!p.micromamba.endsWith(".exe"), "darwin micromamba has no suffix");
+  // The rest of the layout (backend/python/envs-template/jw) is identical.
+  assert.equal(p.backend, join("/Applications/ScienceDiscovery.app/Contents/Resources", "backend"));
+  assert.equal(p.jwSrc, join("/Applications/ScienceDiscovery.app/Contents/Resources", "backend", "jw"));
+});
+
 // --- packagedEnv ---------------------------------------------------------------
 
-test("packagedEnv injects the packaged-mode contract", () => {
-  const p = packagedPaths("C:\\res");
-  const env = packagedEnv(p, "D:\\data");
+test("packagedEnv injects the packaged-mode contract (win32)", () => {
+  const p = packagedPaths("C:\\res", "win32");
+  const env = packagedEnv(p, "D:\\data", "win32");
   assert.equal(env.SCIENCE_AGENT_PACKAGED, "1");
   assert.equal(env.SCIENCE_AGENT_PYTHON_PATH, join("C:\\res", "python", "python.exe"));
   assert.equal(env.SCIENCE_AGENT_PROVISIONER_PATH, join("C:\\res", "micromamba", "micromamba.exe"));
@@ -52,6 +70,20 @@ test("packagedEnv injects the packaged-mode contract", () => {
   assert.equal(env.JIUWENSWARM_ROOT, join("D:\\data", "jiuwenswarm"));
   assert.equal(env.JIUWENSWARM_SRC, join("C:\\res", "backend", "jw"));
   assert.equal(env.SCIENCE_AGENT_PAPER_PYTHON_PATH, join("D:\\data", "envs", "sd-services", "Scripts", "python.exe"));
+  // The Windows-only unisolated opt-in (Seatbelt exists nowhere on win32).
+  assert.equal(env.SCIENCE_AGENT_EVOLVE_UNISOLATED, "1");
+});
+
+test("packagedEnv: darwin uses POSIX venv paths and NEVER opts into unisolated", () => {
+  const p = packagedPaths("/res", "darwin");
+  const env = packagedEnv(p, "/data", "darwin");
+  assert.equal(env.SCIENCE_AGENT_PYTHON_PATH, join("/res", "python", "python3"));
+  assert.equal(env.SCIENCE_AGENT_PROVISIONER_PATH, join("/res", "micromamba", "micromamba"));
+  assert.equal(env.SCIENCE_AGENT_PAPER_PYTHON_PATH, join("/data", "envs", "sd-services", "bin", "python3"));
+  // Seatbelt answers on darwin without any opt-in; the unisolated escape
+  // hatch stays a Windows-only contract (defense in depth even though the
+  // api's darwin branch ignores the flag today).
+  assert.equal(env.SCIENCE_AGENT_EVOLVE_UNISOLATED, undefined);
 });
 
 // --- rewriteEditablePth --------------------------------------------------------
@@ -92,13 +124,15 @@ test("precompileTargets: before unpack only template-phase targets exist; after 
   const root = await mkdtemp(join(tmpdir(), "sd-shell-env-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const resources = join(root, "resources");
+  const layout = venvLayoutFor(IS_DARWIN ? "darwin" : "win32");
   // Bundled interpreter → stdlib is a template-phase target.
   await mkdir(join(resources, "python", "Lib"), { recursive: true });
-  await writeFile(join(resources, "python", "python.exe"), "", "utf8");
+  await writeFile(join(resources, "python", layout.basePython), "", "utf8");
   // jw venv lives in the read-only payload → template phase too.
   const jwVenv = join(resources, "backend", "jw", ".venv");
-  await mkdir(join(jwVenv, "Scripts"), { recursive: true });
-  await writeFile(join(jwVenv, "Scripts", "python.exe"), "", "utf8");
+  await mkdir(join(jwVenv, layout.venvBin), { recursive: true });
+  await writeFile(join(jwVenv, layout.venvBin, layout.venvPython), "", "utf8");
+  await writeFile(join(jwVenv, "pyvenv.cfg"), "home = /builder/python\nversion_info = 3.12.7\n", "utf8");
   const paths = packagedPaths(resources);
   const envsDir = join(root, "data", "envs");
 
@@ -107,15 +141,55 @@ test("precompileTargets: before unpack only template-phase targets exist; after 
     [["python stdlib", "template"], ["jiuwenswarm venv", "template"]]);
 
   // The copied shared venv appears as an unpacked-phase target once it exists.
-  await mkdir(join(envsDir, "sd-services", "Scripts"), { recursive: true });
-  await writeFile(join(envsDir, "sd-services", "Scripts", "python.exe"), "", "utf8");
+  await mkdir(join(envsDir, "sd-services", layout.venvBin), { recursive: true });
+  await writeFile(join(envsDir, "sd-services", layout.venvBin, layout.venvPython), "", "utf8");
+  await writeFile(join(envsDir, "sd-services", "pyvenv.cfg"), "home = /builder/python\nversion_info = 3.12.7\n", "utf8");
   const after = precompileTargets(paths, envsDir);
   assert.deepEqual(after.map((x) => [x.label, x.phase]), [
     ["python stdlib", "template"],
     ["sd-services venv", "unpacked"],
     ["jiuwenswarm venv", "template"],
   ]);
-  assert.equal(after[1].target, join(envsDir, "sd-services", "Lib", "site-packages"));
+  // site-packages follows the HOST layout (win32: Lib\site-packages;
+  // darwin: lib/python3.12/site-packages, minor read from pyvenv.cfg above).
+  const expectedSp = IS_DARWIN
+    ? join(envsDir, "sd-services", "lib", "python3.12", "site-packages")
+    : join(envsDir, "sd-services", "Lib", "site-packages");
+  assert.equal(after[1].target, expectedSp);
+  // On darwin the minor must come from the venv's own pyvenv.cfg, never a
+  // hardcode: a 3.13 venv must land its site-packages under python3.13.
+  if (IS_DARWIN) {
+    await writeFile(join(envsDir, "sd-services", "pyvenv.cfg"), "home = /builder/python\nversion_info = 3.13.1\n", "utf8");
+    const bumped = precompileTargets(paths, envsDir);
+    assert.equal(bumped[1].target, join(envsDir, "sd-services", "lib", "python3.13", "site-packages"));
+  }
+});
+
+test("precompileTargets (darwin fixture): minor comes from pyvenv.cfg, stdlib from lib/ dir listing", async (t) => {
+  // Cross-platform branch coverage: the darwin path family exercised with an
+  // explicit platform injection, meaningful on any host.
+  const root = await mkdtemp(join(tmpdir(), "sd-shell-env-darwin-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const resources = join(root, "resources");
+  // darwin base interpreter: python3 + lib/python3.13/ stdlib.
+  await mkdir(join(resources, "python", "lib", "python3.13"), { recursive: true });
+  await writeFile(join(resources, "python", "python3"), "", "utf8");
+  const paths = packagedPaths(resources, "darwin");
+  const envsDir = join(root, "data", "envs");
+
+  await mkdir(join(envsDir, "sd-services", "bin"), { recursive: true });
+  await writeFile(join(envsDir, "sd-services", "bin", "python3"), "", "utf8");
+  await writeFile(join(envsDir, "sd-services", "pyvenv.cfg"), "version_info = 3.13.5\n", "utf8");
+  const targets = precompileTargets(paths, envsDir, "darwin");
+  assert.deepEqual(targets.map((x) => x.label), ["python stdlib", "sd-services venv"]);
+  assert.equal(targets[0].target, join(resources, "python", "lib", "python3.13"), "stdlib minor discovered by listing lib/");
+  assert.equal(targets[1].target, join(envsDir, "sd-services", "lib", "python3.13", "site-packages"));
+  assert.equal(targets[1].python, join(envsDir, "sd-services", "bin", "python3"));
+
+  // A venv whose pyvenv.cfg is unreadable is skipped, not guessed.
+  await rm(join(envsDir, "sd-services", "pyvenv.cfg"), { force: true });
+  const degraded = precompileTargets(paths, envsDir, "darwin");
+  assert.deepEqual(degraded.map((x) => x.label), ["python stdlib"]);
 });
 
 // --- Concurrent tree copy -----------------------------------------------
@@ -183,18 +257,22 @@ test("bootstrapPackaged unpacks once, rewrites venv homes, and re-runs after a r
   t.after(() => rm(root, { recursive: true, force: true }));
   const resources = join(root, "resources");
   const template = join(resources, "envs-template");
+  const layout = venvLayoutFor(IS_DARWIN ? "darwin" : "win32");
+  // The .pth body keeps the platform's own separator: win32 assemble writes
+  // @@SD_BACKEND_ROOT@@\..., the darwin assemble writes @@SD_BACKEND_ROOT@@/...
+  const pthSep = IS_DARWIN ? "/" : "\\";
   // SIZEOPT W2: the payload stages one shared venv (the five sidecars' union).
   await mkdir(join(template, "sd-services"), { recursive: true });
-  await writeFile(join(template, "sd-services", "pyvenv.cfg"), "home = C:\\builder\\python\n", "utf8");
+  await writeFile(join(template, "sd-services", "pyvenv.cfg"), "home = /builder/python\nversion_info = 3.12.7\n", "utf8");
   // Editable .pth with the assemble-time backend placeholder (the shared venv
   // carries one such file per editable sidecar).
-  const sharedSp = join(template, "sd-services", "Lib", "site-packages");
+  const sharedSp = join(template, "sd-services", "lib", "python3.12", "site-packages");
   await mkdir(sharedSp, { recursive: true });
   await writeFile(join(sharedSp, "_editable_impl_sciencediscovery_gateway.pth"),
-    "@@SD_BACKEND_ROOT@@\\services\\gateway\\src\n", "utf8");
+    `@@SD_BACKEND_ROOT@@${pthSep}services${pthSep}gateway${pthSep}src\n`, "utf8");
   const jwVenv = join(resources, "backend", "jw", ".venv");
   await mkdir(jwVenv, { recursive: true });
-  await writeFile(join(jwVenv, "pyvenv.cfg"), "home = C:\\builder\\python\n", "utf8");
+  await writeFile(join(jwVenv, "pyvenv.cfg"), "home = /builder/python\nversion_info = 3.12.7\n", "utf8");
 
   const dataDir = join(root, "data");
   const paths = packagedPaths(resources);
@@ -203,15 +281,17 @@ test("bootstrapPackaged unpacks once, rewrites venv homes, and re-runs after a r
 
   const first = await bootstrapPackaged(paths, dataDir, log);
   assert.equal(first.unpacked, true);
-  // Fixture venvs carry no Scripts/python.exe → precompile skips cleanly.
+  // Fixture venvs carry no bin|Scripts python → precompile skips cleanly.
   assert.equal(first.precompiled, 0);
-  assert.equal((await readFile(join(dataDir, "envs", "sd-services", "pyvenv.cfg"), "utf8")).trim(),
-    `home = ${join(resources, "python")}`);
+  // Only the home LINE is rewritten; version_info etc. must survive.
+  const homeLine = (await readFile(join(dataDir, "envs", "sd-services", "pyvenv.cfg"), "utf8"))
+    .match(/^home\s*=.*$/m)?.[0]?.trim();
+  assert.equal(homeLine, `home = ${join(resources, "python")}`);
   assert.equal(
-    (await readFile(join(dataDir, "envs", "sd-services", "Lib", "site-packages", "_editable_impl_sciencediscovery_gateway.pth"), "utf8")).trim(),
+    (await readFile(join(dataDir, "envs", "sd-services", "lib", "python3.12", "site-packages", "_editable_impl_sciencediscovery_gateway.pth"), "utf8")).trim(),
     join(resources, "backend", "services", "gateway", "src"));
-  assert.equal((await readFile(join(jwVenv, "pyvenv.cfg"), "utf8")).trim(),
-    `home = ${join(resources, "python")}`);
+  const jwHome = (await readFile(join(jwVenv, "pyvenv.cfg"), "utf8")).match(/^home\s*=.*$/m)?.[0]?.trim();
+  assert.equal(jwHome, `home = ${join(resources, "python")}`);
 
   // Second run on the same install: stamp valid → no-op.
   const second = await bootstrapPackaged(paths, dataDir, log);
@@ -219,20 +299,20 @@ test("bootstrapPackaged unpacks once, rewrites venv homes, and re-runs after a r
 
   // A same-location reinstall re-ships the payload's in-place jw venv
   // with the builder's home; the stamp-valid no-op path must repair it too.
-  await writeFile(join(jwVenv, "pyvenv.cfg"), "home = C:\\builder\\python\n", "utf8");
+  await writeFile(join(jwVenv, "pyvenv.cfg"), "home = /builder/python\n", "utf8");
   const repaired = await bootstrapPackaged(paths, dataDir, log);
   assert.equal(repaired.unpacked, false);
-  assert.equal((await readFile(join(jwVenv, "pyvenv.cfg"), "utf8")).trim(),
-    `home = ${join(resources, "python")}`);
+  const repairedHome = (await readFile(join(jwVenv, "pyvenv.cfg"), "utf8")).match(/^home\s*=.*$/m)?.[0]?.trim();
+  assert.equal(repairedHome, `home = ${join(resources, "python")}`);
 
   // Reinstall to a different directory: stamp mismatch → re-unpack.
   const movedResources = join(root, "resources2");
   await mkdir(join(movedResources, "envs-template", "sd-services"), { recursive: true });
-  await writeFile(join(movedResources, "envs-template", "sd-services", "pyvenv.cfg"), "home = C:\\builder\\python\n", "utf8");
+  await writeFile(join(movedResources, "envs-template", "sd-services", "pyvenv.cfg"), "home = /builder/python\n", "utf8");
   const third = await bootstrapPackaged(packagedPaths(movedResources), dataDir, log);
   assert.equal(third.unpacked, true);
-  assert.equal((await readFile(join(dataDir, "envs", "sd-services", "pyvenv.cfg"), "utf8")).trim(),
-    `home = ${join(movedResources, "python")}`);
+  const thirdHome = (await readFile(join(dataDir, "envs", "sd-services", "pyvenv.cfg"), "utf8")).match(/^home\s*=.*$/m)?.[0]?.trim();
+  assert.equal(thirdHome, `home = ${join(movedResources, "python")}`);
 
   // needsUnpack mirrors the same decision.
   assert.equal(needsUnpack(dataDir, movedResources), false);
@@ -255,15 +335,17 @@ test("bootstrapPackaged in-place mode skips copy and fixes bundled venvs directl
   t.after(() => rm(root, { recursive: true, force: true }));
   const resources = join(root, "resources");
   const template = join(resources, "envs-template");
+  const layout = venvLayoutFor(IS_DARWIN ? "darwin" : "win32");
+  const pthSep = IS_DARWIN ? "/" : "\\";
   await mkdir(join(template, "sd-services"), { recursive: true });
-  await writeFile(join(template, "sd-services", "pyvenv.cfg"), "home = C:\\builder\\python\n", "utf8");
-  const sharedSp = join(template, "sd-services", "Lib", "site-packages");
+  await writeFile(join(template, "sd-services", "pyvenv.cfg"), "home = /builder/python\nversion_info = 3.12.7\n", "utf8");
+  const sharedSp = join(template, "sd-services", "lib", "python3.12", "site-packages");
   await mkdir(sharedSp, { recursive: true });
   await writeFile(join(sharedSp, "_editable_impl_sciencediscovery_gateway.pth"),
-    "@@SD_BACKEND_ROOT@@\\services\\gateway\\src\n", "utf8");
+    `@@SD_BACKEND_ROOT@@${pthSep}services${pthSep}gateway${pthSep}src\n`, "utf8");
   const jwVenv = join(resources, "backend", "jw", ".venv");
   await mkdir(jwVenv, { recursive: true });
-  await writeFile(join(jwVenv, "pyvenv.cfg"), "home = C:\\builder\\python\n", "utf8");
+  await writeFile(join(jwVenv, "pyvenv.cfg"), "home = /builder/python\nversion_info = 3.12.7\n", "utf8");
 
   const dataDir = join(root, "data");
   const paths = packagedPaths(resources);
@@ -276,10 +358,10 @@ test("bootstrapPackaged in-place mode skips copy and fixes bundled venvs directl
   // In-place mode must not copy venvs into the data directory.
   assert.equal(existsSync(join(dataDir, "envs", "sd-services")), false);
   // The template venv should be fixed in place.
-  assert.equal((await readFile(join(template, "sd-services", "pyvenv.cfg"), "utf8")).trim(),
-    `home = ${join(resources, "python")}`);
+  const inplaceHome = (await readFile(join(template, "sd-services", "pyvenv.cfg"), "utf8")).match(/^home\s*=.*$/m)?.[0]?.trim();
+  assert.equal(inplaceHome, `home = ${join(resources, "python")}`);
   assert.equal(
-    (await readFile(join(template, "sd-services", "Lib", "site-packages", "_editable_impl_sciencediscovery_gateway.pth"), "utf8")).trim(),
+    (await readFile(join(template, "sd-services", "lib", "python3.12", "site-packages", "_editable_impl_sciencediscovery_gateway.pth"), "utf8")).trim(),
     join(resources, "backend", "services", "gateway", "src"));
   // A stamp should still be written to the data dir for diagnostics.
   assert.equal(existsSync(stampPath(dataDir)), true);
@@ -300,10 +382,12 @@ test("packagedEnv uses in-place venv paths when SCIENCE_AGENT_IN_PLACE_ENVS=1", 
 
   const root = await mkdtemp(join(tmpdir(), "sd-shell-bootstrap-"));
   t.after(() => rm(root, { recursive: true, force: true }));
+  const layout = venvLayoutFor(IS_DARWIN ? "darwin" : "win32");
   const paths = packagedPaths(join(root, "resources"));
   const env = packagedEnv(paths, join(root, "data"));
   assert.equal(env.SCIENCE_AGENT_ENVS_DIR, join(root, "resources", "envs-template"));
-  assert.equal(env.SCIENCE_AGENT_PAPER_PYTHON_PATH, join(root, "resources", "envs-template", "sd-services", "Scripts", "python.exe"));
+  assert.equal(env.SCIENCE_AGENT_PAPER_PYTHON_PATH,
+    join(root, "resources", "envs-template", "sd-services", layout.venvBin, layout.venvPython));
 });
 
 // --- countBytecode / readPayloadBytecodeManifest: the first-launch IO --------

@@ -16,7 +16,7 @@
 
 import { execFile } from "node:child_process";
 import { copyFile, mkdir, readFile, readdir, readlink, rm, symlink, writeFile } from "node:fs/promises";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import type { Dirent } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -24,6 +24,7 @@ import { promisify } from "node:util";
 import { copyVenvRuntimeDlls, replaceVenvTrampolines } from "../scripts/lib/venv-launchers.mjs";
 // @ts-expect-error — plain .mjs helper shared with scripts/assemble-backend.mjs (no .d.mts in scope)
 import { payloadCompileEnv, unpackedBytecodeVerdict } from "../scripts/lib/pyc-budget.mjs";
+import { CURRENT_SHELL_PLATFORM, pythonMinorFromPyvenvCfg, venvLayoutFor, type ShellPlatform, type VenvLayout } from "./shell-platform.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -48,12 +49,13 @@ export interface PackagedPaths {
   jwSrc: string;
 }
 
-export function packagedPaths(resourcesPath: string): PackagedPaths {
+export function packagedPaths(resourcesPath: string, platform: ShellPlatform = CURRENT_SHELL_PLATFORM): PackagedPaths {
+  const layout = venvLayoutFor(platform);
   return {
     resourcesPath,
     backend: join(resourcesPath, "backend"),
     python: join(resourcesPath, "python"),
-    micromamba: join(resourcesPath, "micromamba", "micromamba.exe"),
+    micromamba: join(resourcesPath, "micromamba", layout.micromamba),
     envsTemplate: join(resourcesPath, "envs-template"),
     // SIZEOPT W2: the five Python sidecars share one venv ("sd-services",
     // staged by assemble-backend from the uv workspace lock) — see
@@ -84,15 +86,16 @@ export function stampPath(dataDir: string): string {
 }
 
 /** Env vars the packaged shell injects into every stack spawn. */
-export function packagedEnv(paths: PackagedPaths, dataDir: string): NodeJS.ProcessEnv {
+export function packagedEnv(paths: PackagedPaths, dataDir: string, platform: ShellPlatform = CURRENT_SHELL_PLATFORM): NodeJS.ProcessEnv {
+  const layout = venvLayoutFor(platform);
   // When running venvs in-place, the stack and paper service need to
   // know where the actual venvs live. Otherwise we keep the historical default
   // of <dataDir>\envs so existing paths/tests keep working.
   const inPlaceEnvs = process.env.SCIENCE_AGENT_IN_PLACE_ENVS === "1";
   const envsRoot = inPlaceEnvs ? paths.envsTemplate : join(dataDir, "envs");
-  return {
+  const env: NodeJS.ProcessEnv = {
     SCIENCE_AGENT_PACKAGED: "1",
-    SCIENCE_AGENT_PYTHON_PATH: join(paths.python, "python.exe"),
+    SCIENCE_AGENT_PYTHON_PATH: join(paths.python, layout.basePython),
     SCIENCE_AGENT_PROVISIONER_PATH: paths.micromamba,
     // No PYTHONPYCACHEPREFIX: the payload's __pycache__ is precompiled at
     // build time with content-hash invalidation (assemble-backend.mjs), so
@@ -107,20 +110,25 @@ export function packagedEnv(paths: PackagedPaths, dataDir: string): NodeJS.Proce
     // The api defaults paper's interpreter to a POSIX-style venv path that
     // never exists on Windows; point it at the shared sidecar venv
     // (SIZEOPT W2: one "sd-services" venv for all five Python sidecars).
-    SCIENCE_AGENT_PAPER_PYTHON_PATH: join(envsRoot, "sd-services", "Scripts", "python.exe"),
+    SCIENCE_AGENT_PAPER_PYTHON_PATH: join(envsRoot, "sd-services", layout.venvBin, layout.venvPython),
     // Tell the stack where to find the sidecar venvs (in-place or copied).
     SCIENCE_AGENT_ENVS_DIR: envsRoot,
-    // Windows has no bubblewrap or Seatbelt, so program evolution would be
-    // refused outright. This opts the installation into direct candidate
-    // execution — which is *not* a sandbox: a candidate runs with the user's
-    // own file, network and environment access. The API still refuses any run
-    // whose goal does not carry the user's confirmation, collected by the
-    // create dialog's warning switch. Set here and nowhere else, so a server
-    // deployment cannot pick it up by accident.
-    SCIENCE_AGENT_EVOLVE_UNISOLATED: "1",
     // Ship the new desktop UI as the renderer payload.
     SCIENCE_AGENT_WEB_DIR: "apps/desktop/dist",
   };
+  // Windows has no bubblewrap or Seatbelt, so program evolution would be
+  // refused outright. This opts the installation into direct candidate
+  // execution — which is *not* a sandbox: a candidate runs with the user's
+  // own file, network and environment access. The API still refuses any run
+  // whose goal does not carry the user's confirmation, collected by the
+  // create dialog's warning switch. Set here and nowhere else, so a server
+  // deployment cannot pick it up by accident.
+  // darwin NEVER sets it: Seatbelt answers there without any opt-in
+  // (services/api sandboxForPlatform returns "seatbelt" before reading
+  // this flag), and defense in depth keeps the unisolated escape hatch a
+  // Windows-only contract even if that branch ever changes.
+  if (platform === "win32") env.SCIENCE_AGENT_EVOLVE_UNISOLATED = "1";
+  return env;
 }
 
 /** Rewrite a pyvenv.cfg `home = ...` line to point at the bundled base
@@ -165,26 +173,82 @@ export interface PrecompileTarget {
  * actually exists on disk right now. Call once before the unpack (yields the
  * template-phase targets) and once after it (also yields the unpacked venvs).
  * Pure w.r.t. the filesystem state it observes.
+ *
+ * darwin: venv site-packages live under lib/python3.<minor> — the minor is
+ * read from each venv's own pyvenv.cfg version_info (never hardcoded), so a
+ * payload Python bump needs no shell change. The bundled base interpreter
+ * has no pyvenv.cfg; its stdlib minor is discovered by listing the lib/
+ * directory (python-build-standalone ships lib/python3.<minor>/).
  */
-export function precompileTargets(paths: PackagedPaths, envsDir: string): PrecompileTarget[] {
+export function precompileTargets(
+  paths: PackagedPaths,
+  envsDir: string,
+  platform: ShellPlatform = CURRENT_SHELL_PLATFORM,
+): PrecompileTarget[] {
+  const layout = venvLayoutFor(platform);
   const out: PrecompileTarget[] = [];
-  const basePython = join(paths.python, "python.exe");
+  const basePython = join(paths.python, layout.basePython);
   if (existsSync(basePython)) {
-    out.push({ label: "python stdlib", python: basePython, target: join(paths.python, "Lib"), phase: "template" });
+    const stdlibMinor = platform === "darwin" ? bundledStdlibMinor(paths.python) : null;
+    out.push({
+      label: "python stdlib",
+      python: basePython,
+      target: join(paths.python, layout.stdlibLib(stdlibMinor ?? "12")),
+      phase: "template",
+    });
   }
   for (const name of paths.venvNames) {
     const venvDir = join(envsDir, name);
-    const venvPython = join(venvDir, "Scripts", "python.exe");
+    const venvPython = join(venvDir, layout.venvBin, layout.venvPython);
     if (existsSync(venvPython)) {
-      out.push({ label: `${name} venv`, python: venvPython, target: join(venvDir, "Lib", "site-packages"), phase: "unpacked" });
+      const minor = venvPythonMinor(venvDir);
+      if (minor) {
+        out.push({
+          label: `${name} venv`,
+          python: venvPython,
+          target: join(venvDir, ...layout.sitePackages(minor).split("/")),
+          phase: "unpacked",
+        });
+      }
     }
   }
   const jwVenv = join(paths.jwSrc, ".venv");
-  const jwPython = join(jwVenv, "Scripts", "python.exe");
+  const jwPython = join(jwVenv, layout.venvBin, layout.venvPython);
   if (existsSync(jwPython)) {
-    out.push({ label: "jiuwenswarm venv", python: jwPython, target: join(jwVenv, "Lib", "site-packages"), phase: "template" });
+    const minor = venvPythonMinor(jwVenv);
+    if (minor) {
+      out.push({
+        label: "jiuwenswarm venv",
+        python: jwPython,
+        target: join(jwVenv, ...layout.sitePackages(minor).split("/")),
+        phase: "template",
+      });
+    }
   }
   return out;
+}
+
+/** CPython minor ("12" for 3.12) of a venv, from its own pyvenv.cfg. Pure
+ *  read; null when the cfg is missing or unreadable (target skipped). */
+function venvPythonMinor(venvDir: string): string | null {
+  try {
+    return pythonMinorFromPyvenvCfg(readFileSync(join(venvDir, "pyvenv.cfg"), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+/** CPython minor of the bundled base interpreter's stdlib, discovered from
+ *  the actual lib/python3.<minor> directory (the base has no pyvenv.cfg). */
+function bundledStdlibMinor(pythonHome: string): string | null {
+  try {
+    const entries = readdirSync(join(pythonHome, "lib"), { withFileTypes: true });
+    for (const entry of entries) {
+      const m = entry.name.match(/^python3\.(\d+)$/);
+      if (entry.isDirectory() && m) return m[1];
+    }
+  } catch { /* no lib/ dir: darwin payload shape mismatch */ }
+  return null;
 }
 
 export interface BootstrapResult {
@@ -797,12 +861,17 @@ export async function bootstrapPackaged(
  * 1.6s). The bundled runtime DLLs must sit beside the launcher; the
  * assemble script ships them, this is the idempotent first-run/reinstall
  * backstop.
+ *
+ * darwin: the whole concept is Windows-only — POSIX venvs made by uv carry
+ * bin/python as a plain symlink to the base interpreter (no trampoline, no
+ * DLLs), so there is nothing to replace or copy. Skipped outright.
  */
 async function fixVenvLaunchers(
   paths: PackagedPaths,
   envsDir: string,
   log: (line: string) => void,
 ): Promise<void> {
+  if (CURRENT_SHELL_PLATFORM === "darwin") return;
   const venvs = [...paths.venvNames.map((name) => join(envsDir, name)), join(paths.jwSrc, ".venv")];
   const existing = venvs.filter((v) => existsSync(v));
   if (existing.length) {
@@ -823,14 +892,18 @@ async function fixVenvHome(venvDir: string, pythonHome: string, log: (line: stri
 }
 
 /** Point the venv's editable-install .pth files (placeholder'ed at assemble
- * time) at the real bundled backend tree. No-op for non-placeholder files. */
+ * time) at the real bundled backend tree. No-op for non-placeholder files.
+ * The site-packages location is platform-shaped (Lib\site-packages vs
+ * lib/python3.<minor>/site-packages — minor from the venv's own pyvenv.cfg). */
 async function fixEditablePths(venvDir: string, backendRoot: string, log: (line: string) => void): Promise<void> {
-  const sitePackages = join(venvDir, "Lib", "site-packages");
+  const layout = venvLayoutFor(CURRENT_SHELL_PLATFORM);
+  const minor = venvPythonMinor(venvDir) ?? "12";
+  const sitePackages = join(venvDir, ...layout.sitePackages(minor).split("/"));
   let entries;
   try {
     entries = await readdir(sitePackages, { withFileTypes: true });
   } catch {
-    return; // not a Windows-venv layout; nothing to fix
+    return; // not a venv layout we recognize; nothing to fix
   }
   for (const entry of entries) {
     if (!entry.isFile() || !/^_editable_impl_.*\.pth$/.test(entry.name)) continue;
