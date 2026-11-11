@@ -1,7 +1,8 @@
 // Data-directory page logic. Decisions are pure (unit-tested); the
 // fs probes (statfs of the nearest existing ancestor, write probe) are thin.
 import { mkdirSync, rmSync, statfsSync, writeFileSync } from "node:fs";
-import { dirname, join, win32 } from "node:path";
+import { dirname, join, posix, win32 } from "node:path";
+import { CURRENT_SHELL_PLATFORM } from "./shell-platform.ts";
 
 /** Stack + venv provisioning + micromamba starter env reserve
  * (base ~700MB, provisioning headroom). Below this the wizard blocks. */
@@ -13,14 +14,22 @@ export const DATA_DIR_WARN_LENGTH = 180;
 export const DATA_DIR_MAX_LENGTH = 240;
 
 /**
- * Default: %LocalAppData%\ScienceDiscovery.
- * An explicit SCIENCE_DISCOVERY_DATA_DIR (dev machines) is preselected as-is.
+ * Default data dir. win32: %LocalAppData%\ScienceDiscovery. darwin:
+ * ~/Library/Application Support/ScienceDiscovery — the same folder
+ * `app.getPath("userData")` resolves to, so the shell's window-state files
+ * and the data dir live under one user-visible root without one being the
+ * other's parent. An explicit SCIENCE_DISCOVERY_DATA_DIR (dev machines) is
+ * preselected as-is on both platforms. Joins follow the TARGET platform's
+ * dialect so injected branches produce native separators on any host.
  */
-export function defaultDataDir(env: NodeJS.ProcessEnv): string {
+export function defaultDataDir(env: NodeJS.ProcessEnv, platform: "win32" | "darwin" = CURRENT_SHELL_PLATFORM): string {
   const fromEnv = env.SCIENCE_DISCOVERY_DATA_DIR?.trim();
   if (fromEnv) return fromEnv;
-  if (env.LOCALAPPDATA?.trim()) return join(env.LOCALAPPDATA, "ScienceDiscovery");
-  return join(env.USERPROFILE ?? ".", ".sciencediscovery");
+  if (platform === "darwin") {
+    return posix.join(env.HOME ?? ".", "Library", "Application Support", "ScienceDiscovery");
+  }
+  if (env.LOCALAPPDATA?.trim()) return win32.join(env.LOCALAPPDATA, "ScienceDiscovery");
+  return win32.join(env.USERPROFILE ?? ".", ".sciencediscovery");
 }
 
 export interface DataDirCheck {
@@ -40,16 +49,23 @@ export interface DataDirCheck {
 
 /** Pure decision over the probe results. `installRoot` is the install dir the
  * uninstaller deletes unconditionally; null means "nothing to collide with"
- * (dev runs, where the shell lives in the repo) and skips that check. */
+ * (dev runs, where the shell lives in the repo) and skips that check.
+ * The path-length gate is a Windows MAX_PATH concern: APFS caps a single
+ * COMPONENT at 255 chars and has no 260 total limit, so on darwin neither
+ * the warning nor the block fires (a too-long component surfaces from
+ * Python itself with a clear error — there is nothing the wizard could
+ * suggest anyway). */
 export function evaluateDataDir(
   path: string,
   freeBytes: number | null,
   writable: boolean,
   installRoot: string | null = null,
+  platform: "win32" | "darwin" = CURRENT_SHELL_PLATFORM,
 ): DataDirCheck {
   const warnings: string[] = [];
-  const pathTooLong = path.length > DATA_DIR_MAX_LENGTH;
-  const pathLengthWarn = !pathTooLong && path.length > DATA_DIR_WARN_LENGTH;
+  const lengthChecked = platform === "win32";
+  const pathTooLong = lengthChecked && path.length > DATA_DIR_MAX_LENGTH;
+  const pathLengthWarn = lengthChecked && !pathTooLong && path.length > DATA_DIR_WARN_LENGTH;
   if (pathLengthWarn) {
     warnings.push(`路径较长（${path.length} 字符）：深层虚拟环境可能超过 Windows 260 字符限制，建议选择更短的目录`);
   }
@@ -215,7 +231,11 @@ export function ensureWritableDir(path: string): boolean {
 /** Thin IO wrapper the main process calls on the wizard page's behalf.
  * `installRoot` is the install dir the data dir must stay clear of (see
  * installRootCollision); pass null in dev, where there is no install dir. */
-export function probeDataDir(path: string, installRoot: string | null = null): DataDirCheck {
+export function probeDataDir(
+  path: string,
+  installRoot: string | null = null,
+  platform: "win32" | "darwin" = CURRENT_SHELL_PLATFORM,
+): DataDirCheck {
   const clean = path.trim();
   if (!clean) {
     return {
@@ -244,7 +264,7 @@ export function probeDataDir(path: string, installRoot: string | null = null): D
       ok: false, reason: collision.reason, warnings: [],
     };
   }
-  return evaluateDataDir(clean, freeBytesForPath(clean), ensureWritableDir(clean), installRoot);
+  return evaluateDataDir(clean, freeBytesForPath(clean), ensureWritableDir(clean), installRoot, platform);
 }
 
 export function formatBytes(bytes: number): string {
