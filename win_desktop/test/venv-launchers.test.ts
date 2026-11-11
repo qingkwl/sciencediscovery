@@ -6,12 +6,12 @@
 // dies with 0xC0000135 on machines without a system Python.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, statSync, symlinkSync, lstatSync, readlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readFile } from "node:fs/promises";
 import {
-  bundledRuntimeDlls, copyVenvRuntimeDlls, isUvTrampoline, replaceVenvTrampolines,
+  bundledRuntimeDlls, copyVenvRuntimeDlls, isUvTrampoline, replaceVenvTrampolines, replaceVenvSymlinks,
 } from "../scripts/lib/venv-launchers.mjs";
 
 // The marker text every uv trampoline binary carries (see the real one:
@@ -79,6 +79,57 @@ test("replaceVenvTrampolines leaves pythonw alone when the bundle has no pythonw
     const n = await replaceVenvTrampolines([venv], home, () => {});
     assert.equal(n, 1, "only python.exe replaced");
     assert.equal(await isUvTrampoline(join(venv, "Scripts", "pythonw.exe")), true, "pythonw left as-is");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- POSIX venv python symlinks (macOS adaptation, D3 §2 §7b) ----------
+
+// The darwin twin of the trampoline disease: uv/CPython venvs put bin/python
+// and bin/python3 down as SYMLINKS whose target is an absolute path on the
+// build machine. On any other machine the link is dead — same failure class
+// ("two local acid tests passed only because the build-machine path existed").
+function makePosixVenv(root: string, name: string, absTarget: string): string {
+  const bin = join(root, name, "bin");
+  mkdirSync(bin, { recursive: true });
+  symlinkSync(absTarget, join(bin, "python"));       // e.g. /Users/builder/.workbuddy/.../bin/python3
+  symlinkSync(absTarget, join(bin, "python3"));      // same disease, second spelling
+  writeFileSync(join(bin, "jiuwenswarm-start"), "#!/bin/sh\nexec python3 \"$@\"\n"); // console script, NOT ours
+  return join(root, name);
+}
+
+test("replaceVenvSymlinks rewrites burned-in absolute targets to the relative bundled target", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "sd-sym-"));
+  try {
+    const venv = makePosixVenv(dir, "v", "/Users/builder/.workbuddy/binaries/.../bin/python3");
+    const logs: string[] = [];
+    const n = await replaceVenvSymlinks([venv], "bin", "../../../python/bin/python3", (l) => logs.push(l));
+    assert.equal(n, 2, "python + python3 rewritten");
+    assert.equal(readlinkSync(join(venv, "bin", "python")), "../../../python/bin/python3");
+    assert.equal(readlinkSync(join(venv, "bin", "python3")), "../../../python/bin/python3");
+    // The console script is not a python symlink — untouched.
+    assert.equal(existsSync(join(venv, "bin", "jiuwenswarm-start")), true);
+    assert.equal(lstatSync(join(venv, "bin", "jiuwenswarm-start")).isSymbolicLink(), false);
+    assert.equal(logs.length, 2);
+    // Idempotent: second pass sees the exact target and rewrites nothing.
+    const n2 = await replaceVenvSymlinks([venv], "bin", "../../../python/bin/python3", () => {});
+    assert.equal(n2, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("replaceVenvSymlinks leaves regular files and missing entries alone", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "sd-sym-"));
+  try {
+    const bin = join(dir, "venv", "bin");
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(join(bin, "python"), "real-interpreter-binary"); // regular file, not a symlink
+    // no bin/python3 at all
+    const n = await replaceVenvSymlinks([join(dir, "venv")], "bin", "../python/bin/python3", () => {});
+    assert.equal(n, 0, "regular file untouched, missing entry skipped");
+    assert.equal((await readFile(join(bin, "python"), "utf8")), "real-interpreter-binary");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
