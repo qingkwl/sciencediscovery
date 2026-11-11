@@ -88,7 +88,12 @@ export function evaluateDataDir(
   // an unwritable or full volume is not something another path choice fixes.
   if (pathTooLong) reason = `路径过长（${path.length} 字符，上限 ${DATA_DIR_MAX_LENGTH}），Windows 260 字符限制下环境准备会失败`;
   else if (!freeOk) reason = "磁盘剩余空间不足，无法完成环境准备";
-  else if (!writable) reason = "目录不可写（请检查权限或杀毒软件）";
+  // Antivirus interference is a real-world Windows failure mode (Defender
+  // locking freshly-written venv files); on darwin it reads as noise — the
+  // handful of real cases are permission- or disk-related.
+  else if (!writable) reason = platform === "win32"
+    ? "目录不可写（请检查权限或杀毒软件）"
+    : "目录不可写（请检查权限）";
   else if (collidesWithInstall) reason = collision.reason;
   return {
     freeBytes, freeOk, writable, pathLengthWarn, pathTooLong, collidesWithInstall,

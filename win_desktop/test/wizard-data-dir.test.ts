@@ -62,6 +62,13 @@ test("evaluate: unwritable blocks", () => {
   const res = evaluateDataDir("C:\\Data\\SD", MIN_FREE_BYTES, false, null, "win32");
   assert.equal(res.ok, false);
   assert.ok(res.reason?.includes("不可写"), res.reason);
+  // The antivirus hint is a real-world Windows failure mode (Defender locking
+  // freshly-written venv files); on darwin it reads as noise.
+  assert.ok(res.reason?.includes("杀毒软件"), "win32 reason keeps the antivirus hint");
+  const mac = evaluateDataDir("/Users/x/Data/SD", MIN_FREE_BYTES, false, null, "darwin");
+  assert.equal(mac.ok, false);
+  assert.ok(mac.reason?.includes("不可写"), mac.reason);
+  assert.ok(!mac.reason?.includes("杀毒软件"), "darwin reason drops the antivirus hint");
 });
 
 test("evaluate: path length warns at 180 and blocks past 240 (win32 gate)", () => {
