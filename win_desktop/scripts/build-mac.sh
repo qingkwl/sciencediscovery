@@ -15,13 +15,38 @@
 #   3. payload spot checks     — darwin path markers, patch manifest, jw deep
 #      file, symlink targets (the B3-2 acceptance items)
 #   4. swarm-patches verify    — payload patch chain integrity (f25 lesson)
-#   5. electron-builder --mac  — ad-hoc signed DMG+zip smoke (the B3-3
-#      acceptance; real Developer ID signing/notarization is B4-1, this gate
-#      only proves the packaging chain itself works)
+#   5. electron-builder --mac  — TWO modes (B4-1):
+#      default: ad-hoc smoke. mac.identity is PINNED to "-" on the CLI —
+#      identity auto-discovery is on by default and would silently pick the
+#      real Developer ID certificate from the keychain (W12), which is not
+#      what a smoke build means. Asserts Signature=adhoc afterwards.
+#      SD_MAC_SIGN=1: full Developer ID sign + notarize chain. electron-
+#      builder signs and notarizes (+staples) the .app via keychain profile
+#      sd-notary; this script then notarizes + staples the DMG itself
+#      (notarizing a DMG does not notarize the app inside — both need their
+#      own ticket, Apple TN3125), and gates on spctl -a -vv.
 #
 # Usage:
-#   ./build-mac.sh            # full gate
-#   SKIP_EB=1 ./build-mac.sh  # everything except electron-builder (step 5)
+#   ./build-mac.sh             # full gate, ad-hoc smoke packaging
+#   SD_MAC_SIGN=1 ./build-mac.sh   # full gate, signed + notarized release
+#   SKIP_EB=1 ./build-mac.sh    # everything except electron-builder (step 5)
+#
+# Signing-mode credentials (kept out of git; naming per the account doc §4):
+#   default (this machine): identity + notary profile live in the login
+#     keychain; no env vars needed. Overrides:
+#   SD_MAC_IDENTITY      signing identity string (default: the Developer ID
+#                         Application identity below)
+#   SD_NOTARY_PROFILE    notarytool keychain profile (default: sd-notary)
+#   SD_MAC_P8 + SD_MAC_KEY_ID + SD_MAC_ISSUER_ID
+#                         notarize via the p8 API key directly instead of
+#                         the keychain profile (paths/ids only, no secrets)
+#   SD_MAC_P12 + SD_MAC_P12_PASS
+#                         CI / relocated-machine mode: import the p12 into a
+#                         TEMPORARY keychain (created on the fly, deleted on
+#                         exit, search list restored) instead of using the
+#                         login keychain. NOTE: the notary profile does NOT
+#                         travel with the p12 — pair this with SD_MAC_P8, or
+#                         store the profile on that machine's keychain first.
 #
 # Preconditions (the script checks and tells you, it does not provision):
 #   - repo built: pnpm build ran at the repo root, services/*/dist exist
@@ -126,23 +151,197 @@ else
   die "payload jw venv python missing at $JW_VENV_PY (assemble step should have failed first)"
 fi
 
-# --- 5. electron-builder ad-hoc DMG smoke (B3-3 acceptance) -------------------
-step "5. electron-builder --mac (ad-hoc DMG+zip smoke)"
+# --- 5. electron-builder packaging (B3-3 smoke / B4-1 sign+notarize) --------
+step "5. electron-builder --mac"
 if [ "${SKIP_EB:-0}" = "1" ]; then
   echo "SKIP_EB=1 — skipping electron-builder (gate reduced to payload checks)"
 else
-  # Ad-hoc: no Developer ID identity is wired yet (B4-1); this proves the
-  # packaging chain (schema, icon, entitlements, DMG layout, zip) works.
-  # Gatekeeper will reject the result for external users — expected, W2-era
-  # behaviour documented in D4 §4.
-  ( cd "$SHELL_ROOT" && npx electron-builder --mac ) \
+  # --- 5a. resolve the signing mode ----------------------------------------
+  # Default is ad-hoc SMOKE. Identity auto-discovery (CSC_IDENTITY_AUTO_DISCOVERY,
+  # on by default) would silently pick the real Developer ID certificate now
+  # living in the login keychain (W12) — so ad-hoc is PINNED via the CLI
+  # dot-config override; setting CSC_NAME=- instead would NOT work (env var
+  # is consumed by the inner findIdentity, which misses "-" and falls through
+  # to reportError → signing silently skipped; qualifier "-" is only honored
+  # from mac.identity — verified against app-builder-lib@26.15.3 sources).
+  SD_MAC_IDENTITY_DEFAULT="Developer ID Application: Haowen Zhong (UGV44NUA6W)"
+  SD_MAC_IDENTITY="${SD_MAC_IDENTITY:-$SD_MAC_IDENTITY_DEFAULT}"
+  SD_NOTARY_PROFILE="${SD_NOTARY_PROFILE:-sd-notary}"
+
+  # --- 5b. temporary-keychain lifecycle (CI / relocated machine mode) --------
+  # Trap-based cleanup: delete the keychain and restore the search list no
+  # matter how the script exits (AppleDeveloper账号.md §4 discipline: p12
+  # material lives in a throwaway keychain, never persisted in the login one).
+  TEMP_KEYCHAIN=""
+  TEMP_KEYCHAIN_SAVED_ARGS=()
+  restore_temp_keychain() {
+    if [ -n "$TEMP_KEYCHAIN" ]; then
+      security delete-keychain "$TEMP_KEYCHAIN" >/dev/null 2>&1 || true
+      if [ "${#TEMP_KEYCHAIN_SAVED_ARGS[@]}" -gt 0 ]; then
+        security list-keychain -d user -s "${TEMP_KEYCHAIN_SAVED_ARGS[@]}" >/dev/null 2>&1 || true
+      fi
+    fi
+  }
+  trap restore_temp_keychain EXIT
+
+  if [ "${SD_MAC_SIGN:-0}" = "1" ]; then
+    # Full signed release. electron-builder does: .app sign (hardened runtime
+    # + entitlements) → notarize via keychain profile → staple — all before
+    # DMG/zip packaging, so the zip update carrier embeds the notarized state
+    # (D4 §5). The DMG itself is signed by dmg.sign:true; its notarization
+    # ticket + staple happen in 5e (TN3125: DMG and app tickets are separate).
+    unset CSC_NAME || true
+    unset CSC_KEYCHAIN || true
+    if [ -n "${SD_MAC_P12:-}" ]; then
+      # CI/relocation mode: import the p12 into a throwaway keychain.
+      [ -f "$SD_MAC_P12" ] || die "SD_MAC_P12 set but file not found: $SD_MAC_P12"
+      [ -n "${SD_MAC_P12_PASS:-}" ] || die "SD_MAC_P12 set but SD_MAC_P12_PASS missing"
+      TEMP_KEYCHAIN="build-sd-$$.keychain"
+      # save the WHOLE search list (multi-keychain setups) and restore it
+      # verbatim. macOS ships bash 3.2 — no mapfile; read into a plain string
+      # and let word-splitting do its thing inside the quoted-array expansion.
+      KEYCHAIN_SAVED_STR="$(security list-keychain -d user | tr -d ' "')"
+      TEMP_KEYCHAIN_SAVED_ARGS=($KEYCHAIN_SAVED_STR)
+      security create-keychain -p "$SD_MAC_P12_PASS" "$TEMP_KEYCHAIN" \
+        || die "failed to create temporary keychain $TEMP_KEYCHAIN"
+      security import "$SD_MAC_P12" -k "$TEMP_KEYCHAIN" -P "$SD_MAC_P12_PASS" \
+        -T /usr/bin/codesign -T /usr/bin/security \
+        || die "failed to import p12 into $TEMP_KEYCHAIN"
+      # order matters: keychain-name LAST (account doc §4 template)
+      security set-key-partition-list -S apple-tool:,apple:,codesign: \
+        -s -k "$SD_MAC_P12_PASS" "$TEMP_KEYCHAIN" >/dev/null \
+        || die "failed to set-key-partition-list on $TEMP_KEYCHAIN"
+      security list-keychain -d user -s "$TEMP_KEYCHAIN" ${TEMP_KEYCHAIN_SAVED_ARGS[@]+"${TEMP_KEYCHAIN_SAVED_ARGS[@]}"} \
+        || die "failed to add $TEMP_KEYCHAIN to the keychain search list"
+      export CSC_KEYCHAIN="$TEMP_KEYCHAIN"
+      export CSC_NAME="$SD_MAC_IDENTITY"
+      echo "CI mode: temporary keychain $TEMP_KEYCHAIN imported (auto-deleted on exit)"
+    else
+      # This-machine mode: identity lives in the login keychain (B0-1); the
+      # yml-level identity pin is handled by the CLI dot-config below.
+      export CSC_NAME="$SD_MAC_IDENTITY"
+    fi
+
+    # Notarization credentials for the .app (electron-builder native path):
+    # APPLE_KEYCHAIN_PROFILE matches getNotarizeOptions() priority — Apple ID
+    # group > API key group > keychain profile. Clear the higher-priority
+    # groups so a stale env can't hijack the mode (they'd also throw on
+    # partial sets).
+    unset APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID || true
+    unset APPLE_API_KEY APPLE_API_KEY_ID APPLE_API_ISSUER || true
+    if [ -n "${SD_MAC_P8:-}" ]; then
+      [ -f "$SD_MAC_P8" ] || die "SD_MAC_P8 set but file not found: $SD_MAC_P8"
+      [ -n "${SD_MAC_KEY_ID:-}" ] || die "SD_MAC_P8 set but SD_MAC_KEY_ID missing"
+      [ -n "${SD_MAC_ISSUER_ID:-}" ] || die "SD_MAC_P8 set but SD_MAC_ISSUER_ID missing"
+      export APPLE_API_KEY="$SD_MAC_P8"
+      export APPLE_API_KEY_ID="$SD_MAC_KEY_ID"
+      export APPLE_API_ISSUER="$SD_MAC_ISSUER_ID"
+      echo "notary credentials: p8 API key ($SD_MAC_KEY_ID)"
+    else
+      export APPLE_KEYCHAIN_PROFILE="$SD_NOTARY_PROFILE"
+      # Fail fast if the profile is missing (Agent-sandboxed probes can't see
+      # keychain items, but the user terminal runs this — a hard die with the
+      # recovery path is the honest gate here).
+      if ! xcrun notarytool history --keychain-profile "$SD_NOTARY_PROFILE" >/dev/null 2>"$SHELL_ROOT/.notarytool-probe.err"; then
+        cat "$SHELL_ROOT/.notarytool-probe.err" >&2 || true
+        rm -f "$SHELL_ROOT/.notarytool-probe.err"
+        die "notarytool profile '$SD_NOTARY_PROFILE' not usable — store it first:
+  xcrun notarytool store-credentials $SD_NOTARY_PROFILE --key <p8> --key-id <key-id> --issuer <issuer-id>
+(notary credentials doc lives outside this repo)"
+      fi
+      rm -f "$SHELL_ROOT/.notarytool-probe.err"
+      echo "notary credentials: keychain profile $SD_NOTARY_PROFILE"
+    fi
+
+    EB_ARGS=(--mac --config.mac.identity="$SD_MAC_IDENTITY")
+  else
+    # Ad-hoc smoke: pin identity to "-" so auto-discovery can't pick the
+    # real certificate (W12). Asserts Signature=adhoc after packaging.
+    unset CSC_NAME CSC_KEYCHAIN || true
+    unset APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID || true
+    unset APPLE_API_KEY APPLE_API_KEY_ID APPLE_API_ISSUER APPLE_KEYCHAIN_PROFILE || true
+    EB_ARGS=(--mac --config.mac.identity=-)
+  fi
+
+  ( cd "$SHELL_ROOT" && npx electron-builder "${EB_ARGS[@]}" ) \
     || die "electron-builder --mac failed"
+
   DMG="$(find "$SHELL_ROOT/release" -maxdepth 1 -name '*.dmg' -print -quit 2>/dev/null || true)"
   [ -n "$DMG" ] || die "no DMG artifact under $SHELL_ROOT/release"
-  echo "DMG artifact: $(basename "$DMG")"
-  codesign --verify --verbose=2 "$SHELL_ROOT/release/mac-arm64/ScienceDiscovery.app" 2>&1 \
+  ZIP="$(find "$SHELL_ROOT/release" -maxdepth 1 -name '*-mac-*.zip' -print -quit 2>/dev/null || true)"
+  [ -n "$ZIP" ] || die "no zip artifact under $SHELL_ROOT/release"
+  APP="$SHELL_ROOT/release/mac-arm64/ScienceDiscovery.app"
+  [ -d "$APP" ] || die "no packed .app at $APP"
+  echo "artifacts: $(basename "$DMG"), $(basename "$ZIP")"
+
+  # --- 5c. signature assertion (both modes gate here) -----------------------
+  codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 \
     || die "codesign verify failed on the packed .app"
-  echo "codesign verify OK (ad-hoc)"
+  SIGN_INFO="$(codesign -dv --verbose=2 "$APP" 2>&1 || true)"
+  if [ "${SD_MAC_SIGN:-0}" = "1" ]; then
+    # Authority must carry the Developer ID Application chain AND match the
+    # exact identity requested (SD_MAC_IDENTITY) — a different signer would
+    # fail the "migration-period dual-signer" rule (D4 §4) upstream anyway.
+    printf '%s\n' "$SIGN_INFO" | grep -q '^Authority=Developer ID Application' \
+      || die ".app is not Developer ID-signed — expected Authority=Developer ID Application, got:
+$SIGN_INFO"
+    printf '%s\n' "$SIGN_INFO" | grep -q "Authority=.*$SD_MAC_IDENTITY" \
+      || die ".app signed by a different identity than requested:
+  requested: $SD_MAC_IDENTITY
+$SIGN_INFO"
+    printf '%s\n' "$SIGN_INFO" | grep -q '^TeamIdentifier=.\+' \
+      || die ".app TeamIdentifier is empty:
+$SIGN_INFO"
+    echo "codesign verify OK (Developer ID + hardened runtime, identity match)"
+  else
+    printf '%s\n' "$SIGN_INFO" | grep -q '^Signature=adhoc' \
+      || die ".app is NOT ad-hoc signed — identity pin failed (W12 regression?):
+$SIGN_INFO"
+    echo "codesign verify OK (ad-hoc pinned)"
+  fi
+
+  # --- 5d. notarization gate on the .app (sign mode only) -------------------
+  if [ "${SD_MAC_SIGN:-0}" = "1" ]; then
+    # electron-builder's notarizeIfProvided() already notarized + STAPLED the
+    # .app during packaging (retry x3). The staple lives INSIDE the .app, and
+    # the DMG/zip artifacts were built from those exact bytes — post-hoc
+    # patching cannot repair a stale zip, so a failed validation is a hard
+    # die (rerun the gate), never a silent local re-staple.
+    xcrun stapler validate "$APP" 2>/dev/null \
+      || die ".app notarization staple missing/invalid — the DMG and zip embed
+these bytes, do NOT hand-fix; rerun this gate after checking the notary log
+  xcrun notarytool log <submission-id> --keychain-profile $SD_NOTARY_PROFILE
+(a rebuild fixes the zip; a hand re-staple would leave stale bytes inside DMG/zip)"
+    echo ".app notarized + staple validated"
+  fi
+
+  # --- 5e. DMG notarization + Gatekeeper gate (sign mode only) --------------
+  if [ "${SD_MAC_SIGN:-0}" = "1" ]; then
+    # The DMG carries its own ticket (TN3125: stapling the DMG does NOT cover
+    # the app inside; the app inside was already notarized+stapled in 5d).
+    # notarytool accepts the DMG bundle directly; submit then staple the DMG.
+    if [ -n "${SD_MAC_P8:-}" ]; then
+      xcrun notarytool submit "$DMG" --key "$SD_MAC_P8" \
+        --key-id "$SD_MAC_KEY_ID" --issuer "$SD_MAC_ISSUER_ID" --wait \
+        || die "notarytool submit (DMG) failed"
+    else
+      xcrun notarytool submit "$DMG" --keychain-profile "$SD_NOTARY_PROFILE" --wait \
+        || die "notarytool submit (DMG) failed"
+    fi
+    xcrun stapler staple "$DMG" || die "stapler staple (DMG) failed"
+    xcrun stapler validate "$DMG" || die "stapler validate (DMG) failed"
+    # The M4 exit criterion, gated per release: Gatekeeper assessment must
+    # accept both the installer and the app. (Command substitution instead
+    # of a pipe: `spctl | grep -q` under pipefail dies on SIGPIPE once grep
+    # exits early — capture once, grep the string.)
+    SPCTL_DMG="$(spctl -a -vv -t open "$DMG" 2>&1 || true)"
+    printf '%s\n' "$SPCTL_DMG" | grep -q 'accepted' \
+      || die "spctl rejected the DMG: $SPCTL_DMG"
+    SPCTL_APP="$(spctl -a -vv -t execute "$APP" 2>&1 || true)"
+    printf '%s\n' "$SPCTL_APP" | grep -q 'accepted' \
+      || die "spctl rejected the .app: $SPCTL_APP"
+    echo "spctl accepted DMG + .app — notarized release OK"
+  fi
 fi
 
 step "gate passed — payload at $OUT_DIR"

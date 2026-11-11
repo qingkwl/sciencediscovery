@@ -81,3 +81,9 @@ dmg:
   contents:
     - { x: 120, y: 160, type: file }
     - { x: 400, y: 160, type: link, path: /Applications }
+  # Sign the DMG itself in addition to the .app (B4-1). The signer looks up
+  # the same "Developer ID Application" identity; with an ad-hoc build
+  # (mac.identity="-", local smoke) the lookup misses and the DMG is skipped —
+  # verified in dmg-builder@26.15.3 dmg.js signDmg(): no error, just a skip.
+  # DMG signing is what lets `spctl -a -vv` pass on the installer itself.
+  sign: true
