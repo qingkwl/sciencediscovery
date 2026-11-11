@@ -1,17 +1,21 @@
 // assemble-backend: stage the packaged payload tree for electron-builder.
 //
 // Inputs (all optional, defaults follow the dev checkout):
-//   --repo   ../sciencediscovery   (built: pnpm build ran, venvs provisioned)
-//   --data   <repo>/.sciencediscovery-data
-//   --out    build/resources
+//   --repo     ../sciencediscovery   (built: pnpm build ran, venvs provisioned)
+//   --data     <repo>/.sciencediscovery-data
+//   --out      build/resources
+//   --platform win32-x64 | darwin-arm64 | darwin-x64   (default win32-x64)
+//              Target-platform dialect for every platform-sensitive step
+//              (venv layout, .pth separators, launcher repairs, compileall
+//              targets, micromamba name) — see lib/assemble-platform.mjs.
 //
 // Output layout (consumed by shell/src/bootstrap.ts and electron-builder.yml):
 //   <out>/backend            repo-relative runtime subset (repoRoot at runtime)
 //   <out>/envs-template      the 5 venvs (pyvenv.cfg home + editable .pth fixed
 //                            at first run by the shell)
 //   <out>/python             the uv-managed base interpreter (venv `home` target)
-//   <out>/micromamba         pinned micromamba.exe
-//   <out>/version.json       payload manifest (commit, sizes, sha256)
+//   <out>/micromamba         pinned micromamba (micromamba.exe on win32)
+//   <out>/version.json       payload manifest (commit, sizes, sha256, platform)
 //
 // node_modules strategy (v4): `pnpm deploy` produces a self-contained
 // prod install whose .pnpm store holds every package as REAL files with
@@ -25,11 +29,12 @@ import { copyFile, cp, mkdir, readdir, readFile, realpath, rm, stat, writeFile }
 import { existsSync, lstatSync, readFileSync, readlinkSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { replaceVenvTrampolines, copyVenvRuntimeDlls } from "./lib/venv-launchers.mjs";
+import { replaceVenvTrampolines, copyVenvRuntimeDlls, replaceVenvSymlinks } from "./lib/venv-launchers.mjs";
 import { makeJwSrcFilter } from "./lib/jw-src-filter.mjs";
 import { matchJwVenvSweep, isDeadVenvScript, JW_VENV_SWEEP_NESTED, codexVendorDirs, leftoverCodexVendorDirs } from "./lib/payload-slim.mjs";
 import { payloadCompileEnv, pycBudgetVerdict, regionsBelowRatio, PYC_MIN_RATIO } from "./lib/pyc-budget.mjs";
 import { stagedPatchTag, patchVerifyCommand, patchVerifyFailureDetail } from "./lib/patch-consistency.mjs";
+import { parseAssemblePlatform, assembleDialect, finderAnchorLevel, sitePackagesDepth } from "./lib/assemble-platform.mjs";
 
 const shellRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -45,14 +50,25 @@ const repo = arg("repo", join(shellRoot, ".."));
 const data = arg("data", join(repo, ".sciencediscovery-data"));
 const out = arg("out", join(shellRoot, "build", "resources"));
 
+const say = (line) => console.log(`[assemble] ${line}`);
+const fail = (line) => { console.error(`[assemble] FAIL: ${line}`); process.exit(1); };
+
+// Target platform dialect (macOS adaptation, D3 §2). Default win32-x64 keeps
+// the current behaviour byte-for-byte; --platform darwin-arm64/darwin-x64
+// switches every platform-sensitive step below (venv layout, separator
+// dialect, trampoline-vs-symlink repairs, compileall targets, micromamba
+// name). The dialect table mirrors src/shell-platform.ts venvLayoutFor() —
+// the runtime consumer of this payload.
+const { platform: assemblePlatform, error: platformError } = parseAssemblePlatform(process.argv);
+if (platformError) fail(platformError);
+const dialect = assembleDialect(assemblePlatform);
+say(`platform = ${assemblePlatform} (${dialect.family})`);
+
 // SIZEOPT W2: the five Python sidecars share one venv (uv workspace,
 // "sd-services"); assemble stages that single venv instead of five.
 const VENV_NAMES = ["sd-services"];
 /** Placeholder bootstrap.ts substitutes with the real <resources>\backend. */
 const BACKEND_PLACEHOLDER = "@@SD_BACKEND_ROOT@@";
-
-const say = (line) => console.log(`[assemble] ${line}`);
-const fail = (line) => { console.error(`[assemble] FAIL: ${line}`); process.exit(1); };
 
 function pyvenvHome(venvDir) {
   const text = readFileSync(join(venvDir, "pyvenv.cfg"), "utf8");
@@ -104,7 +120,7 @@ for (const p of [
   join(repo, "apps", "web", "dist"),
   join(repo, "skills"),
   join(repo, "extensions_config.json"),
-  join(data, "scientific-envs", "bin", "micromamba.exe"),
+  join(data, "scientific-envs", "bin", dialect.micromambaName),
   join(data, "jiuwenswarm", "src", ".venv", "pyvenv.cfg"),
 ]) {
   if (!existsSync(p)) fail(`missing expected input: ${p}`);
@@ -121,6 +137,7 @@ for (const name of VENV_NAMES) {
 // provisioned on another minor (paper drifted to 3.11 once) ships
 // wrong-ABI compiled extensions and dies off-machine (SRE module
 // mismatch / DLL load failure). Gate on pyvenv.cfg version_info.
+let PYTHON_MINOR;
 {
   const venvPython = (venvDir) =>
     /^version_info\s*=\s*(\d+\.\d+)/m.exec(readFileSync(join(venvDir, "pyvenv.cfg"), "utf8"))?.[1];
@@ -138,6 +155,11 @@ for (const name of VENV_NAMES) {
       );
     }
   }
+  // The payload's Python minor ("12" for 3.12), from the same version_info
+  // the gate above just verified consistent. Feeds every layout computation
+  // downstream (site-packages paths, compileall targets) — never hardcoded,
+  // so a Python bump is a venv re-provision, not a script edit.
+  PYTHON_MINOR = base.split(".")[1];
 }
 
 say("sanity checks passed");
@@ -586,7 +608,7 @@ await sweepNodeModules(jwSrcOut);
 // 0018 drops playwright/uv from pyproject) — this is the backstop for stale
 // data dirs, same philosophy as the sweeps above. Best-effort by design.
 {
-  const sp = join(jwSrcOut, ".venv", "Lib", "site-packages");
+  const sp = join(jwSrcOut, ".venv", ...dialect.sitePackages(PYTHON_MINOR).split("/"));
   let sweptAny = false;
   try {
     for (const e of await readdir(sp, { withFileTypes: true })) {
@@ -601,7 +623,7 @@ await sweepNodeModules(jwSrcOut);
       if (existsSync(p)) { await rmIfPresent(p); say(`swept dead weight: ${nested} (google_adk namespace subtree)`); sweptAny = true; }
     }
   } catch { /* site-packages unreadable — sweep is best-effort */ }
-  const scriptsDir = join(jwSrcOut, ".venv", "Scripts");
+  const scriptsDir = join(jwSrcOut, ".venv", dialect.venvBin);
   try {
     for (const e of await readdir(scriptsDir, { withFileTypes: true })) {
       if (!e.isFile() || !isDeadVenvScript(e.name)) continue;
@@ -616,7 +638,13 @@ await sweepNodeModules(jwSrcOut);
 // Rewrite the setuptools editable finder so package paths resolve relative to
 // wherever the payload got installed (site-packages → .venv → src).
 const finderGlob = /^(?:__editable___.*_finder\.py)$/;
-const sitePackages = join(jwSrcOut, ".venv", "Lib", "site-packages");
+const sitePackages = join(jwSrcOut, ".venv", ...dialect.sitePackages(PYTHON_MINOR).split("/"));
+// parents[N] must land exactly on the jw src root: N is derived from the
+// site-packages depth of THIS dialect's venv layout (win32 Lib\site-packages
+// = depth 2 → parents[3]; darwin lib/python3.<minor>/site-packages = depth 3
+// → parents[4]), so a future layout change moves the anchor by editing the
+// dialect table, not this rewrite.
+const anchorLevel = finderAnchorLevel(sitePackagesDepth(dialect, PYTHON_MINOR));
 for (const e of await readdir(sitePackages, { withFileTypes: true })) {
   if (!e.isFile() || !finderGlob.test(e.name)) continue;
   const file = join(sitePackages, e.name);
@@ -640,7 +668,7 @@ for (const e of await readdir(sitePackages, { withFileTypes: true })) {
   }).join(", ");
   const lines = text.split("\n");
   const idx = lines.findIndex((l) => /^MAPPING: dict\[str, str\] = /.test(l));
-  lines.splice(idx, 1, "_SRC = Path(__file__).resolve().parents[3]", `MAPPING: dict[str, str] = {${rewritten}}`);
+  lines.splice(idx, 1, `_SRC = Path(__file__).resolve().parents[${anchorLevel}]`, `MAPPING: dict[str, str] = {${rewritten}}`);
   await writeFile(file, lines.join("\n"), "utf8");
   say(`rewrote editable finder ${e.name} (paths now resolve relative to the payload)`);
 }
@@ -656,8 +684,12 @@ for (const name of VENV_NAMES) {
     filter: pyFilter(),
   });
   // _editable_impl_*.pth contains an absolute path into the dev repo; swap the
-  // repo prefix for the placeholder the shell resolves at first run.
-  const sp = join(out, "envs-template", name, "Lib", "site-packages");
+  // repo prefix for the placeholder the shell resolves at first run. The
+  // separator inside the rewritten body follows the TARGET platform's
+  // dialect (Windows .pth paths carry "\", POSIX ones "/") — the runtime
+  // rewrite in bootstrap.ts substitutes only the placeholder, so the rest of
+  // the string must already be correct for the platform that will read it.
+  const sp = join(out, "envs-template", name, ...dialect.sitePackages(PYTHON_MINOR).split("/"));
   if (!existsSync(sp)) continue;
   for (const e of await readdir(sp, { withFileTypes: true })) {
     if (!e.isFile() || !/^_editable_impl_.*\.pth$/.test(e.name)) continue;
@@ -675,8 +707,8 @@ for (const name of VENV_NAMES) {
     if (!text.startsWith(repo) || !/^[\\/]/.test(text.slice(repo.length))) {
       fail(`${name}/${e.name} points outside the repo (${text}) — the venv's editable install is stale; reinstall the editable packages from this repo before assembling`);
     }
-    const tail = text.slice(repo.length).replace(/^[\\/]+/, "").replace(/\//g, "\\");
-    await writeFile(file, `${BACKEND_PLACEHOLDER}\\${tail}\n`, "utf8");
+    const tail = text.slice(repo.length).replace(/^[\\/]+/, "").replace(/\//g, dialect.pthSeparator);
+    await writeFile(file, `${BACKEND_PLACEHOLDER}${dialect.pthSeparator}${tail}\n`, "utf8");
     say(`placeholdered ${name}/${e.name}`);
   }
 }
@@ -685,7 +717,9 @@ for (const name of VENV_NAMES) {
 // 7. Base interpreter (venv `home`), realpath'd (uv dirs can be symlinks)
 
 const pythonHome = await realpath(pyvenvHome(join(data, "envs", "sd-services")));
-if (!existsSync(join(pythonHome, "python.exe"))) fail(`no python.exe under ${pythonHome}`);
+if (!existsSync(join(pythonHome, dialect.basePythonName))) {
+  fail(`no ${dialect.basePythonName} under ${pythonHome}`);
+}
 say(`copying base interpreter from ${pythonHome}`);
 await cp(pythonHome, join(out, "python"), { recursive: true, force: true, filter: pyFilter() });
 
@@ -703,11 +737,37 @@ const launcherDirs = [
   ...VENV_NAMES.map((name) => join(out, "envs-template", name)),
   join(jwPayload, ".venv"),
 ];
-const launcherReplaced = await replaceVenvTrampolines(launcherDirs, join(out, "python"), say);
-if (launcherReplaced === 0) {
-  fail("no uv trampoline launchers found in the bundled venvs — the payload layout changed (or the venvs are no longer uv-made); investigate before shipping");
+if (dialect.hasTrampolines) {
+  const launcherReplaced = await replaceVenvTrampolines(launcherDirs, join(out, "python"), say);
+  if (launcherReplaced === 0) {
+    fail("no uv trampoline launchers found in the bundled venvs — the payload layout changed (or the venvs are no longer uv-made); investigate before shipping");
+  }
+  say(`replaced ${launcherReplaced} trampoline launcher(s)`);
+} else {
+  // [macOS adaptation] POSIX venvs carry the trampoline disease in symlink
+  // form: bin/python / bin/python3 point at the BUILD machine's absolute
+  // interpreter path (measured: `python3 -> /Users/<builder>/.../bin/python3`).
+  // Rewrite both to a RELATIVE hop at the bundled base interpreter, so the
+  // links stay valid wherever the payload lands (mirrors the trampoline
+  // swap's philosophy — see replaceVenvSymlinks in lib/venv-launchers.mjs).
+  // Relative target from <venv>/bin/ to <out>/python/bin/python3:
+  // envs-template venvs need ../../../python/bin/python3, the jw venv
+  // (backend/jw/.venv) needs ../../python/bin/python3 — computed per venv.
+  say("rewriting venv python symlinks to the bundled interpreter (darwin)");
+  let symlinkReplaced = 0;
+  for (const venvDir of launcherDirs) {
+    // <venvDir> is <out>/envs-template/<name> or <out>/backend/jw/.venv;
+    // the bundled interpreter is <out>/python. Hop up until we reach out.
+    const relFromOut = relative(out, venvDir);
+    const hops = relFromOut.split(/[\\/]/).length; // venv depth below out
+    const n = await replaceVenvSymlinks([venvDir], dialect.venvBin, `${"../".repeat(hops)}python/bin/python3`, say);
+    symlinkReplaced += n;
+  }
+  if (symlinkReplaced === 0) {
+    fail("no venv python symlinks found in the bundled venvs — the payload layout changed (or the venvs were not made on this platform); investigate before shipping");
+  }
+  say(`rewrote ${symlinkReplaced} venv python symlink(s)`);
 }
-say(`replaced ${launcherReplaced} trampoline launcher(s)`);
 
 // The shell launches the whole stack with hidden consoles; every
 // payload Python that spawns a console-subsystem child without
@@ -718,17 +778,31 @@ say(`replaced ${launcherReplaced} trampoline launcher(s)`);
 // which start-stack sets for the whole tree). All six payload venvs —
 // jiuwenswarm + envs-template ×5. Source of
 // truth stays in the repo; the dev venvs are never touched.
+// [macOS adaptation] Windows-only: darwin has no console-window problem,
+// and the script is a no-op unless SCIENCE_AGENT_DESKTOP is set anyway.
 const sitecustomizeSrc = join(repo, "scripts", "desktop-venv-sitecustomize.py");
 let sitecustomizeCount = 0;
-for (const venvRoot of launcherDirs) {
-  const venvSitePackages = join(venvRoot, "Lib", "site-packages");
-  if (!existsSync(venvSitePackages)) {
-    fail(`no site-packages under ${relative(out, venvRoot)} — the venv layout changed; investigate before shipping`);
+if (dialect.hasTrampolines) {
+  for (const venvRoot of launcherDirs) {
+    const venvSitePackages = join(venvRoot, ...dialect.sitePackages(PYTHON_MINOR).split("/"));
+    if (!existsSync(venvSitePackages)) {
+      fail(`no site-packages under ${relative(out, venvRoot)} — the venv layout changed; investigate before shipping`);
+    }
+    await copyFile(sitecustomizeSrc, join(venvSitePackages, "sitecustomize.py"));
+    sitecustomizeCount += 1;
   }
-  await copyFile(sitecustomizeSrc, join(venvSitePackages, "sitecustomize.py"));
-  sitecustomizeCount += 1;
+  say(`installed desktop sitecustomize (subprocess CREATE_NO_WINDOW guard) into ${sitecustomizeCount} payload venv(s)`);
+} else {
+  // Still gate the layout expectation on darwin: site-packages must exist
+  // (dialect-shaped) even though we do not install the Windows guard there.
+  for (const venvRoot of launcherDirs) {
+    const venvSitePackages = join(venvRoot, ...dialect.sitePackages(PYTHON_MINOR).split("/"));
+    if (!existsSync(venvSitePackages)) {
+      fail(`no site-packages under ${relative(out, venvRoot)} — the venv layout changed; investigate before shipping`);
+    }
+  }
+  say("skipped desktop sitecustomize (win32-only subprocess guard)");
 }
-say(`installed desktop sitecustomize (subprocess CREATE_NO_WINDOW guard) into ${sitecustomizeCount} payload venv(s)`);
 
 // [windows-desktop] The swapped-in real exe resolves python3x.dll/
 // vcruntime*.dll by name: its own directory → PATH → registry. On a clean
@@ -737,12 +811,18 @@ say(`installed desktop sitecustomize (subprocess CREATE_NO_WINDOW guard) into ${
 // 0-1s ×6, jiuwenswarm init 1.6s). An unrelated Python on the build
 // machine's PATH masked it during local testing. The runtime DLLs must ride
 // along with the launcher into venv\Scripts\ so the exe directory hits first.
-say("installing runtime DLLs beside the bundled venv launchers");
-const dllCopies = await copyVenvRuntimeDlls(launcherDirs, join(out, "python"), say);
-if (dllCopies === 0) {
-  fail("no runtime DLLs installed beside the venv launchers — expected python3x.dll + vcruntime*.dll in the bundled python root; investigate before shipping");
+// [macOS adaptation] Windows-only: darwin links its runtime dynamically
+// through dyld with @rpath/install ids, no DLL-beside-exe concept needed.
+if (dialect.hasTrampolines) {
+  say("installing runtime DLLs beside the bundled venv launchers");
+  const dllCopies = await copyVenvRuntimeDlls(launcherDirs, join(out, "python"), say);
+  if (dllCopies === 0) {
+    fail("no runtime DLLs installed beside the venv launchers — expected python3x.dll + vcruntime*.dll in the bundled python root; investigate before shipping");
+  }
+  say(`installed ${dllCopies} runtime DLL file(s) beside venv launchers`);
+} else {
+  say("skipped runtime DLLs (win32-only)");
 }
-say(`installed ${dllCopies} runtime DLL file(s) beside venv launchers`);
 
 // ---------------------------------------------------------------------------
 // 7c. Eagerly precompile bytecode so the first-run bootstrap compileall is a
@@ -762,14 +842,14 @@ const compileEnv = payloadCompileEnv(process.env, { warn: say });
 const compileAll = (pythonExe, target, exclude) =>
   execFileSync(pythonExe, ["-m", "compileall", "-q", "--invalidation-mode", "checked-hash",
     ...(exclude ? ["-x", exclude] : []), target], { env: compileEnv, windowsHide: true, stdio: "pipe", maxBuffer: 64 * 1024 * 1024 });
-const basePythonExe = join(out, "python", "python.exe");
-const jwVenvPython = join(jwPayload, ".venv", "Scripts", "python.exe");
+const basePythonExe = join(out, "python", dialect.basePythonName);
+const jwVenvPython = join(jwPayload, ".venv", dialect.venvBin, dialect.venvPythonName);
 const compileTargets = [
-  { label: "python stdlib", python: basePythonExe, path: join(out, "python", "Lib") },
-  ...VENV_NAMES.map(name => ({ label: `venv ${name}`, python: basePythonExe, path: join(out, "envs-template", name, "Lib", "site-packages") })),
+  { label: "python stdlib", python: basePythonExe, path: join(out, "python", ...dialect.stdlibCompileTarget(PYTHON_MINOR)) },
+  ...VENV_NAMES.map(name => ({ label: `venv ${name}`, python: basePythonExe, path: join(out, "envs-template", name, ...dialect.sitePackages(PYTHON_MINOR).split("/")) })),
   // jw's venv compiles with ITS OWN interpreter (site-packages + the editable
   // src mount both resolve through it; the base python failed on this pair).
-  { label: "jiuwenswarm venv", python: jwVenvPython, path: join(jwPayload, ".venv", "Lib", "site-packages") },
+  { label: "jiuwenswarm venv", python: jwVenvPython, path: join(jwPayload, ".venv", ...dialect.sitePackages(PYTHON_MINOR).split("/")) },
   // Lesson: compiling the WHOLE src tree also compiles tests/**, which
   // resurrects the very __pycache__ the post-copy sweep removed (~40 dirs of
   // dead weight that shipped in every installer). -x skips path
@@ -804,8 +884,8 @@ await sweepPycache(join(jwSrcOut, "tests"));
 
 say("copying micromamba");
 await mkdir(join(out, "micromamba"), { recursive: true });
-await cp(join(data, "scientific-envs", "bin", "micromamba.exe"),
-  join(out, "micromamba", "micromamba.exe"), { force: true });
+await cp(join(data, "scientific-envs", "bin", dialect.micromambaName),
+  join(out, "micromamba", dialect.micromambaName), { force: true });
 
 // ---------------------------------------------------------------------------
 // 9. Payload self-verification (SIZEOPT A1/A2, modelled on the JW official
@@ -815,9 +895,11 @@ await cp(join(data, "scientific-envs", "bin", "micromamba.exe"),
 // cannot import the product modules, the installer is broken and must not
 // ship. This is the check that would have caught the silent precompile skip.
 say("verifying payload imports (self-check)");
-const sdVenvPython = join(out, "envs-template", "sd-services", "Scripts", "python.exe");
+const sdVenvPython = join(out, "envs-template", "sd-services", dialect.venvBin, dialect.venvPythonName);
 const sdServiceSrcs = ["gateway", "memory-graph", "evolve", "adapter"]
   .map((name) => join(out, "backend", "services", name, "src"));
+// PYTHONPATH list separator is a platform dialect too (Windows ";", POSIX ":").
+const pythonPathSep = dialect.family === "darwin" ? ":" : ";";
 const smokeRuns = [
   {
     label: "jiuwenswarm venv",
@@ -833,7 +915,7 @@ const smokeRuns = [
     label: "sd-services venv",
     python: sdVenvPython,
     code: "import sciencediscovery_gateway, sciencediscovery_memory_graph, sciencediscovery_evolve, sciencediscovery_adapter",
-    extraEnv: { PYTHONPATH: sdServiceSrcs.join(";") },
+    extraEnv: { PYTHONPATH: sdServiceSrcs.join(pythonPathSep) },
   },
 ];
 for (const { label, python, code, extraEnv } of smokeRuns) {
@@ -905,14 +987,14 @@ try {
 // killed the stack cold start in a shipped installer).
 const requiredFiles = [
   join(jwPayload, ".sciencediscovery-patches.json"),
-  join(jwPayload, ".venv", "Scripts", "jiuwenswarm-start.exe"),
+  join(jwPayload, ".venv", dialect.venvBin, dialect.family === "darwin" ? "jiuwenswarm-start" : "jiuwenswarm-start.exe"),
   join(out, "backend", "node_modules", "@sciencediscovery", "runner", "dist", "sea", "linux-x64", "sciencediscovery-runner"),
   join(out, "backend", "node_modules", "@sciencediscovery", "runner", "dist", "sea", "linux-arm64", "sciencediscovery-runner"),
   join(out, "backend", "services", "api", "dist", "server.js"),
   join(out, "backend", "services", "runner", "dist", "server.js"),
-  join(out, "envs-template", "sd-services", "Lib", "site-packages", "_editable_impl_sciencediscovery_gateway.pth"),
-  join(out, "micromamba", "micromamba.exe"),
-  join(out, "python", "python.exe"),
+  join(out, "envs-template", "sd-services", ...dialect.sitePackages(PYTHON_MINOR).split("/"), "_editable_impl_sciencediscovery_gateway.pth"),
+  join(out, "micromamba", dialect.micromambaName),
+  join(out, "python", dialect.basePythonName),
 ];
 const missingRequired = requiredFiles.filter((p) => !existsSync(p));
 if (missingRequired.length > 0) {
@@ -995,6 +1077,9 @@ say(`required-files manifest OK (${requiredFiles.length} entries)`);
 // (lesson L29), and dirname() of that would label every payload file
 // "pld\backend\…", under-reporting the budget by 6 chars and hiding exactly
 // the breach this gate exists to catch (problems W9).
+// [macOS adaptation] MAX_PATH is a Windows-only constraint; darwin keeps the
+// walk (A6 bytecode counting piggybacks on it) but the budget gate below is
+// win32-scoped. The path-length number is still printed for trend visibility.
 const MAX_PATH_USABLE = 259;
 const DEFAULT_ROOT_LEN = 63; // C:\Users\<u20>\AppData\Local\ScienceDiscoveryApp
 const COMPILEALL_TEMP_MARGIN = 19;
@@ -1050,18 +1135,21 @@ const pycByRegion = {};
   topRel.length = Math.min(topRel.length, 10);
 }
 say(`A5 path budget: maxRel=${maxRel} (runtime limit ${maxRelRuntime} @ default root ${DEFAULT_ROOT_LEN}, build limit ${maxRelBuild} incl. compileall +${COMPILEALL_TEMP_MARGIN}) — longest: ${maxRelPath}`);
-if (maxRel > maxRelRuntime) {
+if (dialect.hasTrampolines && maxRel > maxRelRuntime) {
   fail(`payload path budget exceeded: maxRel=${maxRel} > ${maxRelRuntime} (over by ${maxRel - maxRelRuntime}) under the worst-case default install root (${DEFAULT_ROOT_LEN} chars).\n` +
     `  Longest paths:\n    ${topRel.map(([n, p]) => `${n}  ${p}`).join("\n    ")}\n` +
     `  Shorten the payload layout (design D11 §S2: rename/move the deep venv prefix) — do NOT ship: the installed tree will ImportError under long usernames.`);
 }
-if (maxRel > maxRelBuild) {
+if (dialect.hasTrampolines && maxRel > maxRelBuild) {
   // Advisory, not a failure: the payload ships fully precompiled
   // (checked-hash, step 7c), so first-run compileall over the install tree is
   // a no-op and never materializes the +19 temp names in practice. The line
   // stays visible so the eroding margin cannot hide (W9: the budget is a trend
   // quantity — every upstream dep that nests deeper eats it).
   say(`A5 advisory: maxRel=${maxRel} exceeds the compileall build budget (${maxRelBuild}); safe only while the shipped checked-hash .pyc set stays complete (first-run precompile must remain a no-op)`);
+}
+if (!dialect.hasTrampolines) {
+  say("A5 gate: skipped (MAX_PATH is a win32-only constraint)");
 }
 
 // A6 bytecode-budget gate (SIZEOPT W25): A5's advisory above says the build
@@ -1115,10 +1203,14 @@ const pieces = {};
 for (const name of ["backend", "envs-template", "python", "micromamba"]) {
   pieces[name] = Math.round((await dirSizeMb(join(out, name))) * 10) / 10;
 }
-const mmBuf = readFileSync(join(out, "micromamba", "micromamba.exe"));
+const mmBuf = readFileSync(join(out, "micromamba", dialect.micromambaName));
 const manifest = {
   repoCommit,
   builtAt: new Date().toISOString(),
+  // Target platform of this payload (macOS adaptation, D3 §2) — audit
+  // dimension for version.json consumers (a darwin shell must never boot a
+  // win32 payload, and the requiredFiles manifest differs per platform).
+  platform: assemblePlatform,
   piecesMB: pieces,
   micromambaSha256: createHash("sha256").update(mmBuf).digest("hex"),
   // #897 §2 first half: record the precompiled set so bootstrap can verify the

@@ -27,10 +27,9 @@
 // (first-run safety net — a same-location reinstall keeps the unpack stamp
 // valid while dataDir\envs still holds pre-fix trampolines).
 
-import { copyFile, readdir, readFile, stat } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { copyFile, readdir, readFile, readlink, rm, stat, symlink } from "node:fs/promises";
+import { existsSync, lstatSync } from "node:fs";
 import { join } from "node:path";
-
 const TRAMPOLINE_MARKER = "uv trampoline";
 
 /** Runtime DLLs a copied-in CPython launcher needs beside itself to boot on
@@ -115,6 +114,49 @@ export async function replaceVenvTrampolines(venvDirs, pythonHome, log = () => {
       await copyFile(src, dst);
       replaced++;
       log(`replaced uv trampoline ${name} in ${venvDir}`);
+    }
+  }
+  return replaced;
+}
+
+// [macOS adaptation] POSIX venvs carry the SAME off-machine disease in a
+// different shape: uv/CPython venvs put bin/python (and bin/python3) down as
+// SYMLINKS whose target is an ABSOLUTE path on the build machine (measured:
+// `python3 -> /Users/<builder>/.workbuddy/binaries/.../bin/python3`).
+// Everything else about the venv is position-independent (pyvenv.cfg home is
+// rewritten at assemble/bootstrap), but a symlink with a burned-in absolute
+// target is a dead link on any other machine — the darwin twin of the
+// trampoline lesson ("two local acid tests were false positives only because
+// the build-machine path happened to exist there").
+//
+// Fix: point every venv bin/python* symlink at the bundled base interpreter
+// with a RELATIVE target (../../python/bin/python3 from <venv>/bin), so the
+// link stays valid wherever the payload is installed. Console entry points
+// (jiuwenswarm-start etc.) keep their own symlinks — pip-installed entry
+// point scripts resolve the interpreter at runtime via their shebang, and
+// the shebang is rewritten separately by bootstrap.
+export async function replaceVenvSymlinks(venvDirs, venvBinDir, bundledPythonRelTarget, log = () => {}) {
+  let replaced = 0;
+  for (const venvDir of venvDirs) {
+    for (const name of ["python", "python3"]) {
+      const linkPath = join(venvDir, venvBinDir, name);
+      // Only a symlink is rewriteable: a regular file (real interpreter, or a
+      // Windows trampoline) is not ours to touch, and a missing entry means
+      // the venv was provisioned differently than expected — skip silently,
+      // the caller's gate counts what actually happened.
+      let isLink = false;
+      try {
+        isLink = lstatSync(linkPath).isSymbolicLink();
+      } catch {
+        continue; // missing — nothing to rewrite
+      }
+      if (!isLink) continue;
+      const target = await readlink(linkPath);
+      if (target === bundledPythonRelTarget) continue; // already fixed (idempotent)
+      await rm(linkPath, { force: true });
+      await symlink(bundledPythonRelTarget, linkPath);
+      replaced++;
+      log(`rewrote venv symlink ${name} -> ${bundledPythonRelTarget} in ${venvDir}`);
     }
   }
   return replaced;
