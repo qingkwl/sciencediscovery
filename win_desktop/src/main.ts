@@ -6,7 +6,7 @@
 // hides to tray (real quit via tray menu — the full running-task
 // confirmation drain is out of scope for this feature).
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, Notification, session, shell as electronShell, Tray } from "electron";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { createConnection, createServer } from "node:net";
@@ -35,6 +35,7 @@ import { defaultDataDir, probeDataDir } from "./wizard-data-dir.ts";
 import {
   runSelfCheck,
 } from "./wizard-api.ts";
+import { runSeatbeltProbe, type SeatbeltVerdict } from "./sandbox-probe.ts";
 import { type AgentInfo } from "./agent-ready.ts";
 
 // Bundled as CJS by esbuild: the app path is the shell root in dev (`electron .`).
@@ -1158,10 +1159,19 @@ function registerWizardIpc(proxyEnv: NodeJS.ProcessEnv | null): void {
     return { ok: true };
   });
 
+  // B2-2: the Seatbelt verdict is computed once per session and cached —
+  // retrying the self-check does not change whether the OS can compile a
+  // sandbox profile, and re-probing would only re-run a deterministic spawn.
+  // Windows short-circuits inside runSeatbeltProbe (not-applicable) without
+  // spawning anything.
+  let seatbeltVerdict: SeatbeltVerdict | null = null;
   ipcMain.handle("sd-shell:wizard-self-check", async () => {
     const base = wizardApiBase();
     if (!base) throw new Error("后端尚未就绪，请稍候重试。");
-    return runSelfCheck(base, wizardToken(), wizardRunnerBase(), fetch);
+    if (seatbeltVerdict === null) {
+      seatbeltVerdict = await runSeatbeltProbe(process.platform, (cmd, args) => spawn(cmd, args));
+    }
+    return runSelfCheck(base, wizardToken(), wizardRunnerBase(), fetch, seatbeltVerdict);
   });
 
   // Optional model configuration after backend self-check passes.
