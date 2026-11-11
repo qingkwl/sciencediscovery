@@ -68,6 +68,9 @@ test("packagedEnv injects the packaged-mode contract (win32)", () => {
   // No PYTHONPYCACHEPREFIX: the payload's in-place __pycache__ must be used.
   assert.equal(env.PYTHONPYCACHEPREFIX, undefined);
   assert.equal(env.JIUWENSWARM_ROOT, join("D:\\data", "jiuwenswarm"));
+  // W1/P2 fix: the jw workspace HOME-class anchor must be data-dir-based, so
+  // .jiuwenswarm-instances never lands in the real %USERPROFILE%.
+  assert.equal(env.JIUWENSWARM_HOME, join("D:\\data", "jiuwenswarm-home"));
   assert.equal(env.JIUWENSWARM_SRC, join("C:\\res", "backend", "jw"));
   assert.equal(env.SCIENCE_AGENT_PAPER_PYTHON_PATH, join("D:\\data", "envs", "sd-services", "Scripts", "python.exe"));
   // The Windows-only unisolated opt-in (Seatbelt exists nowhere on win32).
@@ -80,6 +83,8 @@ test("packagedEnv: darwin uses POSIX venv paths and NEVER opts into unisolated",
   assert.equal(env.SCIENCE_AGENT_PYTHON_PATH, join("/res", "python", "python3"));
   assert.equal(env.SCIENCE_AGENT_PROVISIONER_PATH, join("/res", "micromamba", "micromamba"));
   assert.equal(env.SCIENCE_AGENT_PAPER_PYTHON_PATH, join("/data", "envs", "sd-services", "bin", "python3"));
+  // Same W1 fix on darwin: never fall back to process.env.HOME (~ on macOS).
+  assert.equal(env.JIUWENSWARM_HOME, join("/data", "jiuwenswarm-home"));
   // Seatbelt answers on darwin without any opt-in; the unisolated escape
   // hatch stays a Windows-only contract (defense in depth even though the
   // api's darwin branch ignores the flag today).
