@@ -36,7 +36,14 @@ import {
   runSelfCheck,
 } from "./wizard-api.ts";
 import { runSeatbeltProbe, type SeatbeltVerdict } from "./sandbox-probe.ts";
+import { setupAutoUpdate, updateEnabled } from "./updater.ts";
 import { type AgentInfo } from "./agent-ready.ts";
+// electron-updater exports a PLATFORM SINGLETON (NsisUpdater on win /
+// MacUpdater on darwin) — use it as-is, never `new`. esbuild bundles this
+// CJS package into the main.cjs just fine (pure JS deps: semver/js-yaml/
+// fs-extra). The update feed URL comes from the app-embedded publish
+// config (electron-builder.yml, B4-2) — nothing here names a URL.
+import { autoUpdater } from "electron-updater";
 
 // Bundled as CJS by esbuild: the app path is the shell root in dev (`electron .`).
 const shellDir = app.getAppPath();
@@ -160,6 +167,8 @@ let stackOwnedByShell = false;
 /** Data dir the owned stack was spawned with (dir change → stop + respawn). */
 let stackDir: string | null = null;
 let quitConfirmed = false;
+/** Stop() in flight (stack draining) — feeds the updater drain gate. */
+let stackStopInFlight = false;
 /** Endpoints of the current run; the save-token IPC handler reloads the UI. */
 let currentEndpoints: Endpoints | null = null;
 // --- wizard state ---
@@ -1605,6 +1614,50 @@ void app.whenReady().then(async () => {
   createWindow();
   SD_PERF("window-created");
 
+  // Auto-update (B4-3, F11 conservative policy — D4 §5): armed only in
+  // packaged builds; the update-source URL comes from the publish section
+  // embedded by electron-builder (B4-2's yml block is the frozen truth).
+  // Dev builds never hit the feed.
+  if (updateEnabled(app.isPackaged)) {
+    setupAutoUpdate({
+      app,
+      autoUpdater,
+      log,
+      prompt: async version => {
+        const answer = await dialog.showMessageBox({
+          type: "info",
+          title: "ScienceDiscovery 更新",
+          message: `新版本 ${version} 可用`,
+          detail: "下载并安装更新？你可以稍后再装——检查会定期重新提醒。",
+          buttons: ["下载并安装", "暂不更新"],
+          defaultId: 0,
+          cancelId: 1,
+          noLink: true,
+        });
+        return answer.response === 0;
+      },
+      notify: (kind, detail) => {
+        log(`update: ${kind} ${detail}`);
+        if (Notification.isSupported() && mainWindow) {
+          const body = kind === "downloading" ? `正在下载新版本 ${detail}…`
+            : kind === "ready" ? "更新已就绪，即将重启安装"
+            : kind === "drain-blocked" ? detail
+            : `更新失败：${detail}`;
+          new Notification({ title: "ScienceDiscovery 更新", body }).show();
+        }
+      },
+      stackFacts: () => ({ hasHandle: stack !== null, stopInFlight: stackStopInFlight }),
+      stopStack: async () => {
+        const s = stack;
+        if (s && stackOwnedByShell) {
+          stack = null;
+          stackStopInFlight = true;
+          try { await s.stop(); } finally { stackStopInFlight = false; }
+        }
+      },
+    });
+  }
+
   if (wizardMode) {
     wizardData = wizardState ?? { step: "data-dir" };
     registerWizardIpc(proxyEnv);
@@ -1637,6 +1690,7 @@ app.on("will-quit", event => {
   clearStackStableTimer();
   if (stack && stackOwnedByShell) {
     event.preventDefault();
-    void stack.stop().finally(() => { stack = null; app.quit(); });
+    stackStopInFlight = true;
+    void stack.stop().finally(() => { stack = null; stackStopInFlight = false; app.quit(); });
   }
 });
