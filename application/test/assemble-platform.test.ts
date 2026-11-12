@@ -42,6 +42,9 @@ test("win32 dialect matches the shipped Windows payload shape", () => {
   const d = assembleDialect("win32-x64");
   assert.equal(d.family, "win32");
   assert.equal(d.basePythonName, "python.exe");
+  // The bundled interpreter path under <out>/python: win32 roots carry
+  // python.exe at the root itself (lockstep with venvLayoutWin32.basePython).
+  assert.equal(d.bundledBasePythonPath, "python.exe");
   assert.equal(d.venvBin, "Scripts");
   assert.equal(d.venvPythonName, "python.exe");
   assert.equal(d.venvLib("12"), "Lib");
@@ -58,6 +61,11 @@ test("darwin dialect matches the POSIX payload shape (python-build-standalone)",
   const d = assembleDialect("darwin-arm64");
   assert.equal(d.family, "darwin");
   assert.equal(d.basePythonName, "python3");
+  // The darwin payload bundles the uv python INSTALL ROOT, so the bundled
+  // interpreter keeps its bin/ layout — one level deeper than win32
+  // (lockstep with venvLayoutDarwin.basePython "bin/python3" and with
+  // replaceVenvSymlinks' hop target python/bin/python3).
+  assert.equal(d.bundledBasePythonPath, "bin/python3");
   assert.equal(d.venvBin, "bin");
   assert.equal(d.venvPythonName, "python");
   assert.equal(d.venvLib("12"), "lib/python3.12");

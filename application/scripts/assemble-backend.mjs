@@ -444,7 +444,18 @@ const copySet = [
   // build-runner.mjs OUTPUT layout), which nothing reads at runtime; the
   // entry below copies it to the layout remote-host deployment actually
   // resolves, and the rm below drops the dead duplicate from the payload.
-  { src: join(repo, "services", "runner", "dist", "sea"), dest: join(backendOut, "node_modules", "@sciencediscovery", "runner", "dist", "sea") },
+  // Desktop darwin (macOS adaptation, problems W15 mac-design): SEA binaries
+  // are Linux-built (build-binary.mjs resolveSeaRuntimePlan throws off-Linux)
+  // and only serve remote-host SSH execution, which the mac v1 scope excludes
+  // (上级设计文档: 远程执行 Provider C 不进 v1). A Mac build host has no
+  // producer for them — skip the copy and let the A2 manifest drop the entries
+  // (see the darwin branch there). win32 desktop keeps shipping them (Windows
+  // build hosts produce them via WSL/Docker); the runtime fails gracefully per
+  // package when the artifacts are absent (runner-executable.ts: "remote Node
+  // is not required").
+  ...(dialect.family === "darwin"
+    ? []
+    : [{ src: join(repo, "services", "runner", "dist", "sea"), dest: join(backendOut, "node_modules", "@sciencediscovery", "runner", "dist", "sea") }]),
   { src: join(repo, "services", "paper", "paper_worker.py"), dest: join(backendOut, "services", "paper", "paper_worker.py") },
   { src: join(repo, "services", "paper", "pyproject.toml"), dest: join(backendOut, "services", "paper", "pyproject.toml") },
   // SIZEOPT W2: five per-service uv.lock files became one workspace lock at
@@ -716,9 +727,17 @@ for (const name of VENV_NAMES) {
 // ---------------------------------------------------------------------------
 // 7. Base interpreter (venv `home`), realpath'd (uv dirs can be symlinks)
 
-const pythonHome = await realpath(pyvenvHome(join(data, "envs", "sd-services")));
-if (!existsSync(join(pythonHome, dialect.basePythonName))) {
-  fail(`no ${dialect.basePythonName} under ${pythonHome}`);
+// POSIX pyvenv.cfg points `home` at the interpreter's bin/ DIRECTORY (Windows
+// points at the install root). The payload bundles the whole install root —
+// stdlib lives at <out>/python/lib/python3.<minor> (dialect.stdlibLib), and
+// every payload venv's bin/python symlink hops to <out>/python/bin/python3 —
+// so on darwin copy the PARENT of the realpath'd home (the install root),
+// not the bin/ directory itself (measured: copying bin/ alone flattened
+// executables into <out>/python and left lib/ missing entirely).
+const pyvenvHomeRaw = await realpath(pyvenvHome(join(data, "envs", "sd-services")));
+const pythonHome = dialect.family === "darwin" ? dirname(pyvenvHomeRaw) : pyvenvHomeRaw;
+if (!existsSync(join(pythonHome, dialect.bundledBasePythonPath))) {
+  fail(`no ${dialect.bundledBasePythonPath} under ${pythonHome} — not a base interpreter install root`);
 }
 say(`copying base interpreter from ${pythonHome}`);
 await cp(pythonHome, join(out, "python"), { recursive: true, force: true, filter: pyFilter() });
@@ -757,9 +776,16 @@ if (dialect.hasTrampolines) {
   let symlinkReplaced = 0;
   for (const venvDir of launcherDirs) {
     // <venvDir> is <out>/envs-template/<name> or <out>/backend/jw/.venv;
-    // the bundled interpreter is <out>/python. Hop up until we reach out.
+    // the bundled interpreter is <out>/python. The link lives in
+    // <venvDir>/<venvBin>/ (bin/ on POSIX), one level below venvDir, so the
+    // hop count is the venv's depth below out PLUS one for that bin/ level:
+    // envs-template venvs → ../../../python/bin/python3 (3 hops from bin/),
+    // the jw venv (backend/jw/.venv) → ../../../../python/bin/python3 (4).
+    // An off-by-one here lands the links one directory short (measured:
+    // envs-template/python/…, backend/python/… — dead symlinks the jw
+    // precompile step then fails to spawn).
     const relFromOut = relative(out, venvDir);
-    const hops = relFromOut.split(/[\\/]/).length; // venv depth below out
+    const hops = relFromOut.split(/[\\/]/).length + 1; // +1: links sit in <venv>/bin
     const n = await replaceVenvSymlinks([venvDir], dialect.venvBin, `${"../".repeat(hops)}python/bin/python3`, say);
     symlinkReplaced += n;
   }
@@ -842,7 +868,7 @@ const compileEnv = payloadCompileEnv(process.env, { warn: say });
 const compileAll = (pythonExe, target, exclude) =>
   execFileSync(pythonExe, ["-m", "compileall", "-q", "--invalidation-mode", "checked-hash",
     ...(exclude ? ["-x", exclude] : []), target], { env: compileEnv, windowsHide: true, stdio: "pipe", maxBuffer: 64 * 1024 * 1024 });
-const basePythonExe = join(out, "python", dialect.basePythonName);
+const basePythonExe = join(out, "python", ...dialect.bundledBasePythonPath.split("/"));
 const jwVenvPython = join(jwPayload, ".venv", dialect.venvBin, dialect.venvPythonName);
 const compileTargets = [
   { label: "python stdlib", python: basePythonExe, path: join(out, "python", ...dialect.stdlibCompileTarget(PYTHON_MINOR)) },
@@ -988,13 +1014,21 @@ try {
 const requiredFiles = [
   join(jwPayload, ".sciencediscovery-patches.json"),
   join(jwPayload, ".venv", dialect.venvBin, dialect.family === "darwin" ? "jiuwenswarm-start" : "jiuwenswarm-start.exe"),
-  join(out, "backend", "node_modules", "@sciencediscovery", "runner", "dist", "sea", "linux-x64", "sciencediscovery-runner"),
-  join(out, "backend", "node_modules", "@sciencediscovery", "runner", "dist", "sea", "linux-arm64", "sciencediscovery-runner"),
+  // SEA entries are win32-only (macOS adaptation, problems W15 mac-design):
+  // darwin desktop payloads do not ship the remote-host Runner binaries
+  // (Linux-built, out of mac v1 scope — see the copySet note above). The count
+  // in the log line below therefore differs by platform by design.
+  ...(dialect.family === "darwin"
+    ? []
+    : [
+        join(out, "backend", "node_modules", "@sciencediscovery", "runner", "dist", "sea", "linux-x64", "sciencediscovery-runner"),
+        join(out, "backend", "node_modules", "@sciencediscovery", "runner", "dist", "sea", "linux-arm64", "sciencediscovery-runner"),
+      ]),
   join(out, "backend", "services", "api", "dist", "server.js"),
   join(out, "backend", "services", "runner", "dist", "server.js"),
   join(out, "envs-template", "sd-services", ...dialect.sitePackages(PYTHON_MINOR).split("/"), "_editable_impl_sciencediscovery_gateway.pth"),
   join(out, "micromamba", dialect.micromambaName),
-  join(out, "python", dialect.basePythonName),
+  join(out, "python", ...dialect.bundledBasePythonPath.split("/")),
 ];
 const missingRequired = requiredFiles.filter((p) => !existsSync(p));
 if (missingRequired.length > 0) {
