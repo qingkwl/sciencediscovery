@@ -55,33 +55,66 @@ const jwPython = cfg => venvEntry(venvDir(cfg), "python");
  * 绕法：从 venv 自己的 entry_points.txt（纯文本）解析 console-script 入口，
  * 用 venv 的 python.exe -c 直调 —— 零二进制手术、布局无关、jw 升级自动跟随。
  * 解析不到时回退旧 trampoline exe（路径存在时仍可用，开发模式不受影响）。
+ *
+ * [macOS adaptation] W18 —— POSIX console scripts carry the SAME disease in
+ * shebang form: jiuwenswarm-start et al. ship `#!` lines burned with the
+ * BUILD machine's jw source venv path (measured: #!/Users/<builder>/.../
+ * jiuwenswarm/src/.venv/bin/python3), and macOS kernel shebang parsing
+ * breaks on ANY space in the interpreter path anyway (posix_spawn
+ * experiment: target exists + path has a space → ENOENT; no space → runs).
+ * A mounted DMG ("ScienceDiscovery 0.3.0-arm64") hits both at once. The
+ * entry_points bypass sidesteps shebangs entirely — but it used to scan
+ * only the WINDOWS venv layout (Lib/site-packages), so on POSIX it always
+ * missed and fell back to the burned-in console script (the DMG first-run
+ * died with spawn ENOENT after every other stage had gone green).
+ * Scan BOTH layouts; on POSIX the direct-python spec is now the ONLY
+ * working path, not an optimization.
  */
 const jwEntryCache = new Map();
+
+/** The site-packages directories of a venv, Windows and POSIX layouts
+ * (W18: scan both — the resolver runs on the TARGET platform's payload). */
+function venvSitePackagesDirs(venvAbs) {
+  const dirs = [join(venvAbs, "Lib", "site-packages")]; // win32 uv venvs
+  try {
+    const lib = join(venvAbs, "lib");
+    for (const ent of readdirSync(lib, { withFileTypes: true })) {
+      if (ent.isDirectory() && /^python3\.\d+$/.test(ent.name)) {
+        dirs.push(join(lib, ent.name, "site-packages")); // POSIX venvs
+      }
+    }
+  } catch {
+    /* no lib/ dir: a win32-only venv — the first entry covers it */
+  }
+  return dirs;
+}
 
 export function resolveVenvEntry(venvAbs, name) {
   const key = `${venvAbs}::${name}`;
   if (jwEntryCache.has(key)) return jwEntryCache.get(key);
   let spec = null;
-  try {
-    const sitePackages = join(venvAbs, "Lib", "site-packages");
-    for (const ent of readdirSync(sitePackages, { withFileTypes: true })) {
-      if (!ent.isDirectory() || !ent.name.endsWith(".dist-info")) continue;
-      let text;
-      try {
-        text = readFileSync(join(sitePackages, ent.name, "entry_points.txt"), "utf8");
-      } catch {
-        continue; // most dist-infos ship no entry_points.txt — keep scanning
+  for (const sitePackages of venvSitePackagesDirs(venvAbs)) {
+    try {
+      for (const ent of readdirSync(sitePackages, { withFileTypes: true })) {
+        if (!ent.isDirectory() || !ent.name.endsWith(".dist-info")) continue;
+        let text;
+        try {
+          text = readFileSync(join(sitePackages, ent.name, "entry_points.txt"), "utf8");
+        } catch {
+          continue; // most dist-infos ship no entry_points.txt — keep scanning
+        }
+        const match = new RegExp(`^\\s*${name}\\s*=\\s*([\\w.]+):(\\w+)\\s*$`, "m").exec(text);
+        if (match) {
+          const code = `import sys; sys.argv[0] = ${JSON.stringify(name)}; `
+            + `from ${match[1]} import ${match[2]} as _sd_entry; sys.exit(_sd_entry())`;
+          spec = { exe: venvPython(venvAbs), args: ["-c", code] };
+          break;
+        }
       }
-      const match = new RegExp(`^\\s*${name}\\s*=\\s*([\\w.]+):(\\w+)\\s*$`, "m").exec(text);
-      if (match) {
-        const code = `import sys; sys.argv[0] = ${JSON.stringify(name)}; `
-          + `from ${match[1]} import ${match[2]} as _sd_entry; sys.exit(_sd_entry())`;
-        spec = { exe: venvPython(venvAbs), args: ["-c", code] };
-        break;
-      }
+    } catch {
+      /* this layout dir missing — try the next */
     }
-  } catch {
-    /* fall through to the trampoline exe */
+    if (spec) break;
   }
   if (!spec) spec = { exe: venvEntry(venvAbs, name), args: [] };
   jwEntryCache.set(key, spec);
