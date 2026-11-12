@@ -690,6 +690,26 @@ export async function cmdStop(cfg = jwConfig()) {
   }).catch(() => {});
 }
 
+/** [mac-desktop] W20 —— 同步形态停 jw（信号处理器安全版 cmdStop）。
+ * start-stack 的 cleanup() 在 SIGTERM/SIGINT/exit 处理器里跑：那里只能用
+ * 同步原语——async cmdStop 的 execFile 回调永远等不到（cleanup 后立刻
+ * process.exit）。jw 由 spawnDetached 起独立进程组（不在 start-stack 的
+ * children[] 册上），app 退出时若不显式停它，darwin 上整组 4 进程成孤儿
+ * （实测）；win32 同漏（detached:false 但 unref 后同样脱离名册）。走 jw
+ * 官方 --stop（与 cmdStop 同一条命令），spawnSync 有界等待防挂死。 */
+export function stopDetachedSync(cfg = jwConfig()) {
+  if (!jwInstalled(cfg)) return;
+  const entry = jwEntry(cfg, "jiuwenswarm-start");
+  try {
+    spawnSync(entry.exe, [...entry.args, "--stop", cfg.instance], {
+      cwd: cfg.root,
+      env: { ...process.env, JIUWENSWARM_DATA_DIR: cfg.dataDir, ...(cfg.home ? { JIUWENSWARM_HOME: cfg.home } : {}) },
+      windowsHide: true,
+      timeout: 15_000,
+    });
+  } catch { /* best-effort: an unresponsive jw must not wedge the stop chain */ }
+}
+
 /** env: the exports the adapter needs (start-stack consumes them directly). */
 export async function jwEnv(cfg = jwConfig()) {
   if (!jwInstalled(cfg)) {
