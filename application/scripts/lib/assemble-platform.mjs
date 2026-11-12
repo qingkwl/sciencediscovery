@@ -43,6 +43,12 @@ export function assembleDialect(platform) {
     return {
       family,
       basePythonName: "python3",
+      /** Path of the bundled base interpreter UNDER <out>/python once the
+       * install root is copied there. POSIX roots keep their bin/ layout
+       * (<out>/python/bin/python3); win32 roots carry python.exe at the root
+       * itself. Consumed by the precompile step and the A2 manifest so they
+       * agree with replaceVenvSymlinks' hop target (python/bin/python3). */
+      bundledBasePythonPath: "bin/python3",
       venvBin: "bin",
       venvPythonName: "python",
       /** lib dir inside a venv, with the Python minor injected. */
@@ -68,6 +74,7 @@ export function assembleDialect(platform) {
   return {
     family: "win32",
     basePythonName: "python.exe",
+    bundledBasePythonPath: "python.exe",
     venvBin: "Scripts",
     venvPythonName: "python.exe",
     venvLib: () => "Lib",

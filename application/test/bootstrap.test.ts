@@ -6,7 +6,7 @@ import { test } from "node:test";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, sep } from "node:path";
+import { join, sep, dirname } from "node:path";
 
 import {
   bootstrapPackaged, compileallArgs, copyTreeConcurrent, countBytecode, needsUnpack, packagedEnv, packagedPaths,
@@ -80,7 +80,10 @@ test("packagedEnv injects the packaged-mode contract (win32)", () => {
 test("packagedEnv: darwin uses POSIX venv paths and NEVER opts into unisolated", () => {
   const p = packagedPaths("/res", "darwin");
   const env = packagedEnv(p, "/data", "darwin");
-  assert.equal(env.SCIENCE_AGENT_PYTHON_PATH, join("/res", "python", "python3"));
+  // The darwin payload bundles the uv python INSTALL ROOT, so the bundled
+  // interpreter keeps its bin/ layout (<out>/python/bin/python3) — unlike
+  // win32 where python.exe sits at the payload-python root.
+  assert.equal(env.SCIENCE_AGENT_PYTHON_PATH, join("/res", "python", "bin", "python3"));
   assert.equal(env.SCIENCE_AGENT_PROVISIONER_PATH, join("/res", "micromamba", "micromamba"));
   assert.equal(env.SCIENCE_AGENT_PAPER_PYTHON_PATH, join("/data", "envs", "sd-services", "bin", "python3"));
   // Same W1 fix on darwin: never fall back to process.env.HOME (~ on macOS).
@@ -130,9 +133,13 @@ test("precompileTargets: before unpack only template-phase targets exist; after 
   t.after(() => rm(root, { recursive: true, force: true }));
   const resources = join(root, "resources");
   const layout = venvLayoutFor(IS_DARWIN ? "darwin" : "win32");
-  // Bundled interpreter → stdlib is a template-phase target.
-  await mkdir(join(resources, "python", "Lib"), { recursive: true });
-  await writeFile(join(resources, "python", layout.basePython), "", "utf8");
+  // Bundled interpreter → stdlib is a template-phase target. The interpreter
+  // file path (darwin: python/bin/python3 — install-root layout; win32:
+  // python/python.exe — root-level exe) may nest, so mkdir its dirname.
+  const bundledPython = join(resources, "python", layout.basePython);
+  await mkdir(dirname(bundledPython), { recursive: true });
+  await mkdir(join(resources, "python", IS_DARWIN ? "lib/python3.12" : "Lib"), { recursive: true });
+  await writeFile(bundledPython, "", "utf8");
   // jw venv lives in the read-only payload → template phase too.
   const jwVenv = join(resources, "backend", "jw", ".venv");
   await mkdir(join(jwVenv, layout.venvBin), { recursive: true });
@@ -176,9 +183,11 @@ test("precompileTargets (darwin fixture): minor comes from pyvenv.cfg, stdlib fr
   const root = await mkdtemp(join(tmpdir(), "sd-shell-env-darwin-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const resources = join(root, "resources");
-  // darwin base interpreter: python3 + lib/python3.13/ stdlib.
+  // darwin base interpreter: install-root layout — bin/python3 +
+  // lib/python3.13/ stdlib (bundledBasePythonPath nests one level).
   await mkdir(join(resources, "python", "lib", "python3.13"), { recursive: true });
-  await writeFile(join(resources, "python", "python3"), "", "utf8");
+  await mkdir(join(resources, "python", "bin"), { recursive: true });
+  await writeFile(join(resources, "python", "bin", "python3"), "", "utf8");
   const paths = packagedPaths(resources, "darwin");
   const envsDir = join(root, "data", "envs");
 

@@ -38,7 +38,12 @@ export function joinPosixPath(a: string, b: string): string {
 
 export function venvLayoutDarwin(): VenvLayout {
   return {
-    basePython: "python3",
+    // The darwin payload bundles the uv python INSTALL ROOT (assemble §7
+    // copies the parent of pyvenv.cfg's home), so the interpreter keeps its
+    // bin/ layout — unlike win32 where python.exe sits at the payload-python
+    // root. Keep in lockstep with replaceVenvSymlinks' hop target
+    // (python/bin/python3) and assemble's bundledBasePythonPath.
+    basePython: "bin/python3",
     venvBin: "bin",
     venvPython: "python3",
     venvLib: minor => `lib/python3.${minor}`,
