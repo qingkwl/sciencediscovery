@@ -561,6 +561,14 @@ export async function cmdStart(cfg = jwConfig()) {
     // 时该目录可能不存在，openSync 直接抛错 → 先确保目录存在。
     await mkdir(dirname(cfg.logFile), { recursive: true });
     await perfMark(cfg, "logdir-mkdir", startedAt);
+    // [mac-desktop] W19 —— packaged first launch: JIUWENSWARM_ROOT points at
+    // <dataDir>/jiuwenswarm, which nobody creates (dev mode root lives inside
+    // the repo, so it always exists there). Node spawn with a missing cwd
+    // fails with ENOENT that misleadingly names the EXE path — create the
+    // root before spawning (same pattern as the logdir mkdir above and the
+    // cmdSetup mkdir).
+    await mkdir(cfg.root, { recursive: true });
+    await perfMark(cfg, "rootdir-mkdir", startedAt);
     const bootstrapPath = join(repositoryRoot, "services", "adapter", "src", "sciencediscovery_adapter");
     const startEntry = jwEntry(cfg, "jiuwenswarm-start");
     const spawnStarted = Date.now();
