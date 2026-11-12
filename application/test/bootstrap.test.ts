@@ -3,8 +3,8 @@
 // functions under test here.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtemp, mkdir, readFile, rm, writeFile, chmod } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { mkdtemp, mkdir, readFile, rm, writeFile, chmod, symlink } from "node:fs/promises";
+import { existsSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, sep, dirname } from "node:path";
 
@@ -445,6 +445,122 @@ test("bootstrapPackaged degrades in-place to copy mode on a read-only payload (W
   // (which reads process.env) degrades in lockstep.
   assert.notEqual(process.env.SCIENCE_AGENT_IN_PLACE_ENVS, "1");
 });
+
+// --- W17: copied-out venvs need their python symlinks re-pointed ----------------
+//
+// The payload bakes venv bin/python* as relative hops for the venv's IN-PAYLOAD
+// position (envs-template/<name> → ../../../python). The copy fallback moves a
+// venv to <dataDir>/envs/<name>, where the same hop count resolves to thin air
+// (measured live: <dataDir>/envs/sd-services/bin/python → /Users/<user>/python)
+// and start-stack's venvPython() existsSync fail-fasts with "SHARED_ENV is
+// missing". The darwin fixVenvLaunchers must re-point the links from the venv's
+// CURRENT location. The test below is darwin-only (win32 venvs carry trampolines,
+// not symlinks).
+
+if (IS_DARWIN) {
+  test("copied-out venv python symlinks re-point to the bundled interpreter (W17)", async (t) => {
+    const original = process.env.SCIENCE_AGENT_IN_PLACE_ENVS;
+    process.env.SCIENCE_AGENT_IN_PLACE_ENVS = "1";
+    t.after(() => {
+      if (original === undefined) {
+        delete process.env.SCIENCE_AGENT_IN_PLACE_ENVS;
+      } else {
+        process.env.SCIENCE_AGENT_IN_PLACE_ENVS = original;
+      }
+    });
+
+    const root = await mkdtemp(join(tmpdir(), "sd-shell-bootstrap-w17-"));
+    t.after(() => {
+      // restore before rm so the cleanup itself can delete the read-only tree
+      chmod(join(root, "resources"), 0o755).catch(() => {});
+      return rm(root, { recursive: true, force: true });
+    });
+    const resources = join(root, "resources");
+    const template = join(resources, "envs-template");
+    const bundledPython = join(resources, "python", "bin", "python3");
+
+    // A payload-shaped template venv: pyvenv.cfg + bin/python* as the
+    // in-payload relative hops the assemble script bakes (3 hops).
+    const tmplVenv = join(template, "sd-services");
+    await mkdir(join(tmplVenv, "bin"), { recursive: true });
+    await writeFile(join(tmplVenv, "pyvenv.cfg"), `home = ${join(resources, "python")}\nversion_info = 3.12.7\n`, "utf8");
+    // The bundled interpreter itself (a plain file stands in for the binary).
+    await mkdir(dirname(bundledPython), { recursive: true });
+    await writeFile(bundledPython, "#!/bin/sh\n", "utf8");
+    for (const name of ["python", "python3", "python3.12"]) {
+      await symlink("../../../python/bin/python3", join(tmplVenv, "bin", name));
+    }
+
+    // A data dir that is NOT a sibling of the app — the W17 scenario: the
+    // copied venv's baked 3-hop link must NOT resolve from <dataDir>/envs.
+    const dataDir = join(root, "elsewhere", "ScienceDiscovery");
+    // read-only payload — the W16 DMG degradation that triggers the copy
+    // fallback this test exercises.
+    await chmod(resources, 0o555);
+    const paths = packagedPaths(resources);
+    const lines: string[] = [];
+    const log = (line: string) => lines.push(line);
+
+    await bootstrapPackaged(paths, dataDir, log);
+
+    const copiedVenv = join(dataDir, "envs", "sd-services");
+    assert.equal(existsSync(copiedVenv), true, "copy fallback unpacked the venv");
+    // THE W17 assertion: every copied venv python link must resolve to the
+    // BUNDLED interpreter from the venv's actual location — this is exactly
+    // what start-stack's venvPython()/existsSync gate checks before fail-fast.
+    for (const name of ["python", "python3", "python3.12"]) {
+      const link = join(copiedVenv, "bin", name);
+      assert.equal(existsSync(link), true, `${name} must exist (start-stack's gate)`);
+      assert.equal(realpathSync(link), realpathSync(bundledPython),
+        `${name} must resolve to the bundled interpreter`);
+    }
+    assert.ok(lines.some((l) => l.includes("W17")),
+      "the re-point was announced in the first-run log");
+  });
+
+  test("in-place venv symlinks are left alone (W17 idempotence)", async (t) => {
+    // In-place mode the venv never moves, so the baked hop is CORRECT; the
+    // fix must recognize an already-resolving link and not rewrite it (the
+    // rewrite target for an in-place venv equals the baked link anyway, but
+    // touching it would log noise and break the existsSync-in-place contract).
+    const original = process.env.SCIENCE_AGENT_IN_PLACE_ENVS;
+    process.env.SCIENCE_AGENT_IN_PLACE_ENVS = "1";
+    t.after(() => {
+      if (original === undefined) {
+        delete process.env.SCIENCE_AGENT_IN_PLACE_ENVS;
+      } else {
+        process.env.SCIENCE_AGENT_IN_PLACE_ENVS = original;
+      }
+    });
+
+    const root = await mkdtemp(join(tmpdir(), "sd-shell-bootstrap-w17-ip-"));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const resources = join(root, "resources");
+    const template = join(resources, "envs-template");
+    const bundledPython = join(resources, "python", "bin", "python3");
+
+    const tmplVenv = join(template, "sd-services");
+    await mkdir(join(tmplVenv, "bin"), { recursive: true });
+    await writeFile(join(tmplVenv, "pyvenv.cfg"), `home = ${join(resources, "python")}\nversion_info = 3.12.7\n`, "utf8");
+    await mkdir(dirname(bundledPython), { recursive: true });
+    await writeFile(bundledPython, "#!/bin/sh\n", "utf8");
+    const bakedTarget = "../../../python/bin/python3";
+    for (const name of ["python", "python3", "python3.12"]) {
+      await symlink(bakedTarget, join(tmplVenv, "bin", name));
+    }
+
+    const dataDir = join(root, "data");
+    const paths = packagedPaths(resources);
+    const lines: string[] = [];
+    const log = (line: string) => lines.push(line);
+
+    await bootstrapPackaged(paths, dataDir, log);
+    // In-place: the links still resolve and were NOT rewritten (no W17 line).
+    assert.equal(realpathSync(join(tmplVenv, "bin", "python")), realpathSync(bundledPython));
+    assert.equal(lines.some((l) => l.includes("W17")), false,
+      "an already-correct in-place link must not produce re-point noise");
+  });
+}
 
 test("packagedEnv uses in-place venv paths when SCIENCE_AGENT_IN_PLACE_ENVS=1", async (t) => {
   const original = process.env.SCIENCE_AGENT_IN_PLACE_ENVS;

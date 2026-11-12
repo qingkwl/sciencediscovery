@@ -16,12 +16,12 @@
 
 import { execFile } from "node:child_process";
 import { copyFile, mkdir, readFile, readdir, readlink, rm, symlink, writeFile } from "node:fs/promises";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import type { Dirent } from "node:fs";
-import { join } from "node:path";
+import { join, posix } from "node:path";
 import { promisify } from "node:util";
 // @ts-expect-error — plain .mjs helper shared with scripts/assemble-backend.mjs (no .d.mts in scope)
-import { copyVenvRuntimeDlls, replaceVenvTrampolines } from "../scripts/lib/venv-launchers.mjs";
+import { copyVenvRuntimeDlls, replaceVenvTrampolines, replaceVenvSymlinks, pythonNamesFor } from "../scripts/lib/venv-launchers.mjs";
 // @ts-expect-error — plain .mjs helper shared with scripts/assemble-backend.mjs (no .d.mts in scope)
 import { payloadCompileEnv, unpackedBytecodeVerdict } from "../scripts/lib/pyc-budget.mjs";
 import { CURRENT_SHELL_PLATFORM, pythonMinorFromPyvenvCfg, venvLayoutFor, type ShellPlatform, type VenvLayout } from "./shell-platform.ts";
@@ -257,6 +257,13 @@ function bundledStdlibMinor(pythonHome: string): string | null {
     }
   } catch { /* no lib/ dir: darwin payload shape mismatch */ }
   return null;
+}
+
+/** Relative POSIX path from one directory to a target (W17: venv symlink
+ * hop target when the venv has been copied out of the payload — computed
+ * from the venv's CURRENT location, never a baked hop count). */
+function posixRelative(fromDir: string, toPath: string): string {
+  return posix.relative(fromDir, toPath);
 }
 
 /** Whether a directory is writable, by probe (a real create+delete of a
@@ -911,16 +918,65 @@ export async function bootstrapPackaged(
  * assemble script ships them, this is the idempotent first-run/reinstall
  * backstop.
  *
- * darwin: the whole concept is Windows-only — POSIX venvs made by uv carry
- * bin/python as a plain symlink to the base interpreter (no trampoline, no
- * DLLs), so there is nothing to replace or copy. Skipped outright.
+ * darwin: POSIX venvs made by uv carry no trampolines and no DLLs — the
+ * Windows swap is skipped outright. Instead, venv python launchers are
+ * RELATIVE symlinks whose hop count is baked for the venv's position in
+ * the PAYLOAD (envs-template/<name>: ../../../python — 3 hops; the jw venv:
+ * 4). As long as venvs run in-place that target is correct by construction.
+ * W17: when the copy fallback moves a venv OUT of the payload (read-only
+ * volume — the W16 DMG run — or the historical default copy mode), the
+ * hops now resolve against <dataDir> and land on thin air (measured:
+ * <dataDir>/envs/sd-services/bin/python -> ../../../python/bin/python3
+ * resolved to /Users/<user>/python — start-stack's venvPython() existsSync
+ * says false and the stack fail-fasts with "SHARED_ENV is missing"). Re-point
+ * every copied venv's python* symlinks at the ACTUAL bundled interpreter,
+ * with the hop count computed from where the venv sits NOW; venvs still
+ * inside the payload keep their (correct) baked links untouched — the
+ * rewrite is idempotent and only fires for links that do not already
+ * resolve to the right interpreter.
  */
 async function fixVenvLaunchers(
   paths: PackagedPaths,
   envsDir: string,
   log: (line: string) => void,
 ): Promise<void> {
-  if (CURRENT_SHELL_PLATFORM === "darwin") return;
+  if (CURRENT_SHELL_PLATFORM === "darwin") {
+    // Venvs under envsDir are the COPIED ones (in-place mode passes
+    // envsTemplate here and the links are already correct — replaceVenvSymlinks
+    // is idempotent and verifies by target, so running it anyway is safe; but
+    // skip venvs whose links already point where they should, cheaply, by
+    // checking that the venv's python resolves to the bundled interpreter).
+    const venvs = paths.venvNames
+      .map((name) => join(envsDir, name))
+      .filter((v) => existsSync(v));
+    for (const venvDir of venvs) {
+      const minor = venvPythonMinor(venvDir);
+      if (!minor) continue; // unreadable/missing pyvenv.cfg — fixVenvHome already warned
+      // Compute the relative hop count from the venv's CURRENT location to
+      // the bundled interpreter, exactly like assemble §7b does for the
+      // payload position: the link lives in <venv>/bin/ (one level below
+      // venvDir), so hops = depth(venvDir → common root) + 1. An off-by-one
+      // lands the link one directory short (measured in W15) — use the same
+      // relative() the build side uses, not hand-counted "../" repeats.
+      const venvBinDir = join(venvDir, "bin");
+      const relTarget = posixRelative(venvBinDir, join(paths.python, "bin", "python3"));
+      const names = pythonNamesFor(minor);
+      // Does the venv's python already resolve to the bundled interpreter?
+      // (in-place mode: the baked 3-hop link is correct; idempotence gate
+      // for the copy mode: a relaunch re-runs this fix on the copied venvs.)
+      const venvPythonLink = join(venvBinDir, names[0]);
+      let alreadyResolves = false;
+      try {
+        alreadyResolves = realpathSync(venvPythonLink) === realpathSync(join(paths.python, "bin", "python3"));
+      } catch { /* dead link — falls through to the rewrite */ }
+      if (alreadyResolves) continue;
+      const n = await replaceVenvSymlinks([venvDir], "bin", relTarget, log, names);
+      if (n > 0) {
+        log(`first run: re-pointed ${n} venv python symlink(s) in ${venvDir} (copied out of the read-only payload — W17)`);
+      }
+    }
+    return;
+  }
   const venvs = [...paths.venvNames.map((name) => join(envsDir, name)), join(paths.jwSrc, ".venv")];
   const existing = venvs.filter((v) => existsSync(v));
   if (existing.length) {
