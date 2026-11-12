@@ -259,6 +259,22 @@ function bundledStdlibMinor(pythonHome: string): string | null {
   return null;
 }
 
+/** Whether a directory is writable, by probe (a real create+delete of a
+ *  unique temp file — access(W_OK) lies on macOS: it checks the READ-ONLY
+ *  mount flag path but not sandbox/ACL reality, and DMG volumes report
+ *  writable while rejecting writes with EROFS). Exported for unit tests.
+ *  W16: running the app straight off a mounted DMG hits exactly this. */
+export async function dirWritable(dir: string): Promise<boolean> {
+  const probe = join(dir, `.sd-write-probe-${process.pid}-${Date.now()}`);
+  try {
+    await writeFile(probe, "", "utf8");
+    await rm(probe, { force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export interface BootstrapResult {
   unpacked: boolean;
   jwFixed: boolean;
@@ -648,7 +664,22 @@ export async function bootstrapPackaged(
   // Optionally run venvs straight from the read-only payload.
   // Packaged mode never mutates venvs at runtime, so copying them into the
   // data directory is pure overhead on first start.
-  const inPlaceEnvs = process.env.SCIENCE_AGENT_IN_PLACE_ENVS === "1";
+  // W16: in-place mode still FIXES venvs in the payload (pyvenv.cfg home +
+  // editable .pth placeholders) — on a read-only payload volume (running
+  // straight off the mounted DMG) those writes fail EROFS with no catch and
+  // the promise dies silently, freezing the loading page forever. Probe the
+  // payload root once; not writable → fall back to the copy mode, which
+  // only ever writes <dataDir>. The env is cleared on THIS process so
+  // packagedEnv() (reads process.env) degrades in lockstep. The jw venv
+  // stays runnable either way: its python launchers are relative symlinks
+  // (W15), so the stale build-machine `home` in pyvenv.cfg is inert.
+  const payloadWritable = await dirWritable(paths.resourcesPath);
+  let inPlaceEnvs = process.env.SCIENCE_AGENT_IN_PLACE_ENVS === "1";
+  if (inPlaceEnvs && !payloadWritable) {
+    log("payload volume is read-only (running from a mounted DMG?); falling back to copied envs");
+    process.env.SCIENCE_AGENT_IN_PLACE_ENVS = undefined;
+    inPlaceEnvs = false;
+  }
   const envsDir = inPlaceEnvs ? paths.envsTemplate : join(dataDir, "envs");
   // Which payload this launch is running from. Stamped below so an upgrade is
   // told apart from a relaunch of the same payload (needsBytecodeJudgement).
@@ -662,9 +693,13 @@ export async function bootstrapPackaged(
     // The reinstall also refreshed the payload's in-place jw venv,
     // re-shipping the build machine's pyvenv.cfg home — fix that too, or the
     // next jw spawn (init/precompile) runs against a nonexistent interpreter.
-    const jwVenv = join(paths.jwSrc, ".venv");
-    if (existsSync(join(jwVenv, "pyvenv.cfg"))) {
-      await fixVenvHome(jwVenv, paths.python, log);
+    // W16: skip on a read-only payload (DMG run) — the fix writes into
+    // <resources>; jw stays runnable via its relative python symlinks (W15).
+    if (payloadWritable) {
+      const jwVenv = join(paths.jwSrc, ".venv");
+      if (existsSync(join(jwVenv, "pyvenv.cfg"))) {
+        await fixVenvHome(jwVenv, paths.python, log);
+      }
     }
     perfB("short-circuit", `unpackNeeded=false`);
     log(`[perf] bootstrapPackaged short-circuit elapsed=${Date.now() - bootstrapStarted}ms`);
@@ -686,11 +721,17 @@ export async function bootstrapPackaged(
   // picks up the five copied venvs). Ordering matters: the jw home fix used
   // to run only AFTER the ~7s unpack, so the overlapping precompile spawned
   // against the build machine's burned-in home.
-  await fixVenvLaunchers(paths, envsDir, log);
-  const jwVenv = join(paths.jwSrc, ".venv");
-  if (existsSync(join(jwVenv, "pyvenv.cfg"))) {
-    await fixVenvHome(jwVenv, paths.python, log);
-    log("first run: pointed the bundled JiuwenSwarm venv at the bundled interpreter");
+  // W16: on a read-only payload both fixes write into <resources> — skip
+  // them and keep the jw venv running on its relative symlinks (W15) with
+  // the build-machine home left inert in pyvenv.cfg. (fixVenvLaunchers is a
+  // no-op on darwin anyway; the guard also covers a win32 read-only case.)
+  if (payloadWritable) {
+    await fixVenvLaunchers(paths, envsDir, log);
+    const jwVenv = join(paths.jwSrc, ".venv");
+    if (existsSync(join(jwVenv, "pyvenv.cfg"))) {
+      await fixVenvHome(jwVenv, paths.python, log);
+      log("first run: pointed the bundled JiuwenSwarm venv at the bundled interpreter");
+    }
   }
   perfB("jw-venv-fix-done");
 

@@ -580,8 +580,13 @@ await cp(jwSrcIn, jwSrcOut, {
 // dead weight out of the target tree after the copy so the payload reflects
 // the filter, not the history of this build directory.
 async function rmIfPresent(p) {
+  // Best-effort stays best-effort (fresh trees legitimately lack the junk),
+  // but a swallowed delete is no longer SILENT: the W16 rebuild shipped
+  // kubernetes/onnxruntime because the sandbox shim rejected the big rmtree
+  // and only the payload probe caught it. Named in the log, the same failure
+  // is a one-glance diagnosis.
   try { await rm(p, { recursive: true, force: true }); say(`swept stale payload: ${relative(jwSrcOut, p)}`); }
-  catch { /* best effort */ }
+  catch (e) { say(`warning: sweep rm FAILED (left in payload): ${relative(jwSrcOut, p)} — ${e instanceof Error ? e.message : String(e)}`); }
 }
 for (const junk of ["htmlcov", "coverage.xml", ".coverage", ".pytest_cache"]) {
   await rmIfPresent(join(jwSrcOut, junk));
@@ -633,7 +638,7 @@ await sweepNodeModules(jwSrcOut);
       const p = join(sp, ...nested.split("/"));
       if (existsSync(p)) { await rmIfPresent(p); say(`swept dead weight: ${nested} (google_adk namespace subtree)`); sweptAny = true; }
     }
-  } catch { /* site-packages unreadable — sweep is best-effort */ }
+  } catch (e) { say(`warning: dead-weight sweep could not list site-packages — ${e instanceof Error ? e.message : String(e)}`); }
   const scriptsDir = join(jwSrcOut, ".venv", dialect.venvBin);
   try {
     for (const e of await readdir(scriptsDir, { withFileTypes: true })) {

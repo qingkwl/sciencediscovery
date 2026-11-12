@@ -50,6 +50,7 @@
 #
 # Preconditions (the script checks and tells you, it does not provision):
 #   - repo built: pnpm build ran at the repo root, services/*/dist exist
+#     (the SHELL bundle itself is rebuilt automatically by step 1b — W16)
 #   - .sciencediscovery-data provisioned ON THIS MACHINE (uv venvs with
 #     darwin python): the repo's setup scripts do this; assemble sanity-
 #     checks every input before copying.
@@ -107,6 +108,21 @@ step "1. darwin shell unit tests"
 ( cd "$SHELL_ROOT" && node --experimental-strip-types --no-warnings --test test/*.test.ts ) \
   || die "shell unit tests failed"
 echo "unit tests green"
+
+# --- 1b. shell bundle rebuild ------------------------------------------------
+# W16: the packaged main.cjs must match the src/ that the payload was
+# assembled against. A stale dist/ (shell built before a src change, then
+# only assemble rerun) ships a new payload with the OLD path layout baked
+# into main.cjs — observed live: basePython "python3" (pre-4fa8098) in the
+# bundle vs "bin/python3" in src, so SCIENCE_AGENT_PYTHON_PATH pointed at a
+# nonexistent file and start-stack fail-fasted. esbuild rebuilds both
+# entries in seconds, so the gate owns the shell build instead of trusting
+# the "pnpm build ran first" precondition (which the script cannot verify).
+step "1b. shell bundle rebuild (esbuild)"
+( cd "$SHELL_ROOT" && node scripts/build.mjs ) \
+  || die "shell bundle rebuild failed"
+[ -f "$SHELL_ROOT/dist/main.cjs" ] || die "shell rebuild produced no dist/main.cjs"
+echo "shell bundle fresh: $(stat -f '%Sm' "$SHELL_ROOT/dist/main.cjs")"
 
 # --- 2. assemble darwin-arm64 payload ---------------------------------------
 step "2. assemble --platform darwin-arm64"
