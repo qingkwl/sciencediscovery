@@ -29,7 +29,7 @@
 
 import { copyFile, readdir, readFile, readlink, rm, stat, symlink } from "node:fs/promises";
 import { existsSync, lstatSync } from "node:fs";
-import { join } from "node:path";
+import { join, posix } from "node:path";
 const TRAMPOLINE_MARKER = "uv trampoline";
 
 /** Runtime DLLs a copied-in CPython launcher needs beside itself to boot on
@@ -135,10 +135,22 @@ export async function replaceVenvTrampolines(venvDirs, pythonHome, log = () => {
 // (jiuwenswarm-start etc.) keep their own symlinks — pip-installed entry
 // point scripts resolve the interpreter at runtime via their shebang, and
 // the shebang is rewritten separately by bootstrap.
-export async function replaceVenvSymlinks(venvDirs, venvBinDir, bundledPythonRelTarget, log = () => {}) {
+//
+// pythonNamesFor(minor): the venv layout carries THREE interpreter links —
+// python, python3, and the versioned python3.<minor> (e.g. python3.12). The
+// versioned link is what pyvenv.cfg-agnostic tooling (and codesign
+// --deep --strict: "invalid destination for symbolic link in bundle") walks,
+// so ALL three must be rewritten, not just the two unversioned ones
+// (measured: python3.12 left absolute → codesign verify rejected the bundle,
+// and the link is dead on any user machine).
+export function pythonNamesFor(minor) {
+  return ["python", "python3", `python3.${minor}`];
+}
+
+export async function replaceVenvSymlinks(venvDirs, venvBinDir, bundledPythonRelTarget, log = () => {}, names = ["python", "python3"]) {
   let replaced = 0;
   for (const venvDir of venvDirs) {
-    for (const name of ["python", "python3"]) {
+    for (const name of names) {
       const linkPath = join(venvDir, venvBinDir, name);
       // Only a symlink is rewriteable: a regular file (real interpreter, or a
       // Windows trampoline) is not ours to touch, and a missing entry means
@@ -160,4 +172,85 @@ export async function replaceVenvSymlinks(venvDirs, venvBinDir, bundledPythonRel
     }
   }
   return replaced;
+}
+
+// [macOS adaptation] The bundled python INSTALL ROOT itself (uv-managed
+// CPython trees) ships absolute symlinks baked at install time — measured on
+// a payload: bin/python3 -> <builder>/.local/share/uv/python/.../bin/python3.12,
+// lib/pkgconfig/python3.pc -> <builder>/.../python-3.12.pc, share/man/man1/
+// python3.1 -> <builder>/.../python3.12.1. On any other machine these are
+// dead links, and `codesign --verify --deep --strict` refuses the whole
+// bundle ("invalid destination for symbolic link in bundle") before the
+// runtime even gets a chance to trip on them.
+//
+// Fix: walk <out>/python once; for every ABSOLUTE symlink, map its leaf
+// name into the payload tree (the bundled tree mirrors the install root,
+// so destinations keep their leaf names) and rewrite it as a relative hop.
+// Links whose leaf has no counterpart in the tree (pkgconfig/man dev
+// artifacts) are removed outright — codesign requires a valid destination
+// for EVERY symlink in the bundle, and they carry no runtime meaning for a
+// bundled interpreter. Idempotent: already-relative links are untouched.
+export async function relocatablePythonTree(pythonRoot, log = () => {}) {
+  let rewritten = 0;
+  let removed = 0;
+  const walk = async (dir) => {
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      const p = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(p);
+      } else if (entry.isSymbolicLink()) {
+        const target = await readlink(p);
+        if (!target.startsWith("/")) continue; // relative already
+        const leaf = target.split("/").filter(Boolean).pop() || "";
+        if (!leaf) continue;
+        const candidates = await findByName(pythonRoot, leaf);
+        if (candidates.length === 0) {
+          await rm(p, { force: true });
+          removed++;
+          log(`removed off-tree symlink ${p} -> ${target}`);
+          continue;
+        }
+        // Prefer the candidate sharing the link's own parent dir name
+        // (lib/pkgconfig links prefer lib/pkgconfig targets).
+        const parentName = dir.split("/").filter(Boolean).pop();
+        const dest =
+          candidates.find((c) => {
+            const segs = c.split("/").filter(Boolean);
+            return segs[segs.length - 2] === parentName;
+          }) || candidates[0];
+        const rel = posixRelative(dir, dest);
+        await rm(p, { force: true });
+        await symlink(rel, p);
+        rewritten++;
+        log(`relativized ${p}: ${target} -> ${rel}`);
+      }
+    }
+  };
+  await walk(pythonRoot);
+  return { rewritten, removed };
+}
+
+// Find regular files by exact name under root (bounded walk, no fd hoard).
+async function findByName(root, name) {
+  const hits = [];
+  const stack = [root];
+  while (stack.length) {
+    const dir = stack.pop();
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      const p = join(dir, e.name);
+      if (e.isDirectory()) stack.push(p);
+      else if (e.isFile() && e.name === name) hits.push(p);
+    }
+  }
+  return hits;
+}
+
+function posixRelative(fromDir, toPath) {
+  return posix.relative(fromDir, toPath);
 }

@@ -77,6 +77,20 @@ echo "mirrors: ELECTRON_MIRROR=$ELECTRON_MIRROR"
 command -v node >/dev/null 2>&1 || die "node not found on PATH"
 echo "node $(node --version)"
 
+# Headroom, not a fix: the real EMFILE fix is the @electron/osx-sign patch
+# (patches/@electron__osx-sign@1.3.3.patch — W15). Upstream's pre-signing
+# walkAsync fires unbounded concurrent isbinaryfile probes (each holds a raw
+# fd across awaits); on this ~92k-file payload that exceeded even
+# kern.maxfilesperproc (10240), so NO ulimit raise can fix it. The patch caps
+# the probes at 64. This raise just keeps the soft limit comfortably above
+# the residual peak (probe cap + codesign child fds + graceful-fs queues).
+ulimit -n 4096 2>/dev/null || true
+FD_LIMIT="$(ulimit -n)"
+if [ "$FD_LIMIT" -lt 1024 ]; then
+  die "file-descriptor limit is $FD_LIMIT — too low for packaging. Run: launchctl limit maxfiles 4096 unlimited (and restart the terminal), then rerun"
+fi
+echo "fd limit: $FD_LIMIT (headroom; EMFILE fix is the osx-sign patch, W15)"
+
 # assemble takes the payload's base interpreter from the venv's realpath'd
 # pyvenv.cfg home — the data dir must have been provisioned with a darwin
 # python (uv-managed) on THIS machine. Missing dir = provision first.
