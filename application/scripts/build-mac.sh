@@ -9,7 +9,7 @@
 #
 # Steps (each gates the next; any failure aborts with exit 1):
 #   0. environment preflight  — uv present, python provisioned, mirrors set
-#   1. darwin shell unit tests — node --test over win_desktop/test
+#   1. darwin shell unit tests — node --test over application/test
 #   2. assemble --platform darwin-arm64 — full payload + its own gates
 #      (A1 import smoke / A1b runtime probe / A2 required files / A6 bytecode)
 #   3. payload spot checks     — darwin path markers, patch manifest, jw deep

@@ -14,7 +14,7 @@ if (-not (Test-Path -LiteralPath $source)) {
   throw "source artwork not found: $source"
 }
 
-$build = Join-Path $repoRoot "win_desktop/build"
+$build = Join-Path $repoRoot "application/build"
 New-Item -ItemType Directory -Force -Path $build | Out-Null
 $pngPath = Join-Path $build "icon-256.png"
 $icoPath = Join-Path $build "icon.ico"

@@ -17,7 +17,7 @@
 //   plugins    1. SD_NSI_PLUGINS env var
 //              2. electron-builder cache: %LOCALAPPDATA%/electron-builder/Cache/nsis-resources-*/nsis-resources-*/plugins/x86-unicode
 //
-// Usage (from win_desktop/):
+// Usage (from application/):
 //   node scripts/nsh-syntax-check.mjs
 //   node scripts/nsh-syntax-check.mjs --keep   (leave the .exe in the output dir)
 import { execFileSync, spawnSync } from "node:child_process";
@@ -115,7 +115,7 @@ function findTemplates() {
   } catch { /* fall through */ }
   throw new Error(
     "app-builder-lib templates not found. Set SD_NSI_TEMPLATES=<abs path to templates/nsis>, " +
-    "or run `pnpm install` in win_desktop/ first.",
+    "or run `pnpm install` in application/ first.",
   );
 }
 

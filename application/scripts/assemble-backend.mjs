@@ -44,7 +44,7 @@ function arg(name, fallback) {
 }
 
 // The backend tree to package. In-tree default: this repository itself
-// (win_desktop/ lives at the repo root). Pass --repo <path> to package an
+// (application/ lives at the repo root). Pass --repo <path> to package an
 // out-of-tree backend checkout instead.
 const repo = arg("repo", join(shellRoot, ".."));
 const data = arg("data", join(repo, ".sciencediscovery-data"));
