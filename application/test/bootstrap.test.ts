@@ -3,13 +3,13 @@
 // functions under test here.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile, chmod } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, sep, dirname } from "node:path";
 
 import {
-  bootstrapPackaged, compileallArgs, copyTreeConcurrent, countBytecode, needsUnpack, packagedEnv, packagedPaths,
+  bootstrapPackaged, compileallArgs, copyTreeConcurrent, countBytecode, dirWritable, needsUnpack, packagedEnv, packagedPaths,
   precompileTargets, readPayloadBytecodeManifest, rewriteEditablePth, rewritePyvenvHome, stampPath, treeHasPycache,
 } from "../src/bootstrap.ts";
 import { resolveRepoRoot } from "../src/config.ts";
@@ -381,6 +381,69 @@ test("bootstrapPackaged in-place mode skips copy and fixes bundled venvs directl
   assert.equal(existsSync(stampPath(dataDir)), true);
   // It should report the in-place fix in timing logs.
   assert.ok(lines.some((l) => l.includes("[perf] in-place venv fix elapsed=")));
+});
+
+// --- W16: read-only payload (running off a mounted DMG) -----------------------
+
+test("dirWritable answers true for a writable dir and false for a read-only one", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "sd-shell-writable-"));
+  t.after(() => {
+    // restore before rm so the cleanup itself can delete the tree
+    chmod(join(root, "ro"), 0o755).catch(() => {});
+    return rm(root, { recursive: true, force: true });
+  });
+  await mkdir(join(root, "rw"), { recursive: true });
+  await mkdir(join(root, "ro"), { recursive: true });
+  // 0o555 = r-x: write() fails even for root's owner on POSIX — the probe
+  // must catch EACCES/EROFS alike (the DMG case surfaces EROFS, this
+  // fixture approximates with EACCES via mode bits; both are "cannot write").
+  await chmod(join(root, "ro"), 0o555);
+  assert.equal(await dirWritable(join(root, "rw")), true);
+  assert.equal(await dirWritable(join(root, "ro")), false);
+});
+
+test("bootstrapPackaged degrades in-place to copy mode on a read-only payload (W16 DMG run)", async (t) => {
+  const original = process.env.SCIENCE_AGENT_IN_PLACE_ENVS;
+  process.env.SCIENCE_AGENT_IN_PLACE_ENVS = "1";
+  t.after(() => {
+    if (original === undefined) {
+      delete process.env.SCIENCE_AGENT_IN_PLACE_ENVS;
+    } else {
+      process.env.SCIENCE_AGENT_IN_PLACE_ENVS = original;
+    }
+  });
+
+  const root = await mkdtemp(join(tmpdir(), "sd-shell-bootstrap-ro-"));
+  t.after(() => {
+    chmod(join(root, "resources"), 0o755).catch(() => {});
+    return rm(root, { recursive: true, force: true });
+  });
+  const resources = join(root, "resources");
+  const template = join(resources, "envs-template");
+  await mkdir(join(template, "sd-services"), { recursive: true });
+  await writeFile(join(template, "sd-services", "pyvenv.cfg"), "home = /builder/python\nversion_info = 3.12.7\n", "utf8");
+  const jwVenv = join(resources, "backend", "jw", ".venv");
+  await mkdir(jwVenv, { recursive: true });
+  await writeFile(join(jwVenv, "pyvenv.cfg"), "home = /builder/python\nversion_info = 3.12.7\n", "utf8");
+  // read-only payload — what a DMG mount looks like to the shell
+  await chmod(resources, 0o555);
+
+  const dataDir = join(root, "data");
+  const paths = packagedPaths(resources);
+  const lines: string[] = [];
+  const log = (line: string) => lines.push(line);
+
+  const result = await bootstrapPackaged(paths, dataDir, log);
+  // Degraded to copy mode: envs now land in the (writable) data dir...
+  assert.equal(result.unpacked, true);
+  assert.equal(existsSync(join(dataDir, "envs", "sd-services")), true);
+  // ...the in-place fix never ran (no [perf] in-place line)...
+  assert.equal(lines.some((l) => l.includes("in-place venv fix")), false);
+  // ...and the fallback was announced.
+  assert.ok(lines.some((l) => l.includes("read-only")));
+  // The in-place env flag was cleared on the process so packagedEnv()
+  // (which reads process.env) degrades in lockstep.
+  assert.notEqual(process.env.SCIENCE_AGENT_IN_PLACE_ENVS, "1");
 });
 
 test("packagedEnv uses in-place venv paths when SCIENCE_AGENT_IN_PLACE_ENVS=1", async (t) => {
