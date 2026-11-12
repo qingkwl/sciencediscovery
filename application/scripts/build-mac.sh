@@ -194,8 +194,16 @@ else
   # is consumed by the inner findIdentity, which misses "-" and falls through
   # to reportError → signing silently skipped; qualifier "-" is only honored
   # from mac.identity — verified against app-builder-lib@26.15.3 sources).
-  SD_MAC_IDENTITY_DEFAULT="Developer ID Application: Haowen Zhong (UGV44NUA6W)"
+  # NOTE: 26.15.3 REJECTS a "Developer ID Application:" prefix in
+  # mac.identity ("Please remove prefix ... appropriate certificate will be
+  # chosen automatically" — first SD_MAC_SIGN=1 run, 2026-11-12). The bare
+  # cert name ("Haowen Zhong (UGV44NUA6W)") is what findIdentity matches.
+  SD_MAC_IDENTITY_DEFAULT="Haowen Zhong (UGV44NUA6W)"
   SD_MAC_IDENTITY="${SD_MAC_IDENTITY:-$SD_MAC_IDENTITY_DEFAULT}"
+  case "$SD_MAC_IDENTITY" in
+    "Developer ID Application:"*|"Developer ID Installer:"*) \
+      die "SD_MAC_IDENTITY must be the bare certificate name (26.15.3 rejects the 'Developer ID Application:' prefix): $SD_MAC_IDENTITY" ;;
+  esac
   SD_NOTARY_PROFILE="${SD_NOTARY_PROFILE:-sd-notary}"
 
   # --- 5b. temporary-keychain lifecycle (CI / relocated machine mode) --------
