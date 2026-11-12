@@ -30,7 +30,7 @@
 //     silently skips (problems W4 is the same load-bearing point failing the
 //     other way round), or a sweep that eats __pycache__.
 //
-// Both are pure functions so win_desktop/test/pyc-budget.test.ts can pin them
+// Both are pure functions so application/test/pyc-budget.test.ts can pin them
 // without a payload tree. That test pins the ACTUAL incident numbers: the broken
 // tree's 1,384/37,998 must be rejected and the rebuilt tree's 37,324/37,998
 // must be accepted, so the threshold can never be loosened past the one failure

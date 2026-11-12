@@ -1,4 +1,4 @@
-; Minimal makensis stub for syntax-checking win_desktop/build/installer.nsh
+; Minimal makensis stub for syntax-checking application/build/installer.nsh
 ; without a 20-minute electron-builder package run (the file's own header,
 ; :31-33, asks for exactly this).
 ;
@@ -21,7 +21,7 @@
 ; electron-builder run does not hit this because it copies the templates next to
 ; the generated installer.nsi, so the script-dir lookup finds the right file.
 ;
-; Run from win_desktop/ (SD_NSI_OUT is REQUIRED — see the note below):
+; Run from application/ (SD_NSI_OUT is REQUIRED — see the note below):
 ;   makensis -INPUTCHARSET UTF8 \
 ;     -DSD_NSI_TEMPLATES="<abs>\app-builder-lib\templates\nsis" \
 ;     -DSD_NSI_PLUGINS="<abs>\nsis-resources-3.4.1\plugins\x86-unicode" \

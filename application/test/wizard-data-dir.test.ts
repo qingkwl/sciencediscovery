@@ -10,7 +10,7 @@ import {
   probeDataDir,
 } from "../src/wizard-data-dir.ts";
 
-// Two notes on the host-independence of this file. It ships in win_desktop, but
+// Two notes on the host-independence of this file. It ships in application, but
 // nothing here assumes the runner is Windows: the pure cases spell Windows
 // paths as literals because that is the dialect the product parses (and since
 // isFullyQualifiedPath uses path.win32 explicitly, those literals mean the same
