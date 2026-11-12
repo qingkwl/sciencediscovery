@@ -29,7 +29,7 @@ import { copyFile, cp, mkdir, readdir, readFile, realpath, rm, stat, writeFile }
 import { existsSync, lstatSync, readFileSync, readlinkSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { replaceVenvTrampolines, copyVenvRuntimeDlls, replaceVenvSymlinks } from "./lib/venv-launchers.mjs";
+import { replaceVenvTrampolines, copyVenvRuntimeDlls, replaceVenvSymlinks, pythonNamesFor, relocatablePythonTree } from "./lib/venv-launchers.mjs";
 import { makeJwSrcFilter } from "./lib/jw-src-filter.mjs";
 import { matchJwVenvSweep, isDeadVenvScript, JW_VENV_SWEEP_NESTED, codexVendorDirs, leftoverCodexVendorDirs } from "./lib/payload-slim.mjs";
 import { payloadCompileEnv, pycBudgetVerdict, regionsBelowRatio, PYC_MIN_RATIO } from "./lib/pyc-budget.mjs";
@@ -742,6 +742,18 @@ if (!existsSync(join(pythonHome, dialect.bundledBasePythonPath))) {
 say(`copying base interpreter from ${pythonHome}`);
 await cp(pythonHome, join(out, "python"), { recursive: true, force: true, filter: pyFilter() });
 
+// [macOS adaptation] The install root ships absolute symlinks (uv bakes
+// them at python-install time): bin/python3 -> <builder>/.../bin/python3.12,
+// lib/pkgconfig/*.pc, share/man/man1/python3.1 — dead links on any other
+// machine, and codesign --deep --strict rejects the bundle outright
+// ("invalid destination for symbolic link in bundle", W15 second face).
+// Relativize what maps inside the tree, drop dev-only artifacts (pkgconfig/
+// man links with no in-tree counterpart). No-op on win32 (relative links).
+if (dialect.family === "darwin") {
+  const { rewritten, removed } = await relocatablePythonTree(join(out, "python"), say);
+  say(`python tree symlinks: ${rewritten} relativized, ${removed} off-tree removed`);
+}
+
 // ---------------------------------------------------------------------------
 // 7b. [windows-desktop] uv venv Scripts\python.exe / pythonw.exe are
 // trampolines with the build machine's interpreter path burned in — on any
@@ -786,7 +798,16 @@ if (dialect.hasTrampolines) {
     // precompile step then fails to spawn).
     const relFromOut = relative(out, venvDir);
     const hops = relFromOut.split(/[\\/]/).length + 1; // +1: links sit in <venv>/bin
-    const n = await replaceVenvSymlinks([venvDir], dialect.venvBin, `${"../".repeat(hops)}python/bin/python3`, say);
+    // python, python3 AND the versioned python3.<minor> — the versioned link
+    // is what tooling and codesign walk; leaving it absolute re-creates the
+    // "invalid destination for symbolic link in bundle" failure (W15).
+    const n = await replaceVenvSymlinks(
+      [venvDir],
+      dialect.venvBin,
+      `${"../".repeat(hops)}python/bin/python3`,
+      say,
+      pythonNamesFor(PYTHON_MINOR),
+    );
     symlinkReplaced += n;
   }
   if (symlinkReplaced === 0) {
