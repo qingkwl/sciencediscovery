@@ -92,6 +92,12 @@ test("packagedEnv: darwin uses POSIX venv paths and NEVER opts into unisolated",
   // hatch stays a Windows-only contract (defense in depth even though the
   // api's darwin branch ignores the flag today).
   assert.equal(env.SCIENCE_AGENT_EVOLVE_UNISOLATED, undefined);
+  // [mac-desktop] W22: the jw venv runs straight out of the sealed bundle —
+  // Python must never write bytecode there or the codesign seal breaks.
+  assert.equal(env.PYTHONDONTWRITEBYTECODE, "1");
+  // ...and win32 keeps its historical env (no seal to protect).
+  const w = packagedEnv(packagedPaths("/res", "win32"), "/data", "win32");
+  assert.equal(w.PYTHONDONTWRITEBYTECODE, undefined);
 });
 
 // --- rewriteEditablePth --------------------------------------------------------
@@ -293,7 +299,10 @@ test("bootstrapPackaged unpacks once, rewrites venv homes, and re-runs after a r
   const lines: string[] = [];
   const log = (line: string) => lines.push(line);
 
-  const first = await bootstrapPackaged(paths, dataDir, log);
+  // W22: the jw in-bundle home rewrite is a win32-only behaviour now —
+  // darwin must never write inside the sealed .app bundle. Pin the win32
+  // platform so this test exercises that semantic wherever it runs.
+  const first = await bootstrapPackaged(paths, dataDir, log, "win32");
   assert.equal(first.unpacked, true);
   // Fixture venvs carry no bin|Scripts python → precompile skips cleanly.
   assert.equal(first.precompiled, 0);
@@ -308,13 +317,13 @@ test("bootstrapPackaged unpacks once, rewrites venv homes, and re-runs after a r
   assert.equal(jwHome, `home = ${join(resources, "python")}`);
 
   // Second run on the same install: stamp valid → no-op.
-  const second = await bootstrapPackaged(paths, dataDir, log);
+  const second = await bootstrapPackaged(paths, dataDir, log, "win32");
   assert.equal(second.unpacked, false);
 
   // A same-location reinstall re-ships the payload's in-place jw venv
   // with the builder's home; the stamp-valid no-op path must repair it too.
   await writeFile(join(jwVenv, "pyvenv.cfg"), "home = /builder/python\n", "utf8");
-  const repaired = await bootstrapPackaged(paths, dataDir, log);
+  const repaired = await bootstrapPackaged(paths, dataDir, log, "win32");
   assert.equal(repaired.unpacked, false);
   const repairedHome = (await readFile(join(jwVenv, "pyvenv.cfg"), "utf8")).match(/^home\s*=.*$/m)?.[0]?.trim();
   assert.equal(repairedHome, `home = ${join(resources, "python")}`);
@@ -323,7 +332,7 @@ test("bootstrapPackaged unpacks once, rewrites venv homes, and re-runs after a r
   const movedResources = join(root, "resources2");
   await mkdir(join(movedResources, "envs-template", "sd-services"), { recursive: true });
   await writeFile(join(movedResources, "envs-template", "sd-services", "pyvenv.cfg"), "home = /builder/python\n", "utf8");
-  const third = await bootstrapPackaged(packagedPaths(movedResources), dataDir, log);
+  const third = await bootstrapPackaged(packagedPaths(movedResources), dataDir, log, "win32");
   assert.equal(third.unpacked, true);
   const thirdHome = (await readFile(join(dataDir, "envs", "sd-services", "pyvenv.cfg"), "utf8")).match(/^home\s*=.*$/m)?.[0]?.trim();
   assert.equal(thirdHome, `home = ${join(movedResources, "python")}`);
@@ -366,7 +375,9 @@ test("bootstrapPackaged in-place mode skips copy and fixes bundled venvs directl
   const lines: string[] = [];
   const log = (line: string) => lines.push(line);
 
-  const result = await bootstrapPackaged(paths, dataDir, log);
+  // W22: in-place is the win32 packaged default; darwin always falls back to
+  // the copy mode (sealed bundle). Pin win32 to exercise the in-place branch.
+  const result = await bootstrapPackaged(paths, dataDir, log, "win32");
   assert.equal(result.unpacked, true);
   assert.equal(result.jwFixed, true);
   // In-place mode must not copy venvs into the data directory.
@@ -433,7 +444,11 @@ test("bootstrapPackaged degrades in-place to copy mode on a read-only payload (W
   const lines: string[] = [];
   const log = (line: string) => lines.push(line);
 
-  const result = await bootstrapPackaged(paths, dataDir, log);
+  // W22: pin win32 — this test asserts the W16 READ-ONLY degradation path,
+  // which on darwin now also has the W22 seal guard in front of it (a
+  // different log line). The read-only path itself is platform-neutral,
+  // but its in-place entry condition is win32-only now.
+  const result = await bootstrapPackaged(paths, dataDir, log, "win32");
   // Degraded to copy mode: envs now land in the (writable) data dir...
   assert.equal(result.unpacked, true);
   assert.equal(existsSync(join(dataDir, "envs", "sd-services")), true);
@@ -518,11 +533,16 @@ if (IS_DARWIN) {
       "the re-point was announced in the first-run log");
   });
 
-  test("in-place venv symlinks are left alone (W17 idempotence)", async (t) => {
+  test("in-place venv symlinks are left alone (W17 idempotence / W22 seal guard)", async (t) => {
     // In-place mode the venv never moves, so the baked hop is CORRECT; the
     // fix must recognize an already-resolving link and not rewrite it (the
     // rewrite target for an in-place venv equals the baked link anyway, but
     // touching it would log noise and break the existsSync-in-place contract).
+    // W22 on darwin: IN_PLACE=1 is degraded to copy mode by the seal guard,
+    // so "left alone" is now DOUBLE-true — the template tree is never even
+    // reached by the copy branch's launcher pass (that pass runs on the
+    // copied tree under <dataDir>). This test pins both: the baked links
+    // stay byte-identical AND the degradation was announced.
     const original = process.env.SCIENCE_AGENT_IN_PLACE_ENVS;
     process.env.SCIENCE_AGENT_IN_PLACE_ENVS = "1";
     t.after(() => {
@@ -555,10 +575,27 @@ if (IS_DARWIN) {
     const log = (line: string) => lines.push(line);
 
     await bootstrapPackaged(paths, dataDir, log);
-    // In-place: the links still resolve and were NOT rewritten (no W17 line).
-    assert.equal(realpathSync(join(tmplVenv, "bin", "python")), realpathSync(bundledPython));
-    assert.equal(lines.some((l) => l.includes("W17")), false,
-      "an already-correct in-place link must not produce re-point noise");
+    // W22 (darwin): the copy fallback ran, so the TEMPLATE tree must be
+    // byte-identical — its baked links still resolve exactly as baked and
+    // nothing was rewritten in place.
+    for (const name of ["python", "python3", "python3.12"]) {
+      const link = join(tmplVenv, "bin", name);
+      assert.equal(realpathSync(link), realpathSync(bundledPython),
+        `${name}: the in-bundle link must resolve as baked (payload untouched)`);
+    }
+    // The COPY under <dataDir>/envs got the W17 re-point (its baked hops are
+    // dead from the data dir — that is the W17 scenario, still working).
+    const copiedVenv = join(dataDir, "envs", "sd-services");
+    assert.equal(existsSync(copiedVenv), true, "W22 degraded to copy mode");
+    for (const name of ["python", "python3", "python3.12"]) {
+      const link = join(copiedVenv, "bin", name);
+      assert.equal(existsSync(link), true, `${name} must exist in the copy`);
+      assert.equal(realpathSync(link), realpathSync(bundledPython),
+        `${name}: the copied venv must be re-pointed (W17 still holds)`);
+    }
+    // W22: the seal guard fired and announced the copy fallback.
+    assert.ok(lines.some((l) => l.includes("sealed")),
+      "darwin must announce the seal-preserving copy fallback");
   });
 }
 
@@ -696,6 +733,12 @@ function withInPlaceEnvs(t: { after: (fn: () => void) => void }): void {
   });
 }
 
+// W22: the in-place BRANCH below (bytecode judgement over the payload's own
+// envs-template) is win32-only now — darwin degrades IN_PLACE to copy mode to
+// keep the sealed bundle untouched. Every in-place-behaviour test pins win32
+// so the branch stays exercised wherever the suite runs.
+const INPLACE_PLATFORM = "win32" as const;
+
 test("in-place mode names a payload that shipped almost no bytecode", async (t) => {
   withInPlaceEnvs(t);
   const root = await mkdtemp(join(tmpdir(), "sd-inplace-"));
@@ -706,7 +749,7 @@ test("in-place mode names a payload that shipped almost no bytecode", async (t) 
   await writeManifest(resources, { py: 20, pyc: 20 });
 
   const lines: string[] = [];
-  const result = await bootstrapPackaged(packagedPaths(resources), join(root, "data"), (l) => lines.push(l));
+  const result = await bootstrapPackaged(packagedPaths(resources), join(root, "data"), (l) => lines.push(l), INPLACE_PLATFORM);
   assert.equal(result.unpacked, true, "in-place still reports provisioning");
 
   const warned = lines.filter((l) => l.includes("incomplete bytecode"));
@@ -728,7 +771,7 @@ test("in-place mode catches a tree that lost whole directories", async (t) => {
   await writeManifest(resources, { py: 40, pyc: 40 });
 
   const lines: string[] = [];
-  await bootstrapPackaged(packagedPaths(resources), join(root, "data"), (l) => lines.push(l));
+  await bootstrapPackaged(packagedPaths(resources), join(root, "data"), (l) => lines.push(l), INPLACE_PLATFORM);
   const warned = lines.filter((l) => l.includes("incomplete bytecode"));
   assert.equal(warned.length, 1, "a 25%-of-manifest tree must be named; got: " + JSON.stringify(lines));
   assert.match(warned[0], /10 of the 40/, "the gap must be quantified against the build's own count");
@@ -742,7 +785,7 @@ test("in-place mode reports a healthy payload as verified", async (t) => {
   await writeManifest(resources, { py: 10, pyc: 10 });
 
   const lines: string[] = [];
-  await bootstrapPackaged(packagedPaths(resources), join(root, "data"), (l) => lines.push(l));
+  await bootstrapPackaged(packagedPaths(resources), join(root, "data"), (l) => lines.push(l), INPLACE_PLATFORM);
   assert.equal(lines.filter((l) => l.includes("incomplete bytecode")).length, 0,
     "a complete payload must not cry wolf; got: " + JSON.stringify(lines));
   assert.equal(lines.some((l) => l.includes("bytecode coverage verified")), true);
@@ -763,8 +806,8 @@ test("in-place mode verifies once per PAYLOAD, not on every launch", async (t) =
   const lines: string[] = [];
   const paths = packagedPaths(resources);
   const dataDir = join(root, "data");
-  await bootstrapPackaged(paths, dataDir, (l) => lines.push(l));
-  await bootstrapPackaged(paths, dataDir, (l) => lines.push(l));
+  await bootstrapPackaged(paths, dataDir, (l) => lines.push(l), INPLACE_PLATFORM);
+  await bootstrapPackaged(paths, dataDir, (l) => lines.push(l), INPLACE_PLATFORM);
 
   const verified = lines.filter((l) => l.includes("bytecode coverage verified"));
   assert.equal(verified.length, 1,
@@ -789,9 +832,9 @@ test("in-place mode re-judges when an upgrade replaces the payload at the same i
   const lines: string[] = [];
   // Launch 1: the first payload. Judged, stamped with its identity.
   await writeManifest(resources, { py: 10, pyc: 10 }, { repoCommit: "aaaaaaa", builtAt: "2026-11-01T00:00:00Z" });
-  await bootstrapPackaged(paths, dataDir, (l) => lines.push(l));
+  await bootstrapPackaged(paths, dataDir, (l) => lines.push(l), INPLACE_PLATFORM);
   // Launch 2: relaunch of the SAME payload — must skip (the ~750ms budget).
-  await bootstrapPackaged(paths, dataDir, (l) => lines.push(l));
+  await bootstrapPackaged(paths, dataDir, (l) => lines.push(l), INPLACE_PLATFORM);
   assert.equal(lines.filter((l) => l.includes("bytecode coverage verified")).length, 1,
     "the same payload must be judged once, not per launch");
 
@@ -799,7 +842,7 @@ test("in-place mode re-judges when an upgrade replaces the payload at the same i
   // same install root and data dir. The stamp's location matches, so a
   // needsUnpack gate would skip it — this is the regression the fix removes.
   await writeManifest(resources, { py: 10, pyc: 10 }, { repoCommit: "bbbbbbb", builtAt: "2026-11-07T00:00:00Z" });
-  await bootstrapPackaged(paths, dataDir, (l) => lines.push(l));
+  await bootstrapPackaged(paths, dataDir, (l) => lines.push(l), INPLACE_PLATFORM);
   assert.equal(lines.filter((l) => l.includes("bytecode coverage verified")).length, 2,
     "an upgraded payload must be judged again even though the install root is unchanged; got: "
     + JSON.stringify(lines));
@@ -808,7 +851,7 @@ test("in-place mode re-judges when an upgrade replaces the payload at the same i
   // the whole point of §2: the new payload is where bytecode can go missing.
   const brokenLines: string[] = [];
   await writeManifest(resources, { py: 40, pyc: 40 }, { repoCommit: "ccccccc", builtAt: "2026-11-08T00:00:00Z" });
-  await bootstrapPackaged(paths, dataDir, (l) => brokenLines.push(l));
+  await bootstrapPackaged(paths, dataDir, (l) => brokenLines.push(l), INPLACE_PLATFORM);
   assert.equal(brokenLines.filter((l) => l.includes("incomplete bytecode")).length, 1,
     "an upgrade to an incomplete payload must name it at first launch; got: " + JSON.stringify(brokenLines));
 });
@@ -829,7 +872,7 @@ test("a stamp written before the payload field existed is judged, not trusted", 
   await writeFile(stampPath(dataDir), JSON.stringify({ installRoot: paths.resourcesPath, at: "2020-01-01T00:00:00Z" }), "utf8");
 
   const lines: string[] = [];
-  await bootstrapPackaged(paths, dataDir, (l) => lines.push(l));
+  await bootstrapPackaged(paths, dataDir, (l) => lines.push(l), INPLACE_PLATFORM);
   assert.equal(lines.filter((l) => l.includes("bytecode coverage verified")).length, 1,
     "a payload-less stamp must be judged rather than trusted; got: " + JSON.stringify(lines));
 });
@@ -843,7 +886,7 @@ test("a payload with no manifest still judges in-place coverage", async (t) => {
   const resources = await makePayloadFixture(root, 20, 1);
 
   const lines: string[] = [];
-  await bootstrapPackaged(packagedPaths(resources), join(root, "data"), (l) => lines.push(l));
+  await bootstrapPackaged(packagedPaths(resources), join(root, "data"), (l) => lines.push(l), INPLACE_PLATFORM);
   assert.equal(lines.filter((l) => l.includes("incomplete bytecode")).length, 1);
   assert.match(lines.find((l) => l.includes("incomplete bytecode")) ?? "", /no build manifest/);
 });
@@ -863,7 +906,7 @@ test("in-place mode names a tree that lost sources but kept their caches", async
   for (let i = 0; i < 16; i += 1) await rm(join(sp, `m${i}.py`));
 
   const lines: string[] = [];
-  await bootstrapPackaged(packagedPaths(resources), join(root, "data"), (l) => lines.push(l));
+  await bootstrapPackaged(packagedPaths(resources), join(root, "data"), (l) => lines.push(l), INPLACE_PLATFORM);
 
   const warned = lines.filter((l) => l.includes("incomplete bytecode"));
   assert.equal(warned.length, 1,
