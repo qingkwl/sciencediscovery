@@ -29,6 +29,7 @@ import { commitsOnEnter } from "../app/ime-enter.js";
 import type { LandingCategory, LandingSeed } from "../app/landing.js";
 import { skillChoices, skillDraft, skillMark, slashQuery } from "../app/slash.js";
 import { TEXT } from "../text.js";
+import type { EvolveDirectionInput } from "@sciencediscovery/schema";
 import { AttachmentTray } from "./AttachmentTray.js";
 import { EvolveGlyph, EvolveTreeGlyph } from "./evolve/glyphs.js";
 import { filterExperts } from "./expert-catalog.js";
@@ -53,6 +54,10 @@ export interface ComposerTag {
 export interface SeededCommand {
   /** The flags, exactly as they will be sent. */
   command: string;
+  /** The parameters the dialog confirmed, if its panel was used. They travel
+   *  with the token because the dialog closes before the user sends, and are
+   *  dropped with the token if the reader takes the flags back. */
+  direction?: EvolveDirectionInput;
   /** Bumped on every seed, so choosing the same design twice still lands. */
   nonce: number;
   /** What the dialog collected, written after the token for the user to
@@ -88,13 +93,14 @@ interface Props {
   onCreateProject: (name: string) => void;
   /** Opens the session's searches, or starts a new experiment when it has
    *  none. It is a row in 会话设置 rather than a control of its own: the
-   *  header no longer carries a second entry point. */
-  onEvolve?: () => void;
+   *  header no longer carries a second entry point. The composer's draft rides
+   *  along, so a sentence already written becomes the new design's task. */
+  onEvolve?: (draft: string) => void;
   onOpenSettings: () => void;
   /** A skill whose choice has more to it than its command: the pick is handed
-   *  here, and `true` means the surface it opened has taken the draft, so no
-   *  command is written. */
-  onPickSkill?: (skill: SkillDescriptor) => boolean;
+   *  here with the draft it would have replaced, and `true` means the surface
+   *  it opened has taken the draft, so no command is written. */
+  onPickSkill?: (skill: SkillDescriptor, draft: string) => boolean;
   onSelectModel: (modelId: string) => void;
   /** Point the next conversation at a Project, or at none (`undefined`). */
   onSelectProject: (projectId?: string) => void;
@@ -109,7 +115,7 @@ interface Props {
   /** `command` is the seeded token when the draft started from a setup
    *  dialog; the two are one message, but only the caller knows how to join
    *  them. */
-  onSend: (content: string, command?: string) => void;
+  onSend: (content: string, command?: string, direction?: EvolveDirectionInput) => void;
   onStop: () => void;
   onUpload: (files: File[]) => void;
   /** Shown in the landing strip, beside the folder. Absent when the next
@@ -787,9 +793,10 @@ export function Composer({
   const pickSkill = (skill: SkillDescriptor) => {
     // A skill with a setup surface of its own takes the pick: its command
     // carries flags the dialog asks for, so writing the bare command would
-    // only be a step towards opening that dialog anyway. The draft is emptied
-    // because the slash was the whole of it.
-    if (onPickSkill?.(skill) === true) {
+    // only be a step towards opening that dialog anyway. The draft goes with
+    // it — a task already written belongs in the dialog's task field — and is
+    // emptied here because the slash was the whole of it.
+    if (onPickSkill?.(skill, text) === true) {
       setText("");
       setDismissed(true);
       return;
@@ -898,11 +905,19 @@ export function Composer({
     return () => document.removeEventListener("pointerdown", dismiss);
   }, [menu]);
 
-  const submit = () => {
-    if (!canSend) return;
-    onSend(text, command);
+  const sendDraft = (content: string, selectedCommand?: string, direction?: EvolveDirectionInput) => {
+    if (direction) onSend(content, selectedCommand, direction);
+    else onSend(content, selectedCommand);
     setText("");
     setCommand(undefined);
+  };
+
+  const submit = () => {
+    if (!canSend) return;
+    // The token and the sentence are one message; the parameters the dialog
+    // confirmed belong to that token, so they leave with it and with nothing
+    // else.
+    sendDraft(text, command, command === undefined ? undefined : seededCommand?.direction);
   };
 
   /** Drop the dialog's flags and keep the sentence: the reader changed their
@@ -920,7 +935,7 @@ export function Composer({
 
   const stop = (event: { stopPropagation: () => void }) => event.stopPropagation();
 
-  return (
+  return <>
     <div
       className={`composer${landing ? " is-landing" : ""}${attachments.length > 0 ? " has-attachments" : ""}`}
       data-guide="composer"
@@ -1076,7 +1091,9 @@ export function Composer({
               expertsLoading={expertsLoading}
               onApprovalMode={onApprovalMode}
               onClose={() => setMenu(undefined)}
-              onEvolve={onEvolve}
+              // The draft is carried into the setup dialog: a sentence already
+              // written is the task the new design would start from.
+              onEvolve={onEvolve === undefined ? undefined : () => onEvolve(text)}
               onSelectSpecialist={onSelectSpecialist}
               running={running}
               selectedSpecialistId={selectedSpecialistId}
@@ -1114,7 +1131,7 @@ export function Composer({
             title={running ? TEXT.composer.pillLocked : TEXT.composer.modelSelect}
             type="button"
           >
-            <span className="model-name">
+            <span className="model-name" title={selectedName}>
               {selectedName ?? (unavailableModel ? TEXT.errors.modelUnavailable : TEXT.errors.modelRequired)}
             </span>
             <Chevron down={menu !== "model"} />
@@ -1176,5 +1193,5 @@ export function Composer({
         </div>
       ) : null}
     </div>
-  );
+  </>;
 }

@@ -33,7 +33,13 @@
 curl -fsS http://127.0.0.1:4310/health
 ```
 
-成功响应为 `200`，字段包括：
+未携带有效 bearer token 时，`/health` 和 `/api/health` 返回 HTTP `200`，仅包含 `{"service":"sciencediscovery-api","liveness":"ok"}`；Runner 仅返回 `{"status":"ok"}`。公开响应只表示进程存活，不探测依赖。公开的 API 响应体只带 `liveness`，不带 `status`：认证响应里的 `status` 由 Runner 推导而来，因此只认 `status: "ok"` 的读取方读到的一定是已授权的详情。
+
+携带有效 token 时，API 返回以下部署详情：
+
+```bash
+curl -fsS -H "authorization: Bearer $TOKEN" http://127.0.0.1:4310/health
+```
 
 ```json
 {
@@ -165,11 +171,14 @@ curl -X POST http://127.0.0.1:4310/api/projects \
 |---|---|---|
 | `GET /api/proxy/settings` | 无 | `200`，`{defaultPolicy, servers}`；认证设置响应会包含可用的完整代理 URL |
 | `PUT /api/proxy/settings` | `{"defaultPolicy":"none"}` 或 `proxy:<id>` | `200`，更新后的设置 |
+| `POST /api/proxy/test` | `{mode: "environment" \| "direct" \| "url", url?, noProxy?}` | 下载源连通性诊断；不保存设置 |
 | `POST /api/proxy/servers` | `{name, kind, url?}` | `201`，创建后的代理记录 |
 | `PUT /api/proxy/servers/:id` | `{name?, kind?, url?}` | `200`，更新后的代理记录 |
 | `DELETE /api/proxy/servers/:id` | 无 | `200`，`{"deleted":"<id>"}`；仍被引用时为 `409` |
 | `GET /api/mcp/proxy-policies` | 无 | `200`，`{"policies":{...}}` |
 | `PUT /api/mcp/proxy-policies` | `{"policies":{"server-id":"inherit|none|proxy:<id>"}}` | `200`，规范化后的策略 map |
+
+`GET/PUT /api/proxy/settings` 还支持可选的 `noProxy`（逗号分隔的绕过代理主机）；传空值会清除已保存的列表，重新采用进程环境变量里的 `NO_PROXY`。环境变量摘要会隐藏代理凭据。
 
 `kind` 只能是 `custom_url`、`environment` 或 `system`；`custom_url` 创建时必须提供 `url`。示例：
 

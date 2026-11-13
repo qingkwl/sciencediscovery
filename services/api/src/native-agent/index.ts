@@ -58,6 +58,7 @@ import {
   type ModelClientPolicy,
   type ModelEndpoint,
   type ModelUsage,
+  addUsage,
 } from "@sciencediscovery/model";
 import type { Agent, AgentEvent, AgentHistoryMessage } from "@sciencediscovery/orchestration";
 import type { PlanStore } from "@sciencediscovery/plan";
@@ -65,6 +66,7 @@ import type { EvolveToolRuntime } from "@sciencediscovery/evolve";
 import {
   DEFAULT_MAX_PARALLEL_TOOL_CALLS,
   ExternalWaitController,
+  effectiveModelTurns,
   resolveMaxParallelToolCalls,
   type RunEvent,
 } from "@sciencediscovery/runtime-core";
@@ -97,10 +99,6 @@ import { projectConfigurationHistory } from "../configuration/model-context.js";
 export const DEFAULT_AGENT_IDLE_TIMEOUT_MS = 240_000;
 export const DEFAULT_AGENT_TURN_TIMEOUT_MS = 0;
 
-/** Hard safety net against a runaway model loop; time budgets remain the
- *  primary bound (`runTimeoutMs` / `runIdleTimeoutMs`). */
-const MAX_MODEL_TURNS = 128;
-
 export function configuredMaxParallelToolCalls(
   raw = process.env.SCIENCE_AGENT_MAX_PARALLEL_TOOL_CALLS,
 ): number {
@@ -117,6 +115,10 @@ export interface NativeAgentOptions extends WorkspaceAgentOptions {
   versioning?: AgentVersioningOptions;
   /** Stable identity for logging/tracing; use the session id. */
   sessionId: string;
+  /** The caller's turn budget. A value above the engine ceiling is accepted and
+   *  clamped to it; the effective bound is what the loop enforces and what the
+   *  handoff reports (#1106). */
+  maxModelTurns?: number;
   /** Hard deadline for one complete run, including streamed output. */
   runTimeoutMs?: number;
   /** Maximum time without model-stream progress (tool waits pause it via beginExternalWait). */
@@ -150,6 +152,12 @@ export interface NativeAgentRunResult {
 
 export interface NativeAgentHandle extends Agent {
   execute(text: string): Promise<NativeAgentRunResult>;
+  /** The turn bound this loop was composed with, after the ceiling clamp. The
+   *  caller records this rather than re-deriving it, so the number reported for a
+   *  run is the number that ran. Absent on an executor that cannot name a bound
+   *  (the JiuwenSwarm backend leaves the turn budget to its own loop)
+   *  (#1106, #1113 review). */
+  readonly enforcedMaxModelTurns?: number;
 }
 
 /** Test seam: replaces the model-turn transport without a live endpoint. */
@@ -350,6 +358,8 @@ export function composeSystemPrompt(
 }
 
 class NativeAgent implements NativeAgentHandle {
+  /** The bound `composeRuntime` receives; reported so callers never re-derive it. */
+  readonly enforcedMaxModelTurns: number;
   private readonly listeners = new Set<Listener>();
   private toolRegistry!: ToolRegistry<WireMessage>;
   private systemPrompt!: string;
@@ -374,6 +384,7 @@ class NativeAgent implements NativeAgentHandle {
   private plugins?: Awaited<ReturnType<typeof createRuntimePluginScope<WireMessage>>>;
 
   constructor(private readonly options: NativeAgentOptions) {
+    this.enforcedMaxModelTurns = effectiveModelTurns(options.maxModelTurns);
     this.contextId = `${options.sessionId}:${randomUUID()}`;
     this.durableContext = new DurableContextStore({
       history: options.gatewayHistory,
@@ -653,7 +664,11 @@ class NativeAgent implements NativeAgentHandle {
       // what "completed" means.
       let truncatedTerminalTurn = false;
       const loop = composeRuntime<WireMessage, ModelInput<WireMessage>, ModelUsage>({
-        maxModelTurns: MAX_MODEL_TURNS,
+        // Sum the per-turn figures into the run's total (#1109). Without this the
+        // loop returns the last turn's usage and one ledger row describes one
+        // turn while its timestamps describe the whole run.
+        accumulateUsage: addUsage,
+        maxModelTurns: effectiveModelTurns(this.options.maxModelTurns),
         maxParallelToolCalls: configuredMaxParallelToolCalls(),
         contextAssembler: {
           assemble: async (input) => {
@@ -902,8 +917,27 @@ function outputLimitFeedback(turn: { assistantMessage: WireMessage }, attempt: n
  *  added at both ends but missed in the middle leaves its tool absent from the
  *  model's list with nothing failing anywhere. */
 /** The execution tools one run gets; also what another executor must expose. */
+/** The per-Session tool-output store, created once per options object so a ref
+ *  published in a handoff keeps resolving for later runs. `createToolRegistry`
+ *  builds its own over the same root; the store is file-backed, so the ref a
+ *  handoff publishes is readable through either view (#1107). */
+const toolOutputStores = new WeakMap<NativeAgentOptions, ToolOutputStore>();
+function toolOutputStoreFor(options: NativeAgentOptions): ToolOutputStore {
+  const existing = toolOutputStores.get(options);
+  if (existing) return existing;
+  const store = new ToolOutputStore({ root: toolOutputStoreRoot(options.config.dataDir, options.sessionId) });
+  toolOutputStores.set(options, store);
+  return store;
+}
+
 export function buildTools(options: NativeAgentOptions): AgentTool[] {
   return createWorkspaceTools(options.workspaceRoot, {
+    // An oversized child result is stored where `read_tool_output` can serve it,
+    // so the handoff can publish a ref instead of only a cut body (#1107).
+    saveSubagentResult: async (text) => {
+      const record = await toolOutputStoreFor(options).save("subagent_result", text);
+      return { ref: record.ref };
+    },
     enabledConnectorIds: options.enabledConnectorIds,
     ...(options.extraTools?.length ? { extraTools: options.extraTools } : {}),
     ...(options.environments ? { environments: options.environments } : {}),

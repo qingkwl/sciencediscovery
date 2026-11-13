@@ -51,7 +51,7 @@ import type {
   UninstallEnvironmentRequest,
 } from "@sciencediscovery/schema";
 
-export type RunnerInstallEnvironmentRequest = InstallEnvironmentRequest & { workspaceRoot?: string; runnerWorkspaceKey?: string };
+export type RunnerInstallEnvironmentRequest = InstallEnvironmentRequest & { workspaceRoot?: string; runnerWorkspaceKey?: string; networkProxy?: import("@sciencediscovery/schema").ResolvedProxy };
 
 /**
  * Error codes a Runner response may carry that map to a stable non-retryable
@@ -74,6 +74,7 @@ export class RunnerClient {
   constructor(
     private readonly baseUrl: string,
     private readonly token: string,
+    private readonly environmentProxy?: () => import("@sciencediscovery/schema").ResolvedProxy,
   ) {}
 
   /**
@@ -185,7 +186,10 @@ export class RunnerClient {
     // The health check is the first thing a connection does, so this is where
     // the clock offset is first learned — before anything needs signing.
     const sentAt = Date.now();
-    const response = await fetch(`${this.baseUrl}/health`, { signal: AbortSignal.timeout(5_000) });
+    const response = await fetch(`${this.baseUrl}/health`, {
+      headers: { authorization: `Bearer ${this.token}` },
+      signal: AbortSignal.timeout(5_000),
+    });
     this.observeClock(response.headers.get("date"), sentAt, Date.now());
     if (!response.ok) throw new Error(`Runner health check failed (${response.status})`);
     return await response.json() as RunnerHealth;
@@ -356,7 +360,7 @@ export class RunnerClient {
 
   async setupScientificEnvironments(): Promise<ScientificEnvironmentSetup> {
     return await this.request("/environment-setup", {
-      body: JSON.stringify({ confirmed: true }),
+      body: JSON.stringify({ confirmed: true, networkProxy: this.environmentProxy?.() }),
       method: "POST",
     });
   }
@@ -377,7 +381,7 @@ export class RunnerClient {
   }
 
   async createEnvironment(input: CreateEnvironmentRequest): Promise<Environment> {
-    return await this.request("/environments", { body: JSON.stringify(input), method: "POST" });
+    return await this.request("/environments", { body: JSON.stringify({ ...input, networkProxy: this.environmentProxy?.() }), method: "POST" });
   }
 
   async deleteEnvironment(environmentId: string): Promise<void> {
@@ -386,7 +390,7 @@ export class RunnerClient {
 
   async installEnvironment(environmentId: string, input: RunnerInstallEnvironmentRequest): Promise<EnvironmentRevision> {
     return await this.request(`/environments/${encodeURIComponent(environmentId)}/install`, {
-      body: JSON.stringify(input),
+      body: JSON.stringify({ ...input, networkProxy: input.networkProxy ?? this.environmentProxy?.() }),
       method: "POST",
     });
   }

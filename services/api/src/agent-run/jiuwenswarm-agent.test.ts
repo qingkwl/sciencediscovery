@@ -203,6 +203,8 @@ test("sends the prompt, model and the run's tools to the adapter and returns the
     assert.equal(body.cwd, "/workspace");
     assert.equal(typeof body.systemPrompt, "string");
     assert.ok(body.systemPrompt.length > 200, "the run gets the workspace system prompt, not an empty one");
+    assert.match(body.systemPrompt, /Ask clarification questions in a regular assistant message/);
+    assert.ok(body.hiddenJiuwenSwarmTools.includes("ask_user"));
     assert.equal(body.model.model, "gpt-x");
     assert.match(body.model.baseUrl, /^http:\/\/127\.0\.0\.1:\d+\/v1$/, "the adapter is pointed at the run's loopback model gateway, not the provider");
     assert.notEqual(body.model.apiKey, "sk-test", "the provider's key never leaves this process");
@@ -567,6 +569,26 @@ test("the idle timeout stalls a run with no gateway progress, with the wording s
   } finally {
     await adapter.close();
   }
+});
+
+test("an unexpected generic Swarm question is shown in chat without leaving the run open", async () => {
+  const question = "Which timeout?\n- Idle timeout\n- Whole-turn timeout";
+  const adapter = await fakeAdapter((_request, response) => {
+    response.writeHead(200);
+    response.write(line({ event: { type: "user_input.required", turn: 1, request: { id: "q1", question } } }));
+  });
+  try {
+    const agent = createJiuwenSwarmAgentFactory({ adapterUrl: adapter.url })(options());
+    const events = collect(agent);
+    const result = await Promise.race([
+      agent.execute("Change the timeout"),
+      delay(1_000).then(() => { throw new Error("The run kept waiting on the question"); }),
+    ]);
+    assert.equal(result.finalMessages.at(-1)?.content, question);
+    const updates = events.filter(event => event.type === "message_update");
+    assert.deepEqual(updates.map(event => event.assistantMessageEvent.type === "text_delta" && event.assistantMessageEvent.delta),
+      [question]);
+  } finally { await adapter.close(); }
 });
 
 test("a JiuwenSwarm approval question pauses the idle clock: a human answer slower than the idle timeout still completes the run", async () => {
@@ -1735,7 +1757,7 @@ test("by default the model gets JiuwenSwarm's own tools but not those acting on 
     assert.equal(sent.systemPrompt.includes("Use only the registered workspace tools"), false);
     // Commands and file writes stay in ScienceDiscovery's sandbox: JiuwenSwarm's host tools are hidden, and the prompt says so.
     // These options give the run no web tools, so JiuwenSwarm's web tools are hidden as well.
-    assert.deepEqual(sent.hiddenJiuwenSwarmTools, ["bash", "read_file", "write_file", "edit_file", "glob", "list_files", "grep", "read_pdf",
+    assert.deepEqual(sent.hiddenJiuwenSwarmTools, ["ask_user", "bash", "read_file", "write_file", "edit_file", "glob", "list_files", "grep", "read_pdf",
       "free_search", "paid_search", "fetch_webpage",
       "todo_create", "todo_modify", "todo_list", "todo_get",
       "subagent_spawn", "subagent_wait", "task_tool", "subagent_list", "subagent_send_input", "subagent_close", "subagent_resume"]);

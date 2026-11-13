@@ -22,7 +22,7 @@ import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { VersionStore, RefStore, workspaceHeadName, withWorkspaceMutation } from "@sciencediscovery/cas";
 
-import type { ArtifactDerivation, ArtifactJob, ComposerReference, Environment, EnvironmentRevision, ExecutionRun, ModelInvocationUsage, Subagent } from "@sciencediscovery/schema";
+import type { ArtifactDerivation, ArtifactJob, ComposerReference, Environment, EnvironmentRevision, ExecutionRun, McpInvocation, ModelInvocationUsage, Subagent } from "@sciencediscovery/schema";
 import {
   INBOX_PROJECT_NAME,
   UNTITLED_SESSION_TITLE,
@@ -1054,6 +1054,82 @@ test("SessionStore appends run events losslessly and survives reload", async (co
   );
 });
 
+test("a cursor read returns only the tail of a run stream, and a typed read only its type", async (context) => {
+  // #1011: both readers used to build every record of the stream before
+  // discarding what the caller did not ask for. The visible contract is
+  // unchanged, so this pins the contract plus the two new read shapes.
+  const tempRoot = resolve(process.cwd(), ".tmp", `run-stream-cursor-${Date.now()}-${process.pid}`);
+  await mkdir(tempRoot, { recursive: true });
+  context.after(() => rm(tempRoot, { force: true, recursive: true }));
+
+  const store = new SessionStore(tempRoot);
+  await store.load();
+  const model = await store.createModel({
+    apiToken: "token",
+    baseUrl: "https://models.example.test/v1",
+    model: "model",
+    name: "Model",
+  });
+  const project = await store.createProject("Cursor reads");
+  const session = await store.createSession(project.id, "Cursor", model.id);
+  const run = await store.createSessionRun({
+    prompt: "Stream a long run",
+    sessionId: session.id,
+    settingsSnapshot: store.resolveRuntimeSettings(session.id).effective,
+  });
+
+  // Thirty deltas with three plan snapshots spread through them: the typed read
+  // has to skip most of the stream, and the cursor read has to return exactly
+  // the records after it.
+  const planSequences: number[] = [];
+  for (let turn = 0; turn < 30; turn += 1) {
+    await store.appendSessionRunEvent(session.id, run.id, { delta: `chunk ${turn}`, type: "assistant.delta" });
+    if (turn % 10 === 4) {
+      const event = await store.appendSessionRunEvent(session.id, run.id, {
+        plan: {
+          agentId: "main",
+          explanation: `step ${turn}`,
+          items: [{ status: "in_progress", step: `work ${turn}` }],
+          toolCallId: `call-${turn}`,
+          turn,
+          updatedAt: "2026-11-10T00:00:00.000Z",
+        },
+        type: "plan.updated",
+      });
+      planSequences.push(event.sequence);
+    }
+  }
+
+  const all = await store.listSessionRunEvents(session.id, run.id);
+  assert.equal(all.length, 33);
+  assert.deepEqual(all.map((record) => record.sequence), Array.from({ length: 33 }, (_, index) => index + 1));
+
+  const tail = await store.listSessionRunEvents(session.id, run.id, 29);
+  assert.deepEqual(tail.map((record) => record.sequence), [30, 31, 32, 33], "only records after the cursor");
+  assert.deepEqual(tail, all.slice(29), "the tail is identical to the matching slice of the full read");
+
+  assert.deepEqual(await store.listSessionRunEvents(session.id, run.id, 33), [], "a cursor at the end returns nothing");
+
+  const plans = await store.listRunStreamEventsOfType(session.id, run.id, "main", "plan.updated");
+  assert.deepEqual(plans.map((record) => record.sequence), planSequences);
+  assert.deepEqual(plans, all.filter((record) => record.event.type === "plan.updated"),
+    "the typed read returns the same envelopes as the full read");
+  assert.deepEqual(await store.listRunStreamEventsOfType(session.id, run.id, "main", "run.history.truncated"), []);
+
+  // A non-main stream takes the same path and keeps the same envelope.
+  await store.appendRunStreamEvent(session.id, run.id, "tool-call-1", { trace: { id: "call-1", name: "run_shell", status: "running" }, type: "tool.started" });
+  await store.appendRunStreamEvent(session.id, run.id, "tool-call-1", { trace: { id: "call-1", name: "run_shell", status: "completed" }, type: "tool.completed" });
+  const toolCompleted = await store.listRunStreamEventsOfType(session.id, run.id, "tool-call-1", "tool.completed");
+  assert.equal(toolCompleted.length, 1);
+  assert.equal(toolCompleted[0]?.event.type, "tool.completed");
+
+  // The package export keeps its contract: every stream, every event, ascending.
+  const exported = await store.exportRunStreams(session.id, run.id);
+  const main = exported.find((stream) => stream.streamId === "main");
+  assert.deepEqual(main?.events, all, "the exported main stream is the full ordered history");
+  assert.ok(exported.some((stream) => stream.streamId === "tool-call-1" && stream.events.length === 2));
+});
+
 test("SessionStore serializes concurrent model usage writes without losing records", async (context) => {
   const tempRoot = resolve(process.cwd(), ".tmp", `model-usage-concurrency-${Date.now()}-${process.pid}`);
   await mkdir(tempRoot, { recursive: true });
@@ -1149,6 +1225,26 @@ test("SessionStore ignores duplicate model usage attempts but keeps retries", as
   assert.deepEqual(records.map((usage) => usage.id).toSorted(), ["usage-0", "usage-retry"]);
   assert.deepEqual(records.map((usage) => usage.attemptIndex).toSorted(), [0, 1]);
   context.after(() => rm(tempRoot, { force: true, recursive: true }));
+});
+
+test("SessionStore serializes concurrent MCP invocation writes", async (context) => {
+  const tempRoot = resolve(process.cwd(), ".tmp", `mcp-invocation-concurrency-${randomUUID()}`);
+  context.after(() => rm(tempRoot, { recursive: true, force: true }));
+  const store = new SessionStore(tempRoot); await store.load();
+  const project = await store.createProject("MCP invocation persistence");
+  const session = await store.createSession(project.id, "Concurrent MCP", {}, {}, { allowUnconfiguredModel: true });
+  const now = new Date().toISOString();
+  const records = Array.from({ length: 32 }, (_, index) => ({
+    id: `mcp-invocation-${index}`, sessionId: session.id, projectId: project.id,
+    sourceId: "custom-test", toolId: "echo", mcpServerId: "custom-test", toolCallId: `call-${index}`,
+    turnId: `turn-${index}`, adapterVersion: "test", attempts: [], attribution: "test",
+    cache: { hit: false, key: `key-${index}`, scope: "session" }, finishedAt: now,
+    license: "test", resultCount: 0, startedAt: now, status: "succeeded", transport: "mcp",
+    request: { hash: `sha256:${"0".repeat(64)}`, size: 0 },
+    normalizedResult: { hash: `sha256:${"1".repeat(64)}`, size: 0 },
+  } satisfies McpInvocation));
+  await Promise.all(records.map((record) => store.appendMcpInvocation(record)));
+  assert.deepEqual((await store.listMcpInvocations(session.id)).map((record) => record.id).toSorted(), records.map((record) => record.id).toSorted());
 });
 
 test("SessionStore serializes concurrent Session run creation and updates", async (context) => {
@@ -1322,6 +1418,58 @@ test("SessionStore manages registry defaults and independent module policies", a
   );
 });
 
+test("proxy bypass settings survive reload and reject invalid input", async (context) => {
+  const tempRoot = resolve(process.cwd(), ".tmp", `proxy-bypass-${Date.now()}-${process.pid}`);
+  await mkdir(tempRoot, { recursive: true });
+  context.after(() => rm(tempRoot, { force: true, recursive: true }));
+  const store = new SessionStore(tempRoot);
+  await store.load();
+  const defaultPolicy = store.getProxySettings().defaultPolicy;
+  await store.updateProxySettings({ defaultPolicy, noProxy: "internal.test,[::1]" });
+  const reloaded = new SessionStore(tempRoot);
+  await reloaded.load();
+  assert.equal(reloaded.getProxySettings().noProxy, "internal.test,[::1]");
+  assert.equal(reloaded.resolveProxy().noProxy, "internal.test,[::1]");
+  await assert.rejects(reloaded.updateProxySettings({ defaultPolicy, noProxy: "host\ninvalid" }));
+  assert.equal(reloaded.getProxySettings().noProxy, "internal.test,[::1]");
+  // An emptied field means "nothing stored", so the process's own NO_PROXY applies
+  // again — an empty string would otherwise win over it and disable every bypass.
+  await reloaded.updateProxySettings({ defaultPolicy, noProxy: "   " });
+  assert.equal(reloaded.getProxySettings().noProxy, undefined);
+  assert.equal(reloaded.resolveProxy().noProxy, undefined);
+});
+
+test("proxy bypass edits rotate the configuration approval fingerprints", async (context) => {
+  const tempRoot = resolve(process.cwd(), ".tmp", `proxy-fingerprint-${Date.now()}-${process.pid}`);
+  await mkdir(tempRoot, { recursive: true });
+  context.after(() => rm(tempRoot, { force: true, recursive: true }));
+  const store = new SessionStore(tempRoot);
+  await store.load();
+  const project = await store.createProject("Proxy fingerprint");
+  const session = await store.createSession(project.id, "Session", {}, {}, { allowUnconfiguredModel: true });
+
+  const before = store.configurationSnapshot(session.id, "model.select", "model");
+  const beforeWeb = store.configurationSnapshot(session.id, "web.credential", "web");
+  const beforePolicies = before.resourceVersions.policies;
+  const beforeWebProxy = beforeWeb.resourceVersions.webProxy;
+
+  // Editing only the bypass list changes no default policy and no server, but
+  // it decides which destinations skip the proxy, so every fingerprint that
+  // vouches for proxy routing must rotate with it.
+  await store.updateProxySettings({ defaultPolicy: "none", noProxy: "internal.test" });
+  const after = store.configurationSnapshot(session.id, "model.select", "model");
+  const afterWeb = store.configurationSnapshot(session.id, "web.credential", "web");
+  assert.notEqual(after.resourceVersions.policies, beforePolicies, "policies fingerprint must rotate on a noProxy edit");
+  assert.notEqual(afterWeb.resourceVersions.webProxy, beforeWebProxy, "webProxy fingerprint must rotate on a noProxy edit");
+
+  // An identical re-save keeps the fingerprints stable: only real changes rotate.
+  await store.updateProxySettings({ defaultPolicy: "none", noProxy: "internal.test" });
+  const again = store.configurationSnapshot(session.id, "model.select", "model");
+  const againWeb = store.configurationSnapshot(session.id, "web.credential", "web");
+  assert.equal(again.resourceVersions.policies, after.resourceVersions.policies);
+  assert.equal(againWeb.resourceVersions.webProxy, afterWeb.resourceVersions.webProxy);
+});
+
 test("SessionStore migrates legacy web proxy modes into the authenticated settings projection", async (context) => {
   for (const mode of ["environment", "direct", "custom"] as const) {
     const tempRoot = resolve(process.cwd(), ".tmp", `proxy-migration-${mode}-${Date.now()}-${process.pid}`);
@@ -1419,6 +1567,20 @@ test("proxy settings project supported authenticated URLs while catalog and SQLi
       && !error.message.includes("leak-user")
       && !error.message.includes("leak-password"),
   );
+  // A path or query is never sent by any consumer, so saving one would store a
+  // setting the proxy never sees.
+  for (const [url, message] of [
+    ["http://leak-user:leak-password@proxy.example.test:8080/path", "The proxy URL cannot contain a path"],
+    ["http://leak-user:leak-password@proxy.example.test:8080/?token=private", "The proxy URL cannot contain a query"],
+  ] as const) {
+    await assert.rejects(
+      store.createProxyServer({ kind: "custom_url", name: "Invalid", url }),
+      (error: Error) => error.message === message
+        && !error.message.includes("leak-user")
+        && !error.message.includes("leak-password")
+        && !error.message.includes("private"),
+    );
+  }
 });
 
 test("recovering a large run stream does not load the whole file into the heap", { timeout: 120_000 }, async (context) => {
@@ -2481,7 +2643,8 @@ test("SessionStore seeds, validates, and persists memory-graph settings + passwo
 
   // Replacing the password (non-null overwrites).
   const replacementPassword = `pw-${randomUUID()}`;
-  await store.updateMemoryGraphSettings({ neo4jPassword: replacementPassword });
+  // Preserve the legacy writer normalization; MCP exact drafts do not change this endpoint.
+  await store.updateMemoryGraphSettings({ neo4jPassword: ` \t${replacementPassword}\n ` });
   assert.equal(store.getMemoryGraphNeo4jPassword(), replacementPassword);
 
   // Removing the password (null clears it; hasNeo4jPassword flips back).

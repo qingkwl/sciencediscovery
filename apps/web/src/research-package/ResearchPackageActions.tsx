@@ -5,6 +5,7 @@ import type { ResearchPackageExportProfileView as ResearchPackageExportProfile }
 import { trackResearchPackageExport } from "./ResearchPackageExportTasks.js";
 import { ContinueResearchButton } from "./ContinueResearchButton.js";
 import { ExportPreviewCache } from "./export-preview-cache.js";
+import { ApiRequestError } from "../api/auth.js";
 import { translateActive, useLocale } from "../i18n/index.js";
 
 export type ResearchPackageDialogTarget = { projectId: string; sessionId: string; kind: "conversation" | "package" | "import" };
@@ -114,6 +115,11 @@ function PackageExportDialog({ client, target, onClose, onExportQueued }: Dialog
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string>();
   const [error, setError] = useState<string>();
+  // The scope this dialog previews can be deleted while the dialog is open (another
+  // client, another tab, a teardown). The poll then answers `deleted`; the last
+  // estimate stays on screen as the pre-deletion snapshot, but exporting it would
+  // only fail, so both export buttons are disabled from that answer on.
+  const [scopeGone, setScopeGone] = useState(false);
   const [sessionTitle, setSessionTitle] = useState(t("researchPackage.currentSession"));
   const [defaults, setDefaults] = useState(() => previewCache.peekDefaults(target.projectId, target.sessionId));
   const sessionRevision = defaults?.revision;
@@ -142,7 +148,16 @@ function PackageExportDialog({ client, target, onClose, onExportQueued }: Dialog
       setDefaults(next);
       if (!next) setPreview(undefined);
     });
-    const refresh = () => { void previewCache.refreshDefaults(target.projectId, target.sessionId).catch((reason: unknown) => { if (active) setError(errorText(reason)); }); };
+    setScopeGone(false);
+    const refresh = () => { void previewCache.refreshDefaults(target.projectId, target.sessionId).catch((reason: unknown) => {
+      if (!active) return;
+      // The dialog renders this state from its own snapshot, so the wording can
+      // match what is actually on screen; the rejection's message is not used.
+      if (reason instanceof ApiRequestError && reason.code === "EXPORT_PREVIEW_RESOURCE_DELETED") {
+        setScopeGone(true); setError(undefined); return;
+      }
+      setError(errorText(reason));
+    }); };
     refresh();
     const timer = window.setInterval(refresh, 3_000);
     return () => { active = false; unsubscribe(); window.clearInterval(timer); };
@@ -197,10 +212,21 @@ function PackageExportDialog({ client, target, onClose, onExportQueued }: Dialog
     : includeFullTrajectory ? defaults?.completeWithTrajectory : defaults?.complete;
   const necessarySize = defaults && defaults.necessary.revision === defaults.revision ? defaults.necessary.estimatedBytes : undefined;
   const completeSize = completeDefaultPreview && completeDefaultPreview.revision === defaults?.revision ? completeDefaultPreview.estimatedBytes : undefined;
+  // A gone scope will never finish a preview, so the dialog stops promising
+  // "Calculating…" next to an alert that says the opposite (#1074 F6).
+  const unavailableSize = "—";
+  const sizeText = (bytes: number | undefined) => bytes === undefined
+    ? scopeGone ? unavailableSize : t("researchPackage.previewCalculating")
+    : formatSize(bytes);
+  // What the alert may claim is on screen. `preview` alone is not enough: picking
+  // a file clears it while the two scope cards keep the sizes they read from
+  // `defaults`, and those survive the gone answer — in that window the cards show
+  // last-known bytes, so the sentence has to admit them.
+  const hasVisibleSizes = preview !== undefined || necessarySize !== undefined || completeSize !== undefined;
   return <DialogFrame description={t("researchPackage.exportDescription")} onClose={onClose} title={t("researchPackage.exportEvidence")}>
     <div className="research-export-body">
-      <div className="research-choice-grid"><ChoiceCard checked={level === "necessary"} description={t("researchPackage.necessaryDescription", { size: necessarySize === undefined ? t("researchPackage.previewCalculating") : formatSize(necessarySize) })} onClick={() => chooseLevel("necessary")} title={t("researchPackage.scopeNecessary")} /><ChoiceCard checked={level === "complete"} description={t("researchPackage.completeDescription", { size: completeSize === undefined ? t("researchPackage.previewCalculating") : formatSize(completeSize) })} onClick={() => chooseLevel("complete")} title={t("researchPackage.scopeComplete")} /></div>
-      <div className="research-export-estimate" aria-live="polite"><strong>{preview ? t("researchPackage.estimatedSize", { size: formatSize(preview.estimatedBytes) }) : t("researchPackage.previewCalculating")}</strong><span>{t("researchPackage.selectedFiles", { selected: checkedPaths.length, total: files.length })}</span></div>
+      <div className="research-choice-grid"><ChoiceCard checked={level === "necessary"} description={t("researchPackage.necessaryDescription", { size: sizeText(necessarySize) })} onClick={() => chooseLevel("necessary")} title={t("researchPackage.scopeNecessary")} /><ChoiceCard checked={level === "complete"} description={t("researchPackage.completeDescription", { size: sizeText(completeSize) })} onClick={() => chooseLevel("complete")} title={t("researchPackage.scopeComplete")} /></div>
+      <div className="research-export-estimate" aria-live="polite"><strong>{preview ? t("researchPackage.estimatedSize", { size: formatSize(preview.estimatedBytes) }) : sizeText(undefined)}</strong><span>{t("researchPackage.selectedFiles", { selected: checkedPaths.length, total: files.length })}</span></div>
       <p className="research-export-note">{t("researchPackage.previewNote")}</p>
       {preview?.estimateKind === "uncompressed" ? <p className="research-export-note">{t("researchPackage.uncompressedNote")}</p> : null}
       {preview?.exportProfile ? <PackageScope profile={preview.exportProfile} /> : null}
@@ -212,9 +238,9 @@ function PackageExportDialog({ client, target, onClose, onExportQueued }: Dialog
       {level === "complete" ? <label className="research-export-toggle"><input checked={includeFullMemoryGraph} onChange={(event) => setIncludeFullMemoryGraph(event.target.checked)} type="checkbox" /><span><strong>{t("researchPackage.fullMemoryGraph")}</strong><small>{t("researchPackage.fullMemoryGraphHint")}</small></span></label> : null}
       <p className="research-export-note">{t("researchPackage.completeNote")}</p>
       {preview?.omissions.length ? <details className="research-export-details"><summary>{t("researchPackage.omissions", { count: preview.omissions.length })}</summary><ul>{preview.omissions.map((item, index) => <li key={index}>{item}</li>)}</ul></details> : null}
-      {error ? <p role="alert" className="research-export-error">{error}</p> : null}{message ? <p role="status" className="research-export-status">{message}</p> : null}
+      {scopeGone ? <p role="alert" className="research-export-error">{t(hasVisibleSizes ? "researchPackage.resourceDeleted" : "researchPackage.resourceDeletedNoSizes")}</p> : error ? <p role="alert" className="research-export-error">{error}</p> : null}{message ? <p role="status" className="research-export-status">{message}</p> : null}
     </div>
-    <footer className="dialog-actions"><button className="secondary-button" disabled={busy} onClick={onClose} type="button">{t("researchPackage.cancel")}</button><span className="dialog-actions-spacer" /><button className="secondary-button" disabled={busy || !preview?.revision} onClick={() => void exportPackageInBackground()} type="button">{t("researchPackage.backgroundExport")}</button><button className="primary-button" disabled={busy || !preview} onClick={() => void exportPackage()} type="button">{busy ? t("researchPackage.processing") : t("researchPackage.immediateExport")}</button></footer>
+    <footer className="dialog-actions"><button className="secondary-button" disabled={busy} onClick={onClose} type="button">{t("researchPackage.cancel")}</button><span className="dialog-actions-spacer" /><button className="secondary-button" disabled={busy || scopeGone || !preview?.revision} onClick={() => void exportPackageInBackground()} type="button">{t("researchPackage.backgroundExport")}</button><button className="primary-button" disabled={busy || scopeGone || !preview} onClick={() => void exportPackage()} type="button">{busy ? t("researchPackage.processing") : t("researchPackage.immediateExport")}</button></footer>
   </DialogFrame>;
 }
 

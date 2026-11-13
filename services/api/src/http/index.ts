@@ -15,6 +15,7 @@
 import { diagnosticIds, diagnosticLogPaths, errorDiagnosticSnapshot } from "./error-diagnostics.js";
 import { randomUUID } from "node:crypto";
 import { matchesManualModelDestination } from "./manual-model-destination.js";
+import { testProxyConnectivity } from "../proxy-connectivity.js";
 import { createResearchSnapshots } from "../research-snapshots.js";
 import { isEvidenceSessionReadOnly } from "@sciencediscovery/schema";
 import { handleExecutionReadiness } from "./execution-readiness.js";
@@ -30,7 +31,7 @@ import { createReadStream } from "node:fs";
 import { mkdir, open, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { CasStore, VersionStore, withWorkspaceMutation } from "@sciencediscovery/cas";
-import { sessionTrajectory } from "../trajectory.js";
+import { sessionTrajectory, trajectoryMaxEvents } from "../trajectory.js";
 import { jiuwenSwarmConfigFromEnv } from "../agent-run/jiuwenswarm-agent.js";
 import { importSkillsToJiuwenSwarm, listJiuwenSwarmSkills, setJiuwenSwarmLanguage, setJiuwenSwarmSkillEnabled } from "../agent-run/jiuwenswarm-skills.js";
 import { syncWebSettingsToJiuwenSwarm } from "../agent-run/jiuwenswarm-web-settings.js";
@@ -105,8 +106,9 @@ import {
   type UpdateModelProviderRequest,
 } from "@sciencediscovery/schema";
 import { createMainAgentProfile, createSubagentProfile, resolveSubagentConfig } from "@sciencediscovery/orchestration";
-import { resolveWorkspaceFile } from "@sciencediscovery/workspace";
+import { findWindowsReservedDeviceSegment, resolveWorkspaceFile } from "@sciencediscovery/workspace";
 import { handleEvolveCompletion } from "../evolution/llm-proxy.js";
+import { handleEvolveRunner } from "../evolution/runner-proxy.js";
 import {
   handleGetCandidate as handleEvolveGetCandidate,
   handleListRuns as handleEvolveListRuns,
@@ -240,7 +242,10 @@ import {
 } from "../artifact-dashboard.js";
 import { mgLog, type ObserveUploadFilePayload } from "@sciencediscovery/memory";
 import { resolveProxyForUrl } from "@sciencediscovery/data-source";
+import { draftEvolveDirection } from "../evolution/direction-draft.js";
 import { apiLog, runLog } from "../logging.js";
+import { createMemoryWatch } from "../memory-watch.js";
+import { heapBudget } from "../heap-budget.js";
 import { shortErrorMessage } from "@sciencediscovery/operational-logging";
 import { createPromptManifest } from "../prompt-manifest.js";
 import { createMcpWorkspaceTools } from "@sciencediscovery/artifact-manager";
@@ -414,6 +419,96 @@ function extractReplacementModelId(body: unknown): string | null | undefined {
   throw new ApiStatusError(400, "replacementModelId must be a string or null");
 }
 
+/**
+ * The Specialist routes forward plain `Error`s from the store, and the store's
+ * wording is the message the settings pane shows. Only the store's own
+ * rejections may be answered as client errors; anything else raised in these
+ * handlers is an internal fault and must read 500. Exported for the route test.
+ */
+export function specialistErrorStatus(error: unknown): 400 | 404 | undefined {
+  if (!(error instanceof Error)) return undefined;
+  const match = SPECIALIST_REJECTIONS.find(([wording]) =>
+    typeof wording === "string" ? error.message === wording : wording.test(error.message));
+  return match?.[1];
+}
+
+/**
+ * One entry per rejection `services/api/src/store.ts` raises for these routes,
+ * by its exact wording. A wording the store does not raise is not client input:
+ * `isKnownClientInputError` matches any message containing "must" or "cannot",
+ * which would relabel an internal fault as 400 and hide it from the log.
+ */
+const SPECIALIST_REJECTIONS: ReadonlyArray<readonly [string | RegExp, 400 | 404]> = [
+  ["Specialist not found", 404],
+  ["Specialist name is required", 400],
+  ["Specialist description is required", 400],
+  ["Specialist description must be 1-500 characters", 400],
+  ["Specialist instructions must be 1-20000 characters", 400],
+  ["Specialist name already exists", 400],
+  [/^Specialist (?:skills|connectors) are unavailable: /, 400],
+  ["Built-in specialists are read-only; only their enabled flag can be toggled", 400],
+  ["Built-in specialists cannot be deleted", 400],
+  ["Specialist is referenced by a Session or subagent and cannot be deleted", 400],
+  ["enabled must be a boolean", 400],
+];
+
+/**
+ * Answer one Specialist route, keeping the store's message and its status.
+ *
+ * A rejection the store did not raise is a fault. It is answered here rather
+ * than rethrown, because the catch-all judges an unknown `Error` by its
+ * wording: a failed `saveCatalog()` surfaces `node:sqlite`'s
+ * `cannot start a transaction within a transaction` (with
+ * `code: "ERR_SQLITE_ERROR"`), which would answer 400 with its raw text. Only
+ * the two typed errors and the one coded store rejection the catch-all maps
+ * without reading the message go through it.
+ */
+async function answerSpecialistRoute<T>(
+  response: ServerResponse,
+  request: IncomingMessage,
+  path: string,
+  status: number,
+  work: () => Promise<T>,
+): Promise<void> {
+  try {
+    sendJson(response, status, await work());
+  } catch (error) {
+    const errorStatus = specialistErrorStatus(error);
+    if (errorStatus !== undefined) {
+      sendError(response, errorStatus, error instanceof Error ? error.message : "Specialist request failed");
+      return;
+    }
+    if (error instanceof ApiStatusError || error instanceof SessionStoreHttpError
+      || (error as { code?: unknown } | null)?.code === "SPECIALIST_RUNTIME_INVALID") {
+      throw error;
+    }
+    apiLog.error("unclassified_specialist_request_error", {
+      errorMessage: shortErrorMessage(error),
+      method: request.method ?? "UNKNOWN",
+      path,
+      status: 500,
+    });
+    sendError(response, 500, "Internal server error");
+  }
+}
+
+/**
+ * Read a Specialist body that has to be a JSON object.
+ *
+ * `readJson` returns whatever `JSON.parse` produced, so a bare `null` body
+ * reaches the store and fails on a property read. That `TypeError` names
+ * nothing in `SPECIALIST_REJECTIONS`, so the route would answer it as a 500
+ * fault; rejecting it here keeps the status class the base answered for a
+ * malformed client body, before any of it touches the store.
+ */
+async function readSpecialistBody<T>(request: IncomingMessage): Promise<T> {
+  const body = (await readJson<unknown>(request)) as unknown;
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    throw new ApiStatusError(400, "Request body must be a JSON object");
+  }
+  return body as T;
+}
+
 export function createApiServer(config = loadServerConfig(), dependencies: ApiServerDependencies = {}): Server {
   const platform = createPlatformServices(config, repositoryRoot, dependencies);
   const {
@@ -460,6 +555,15 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       .catch(() => null),
   });
   const conversationalConfiguration = () => {
+    store.setConfigurationMcpProxySource(() => {
+      const services = new Map<string, { id: string; names: string[]; connectorIds: string[] }>();
+      for (const manifest of mcpRegistry.listManifests()) {
+        const id = manifest.transport.mcpServerId;
+        const service = services.get(id) ?? { id, names: [], connectorIds: [] };
+        service.names.push(manifest.displayName); service.connectorIds.push(manifest.id); services.set(id, service);
+      }
+      return [...services.values()].map(service => ({ id: service.id, name: service.names.sort().join(", "), connectorIds: service.connectorIds.sort() }));
+    });
     store.setConfigurationConnectorRevisionSource((ids?: readonly string[]) => {
       const selected = mcpRegistry.listManifests().filter(manifest => !ids || ids.includes(manifest.id));
       const servers = new Set(selected.map(manifest => manifest.transport.mcpServerId));
@@ -480,6 +584,13 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
     });
     return configurationFramework(store, {
     nativeExecutor: !jiuwenSwarmConfigFromEnv(),
+    mcpMetadata: platform.customMcpServers,
+    mcpTimeout: platform.customMcpServers,
+    mcpHeaderRemoval: platform.customMcpServers,
+    mcpEnvironmentRemoval: platform.customMcpServers,
+    mcpHeaderCredential: platform.customMcpServers,
+    mcpAvailability: platform.customMcpServers,
+    mcpDeletion: platform.customMcpServers,
     jiuwenLiveWait: Boolean(jiuwenSwarmConfigFromEnv()),
     connectors: () => mcpRegistry.listManifests().map(manifest => {
       const status = mcpCatalog.getStatus(manifest.id);
@@ -783,7 +894,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
   // Provider model listings are cached briefly so composer and settings reads
   // do not hammer vendor endpoints; provider edits invalidate the entry and
   // `?refresh=1` forces a live fetch.
-  const providerModelListCache = new Map<string, { fetchedAt: string; models: DiscoveredModel[] }>();
+  const providerModelListCache = new Map<string, { revision: string; fetchedAt: string; models: DiscoveredModel[] }>();
   const PROVIDER_MODEL_CACHE_TTL_MS = 5 * 60_000;
   const usageExchangeRateProvider = new UsageExchangeRateProvider({
     config: config.usageExchangeRates,
@@ -1052,7 +1163,20 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       // checks after that — never a hung response.
       if (request.method === "GET" && (url.pathname === "/health" || url.pathname === "/api/health")) {
         if (!(await settleWithin(ready.then(() => true), 3_000, false))) {
-          sendJson(response, 503, { service: "sciencediscovery-api", status: "starting" });
+          sendJson(response, 503, { service: "sciencediscovery-api", liveness: "starting" });
+          return;
+        }
+        // Liveness for everyone, detail for a caller that proves it may read it:
+        // the record below carries the Runner's platform, the sandbox egress
+        // allowlist and the workspace quotas, which are reconnaissance for
+        // anyone who can reach this port without a token.
+        //
+        // The two answers share no field name on purpose. `status` in the detail
+        // is derived from the Runner, so a liveness body spelling it `"ok"` would
+        // let every reader that gates on `status === "ok"` pass without ever
+        // having read the detail — a wrong token would look like a healthy stack.
+        if (!isAuthorized(request, config.authToken)) {
+          sendJson(response, 200, { service: "sciencediscovery-api", liveness: "ok" });
           return;
         }
         const runner = await settleWithin(runnerClient.health().catch(() => undefined), 2_000, undefined);
@@ -1078,7 +1202,12 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
           },
           runner: runner ?? { status: "unavailable" },
           service: "sciencediscovery-api",
-          status: runner && runner.execution?.ready !== false ? "ok" : "degraded",
+          // `status` follows the Runner's readiness record, not the fact that a
+          // Runner answered: a Runner that does not accept this token answers
+          // 200 with its public body, which carries no `execution`. Reading that
+          // as "ok" would tell an operator the stack is healthy while its Runner
+          // was never consulted.
+          status: runner?.execution && runner.execution.ready !== false ? "ok" : "degraded",
           workspace,
         });
         return;
@@ -1097,6 +1226,11 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
         });
         return;
       }
+      if (url.pathname.startsWith("/internal/evolve-runner/") && await handleEvolveRunner(request, response, url, {
+        grants: evolveOrchestrator.runnerGrants,
+        runnerClient: (runnerId) => remoteCompute.runnerClient(runnerId),
+        sessions: store,
+      })) return;
 
       // OAuth callbacks are authorized by a single-use state and SDK PKCE verifier.
       if (await handleMcpOAuthCallback(request, response, url, platform.customMcpServers)) return;
@@ -1272,9 +1406,24 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       const researchPackageMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/research-package(?:\/(inspect|import|preview))?$/);
       if (researchPackageMatch) {
         const projectId = decodeURIComponent(researchPackageMatch[1]!);
-        if (!store.getProject(projectId)) return sendError(response, 404, "Project not found");
         const sessionId = url.searchParams.get("sessionId") ?? undefined;
-        if (request.method === "GET" && (!researchPackageMatch[2] || researchPackageMatch[2] === "preview")) {
+        const previewRead = request.method === "GET" && (!researchPackageMatch[2] || researchPackageMatch[2] === "preview");
+        // Only the polling shape (`defaults=1`, what a mounted panel asks every
+        // 3 s) ends quietly. A one-shot preview read keeps its status: there the
+        // caller asked once, and a deleted scope is worth reporting.
+        const previewPoll = previewRead && researchPackageMatch[2] === "preview" && url.searchParams.get("defaults") === "1";
+        const packagePreviewGone = () => !store.getProject(projectId)
+          || (sessionId !== undefined && sessionId !== "" && !store.getSession(sessionId));
+        // A mounted panel polls the preview of the Session it is showing. When
+        // that Session or Project has been deleted, the honest answer to the
+        // poll is "there is nothing left to preview" — not a 404, which the
+        // browser reports as a console error and which a polling client would
+        // keep asking for (#1072). The panel stops on this answer. Downloads
+        // keep their 404 below: asking for a package that is gone is a mistake
+        // worth reporting, asking after a polled preview is not.
+        if (previewPoll && packagePreviewGone()) return sendJson(response, 200, { state: "deleted" as const });
+        if (!store.getProject(projectId)) return sendError(response, 404, "Project not found");
+        if (previewRead) {
           const requestedLevel = url.searchParams.get("level");
           const level = requestedLevel === "complete" ? "complete" : "necessary";
           const includeFullTrajectory = url.searchParams.get("includeFullTrajectory") !== "0";
@@ -1289,6 +1438,14 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
               }
               return sendJson(response, 200, await previewResearchPackage(projectId, sessionId, level, selectedFiles, includeFullTrajectory, includeFullMemoryGraph));
             } catch (error) {
+              // The scope can disappear while a preview is being calculated —
+              // teardown, or another client deleting the Project/Session. That
+              // ends the poll; it is not a failure of the page still showing it.
+              // An ENOENT counts only when the scope is really gone, so a
+              // missing input of a live Project still surfaces as an error.
+              if (previewPoll && ((error instanceof ApiStatusError && error.code === "EXPORT_PREVIEW_RESOURCE_DELETED")
+                || (packagePreviewGone() && (error as NodeJS.ErrnoException).code === "ENOENT")))
+                return sendJson(response, 200, { state: "deleted" as const });
               // Pending is expected while a run changes evidence. Opt-in clients can
               // wait without turning that state into a browser resource error.
               const preferAsync = [request.headers.prefer].flat().join(",").split(",").some((preference) => preference.trim().toLowerCase() === "respond-async");
@@ -1570,6 +1727,10 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       }
       if (url.pathname === "/api/proxy/settings" && request.method === "GET") {
         sendJson(response, 200, store.getProxySettings());
+        return;
+      }
+      if (url.pathname === "/api/proxy/test" && request.method === "POST") {
+        sendJson(response, 200, await testProxyConnectivity(await readJson(request)));
         return;
       }
       if (url.pathname === "/api/proxy/settings" && request.method === "PUT") {
@@ -2232,20 +2393,21 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
         return;
       }
       if (request.method === "POST" && url.pathname === "/api/specialists") {
-        sendJson(response, 201, await store.createSpecialist(await readJson<CreateSpecialistRequest>(request)));
+        const body = await readSpecialistBody<CreateSpecialistRequest>(request);
+        await answerSpecialistRoute(response, request, url.pathname, 201, () => store.createSpecialist(body));
         return;
       }
       const specialistMatch = url.pathname.match(/^\/api\/specialists\/([^/]+)$/);
       if (specialistMatch && request.method === "PUT") {
-        sendJson(response, 200, await store.updateSpecialist(
-          specialistMatch[1]!,
-          await readJson<UpdateSpecialistRequest>(request),
-        ));
+        const body = await readSpecialistBody<UpdateSpecialistRequest>(request);
+        await answerSpecialistRoute(response, request, url.pathname, 200, () => store.updateSpecialist(specialistMatch[1]!, body));
         return;
       }
       if (specialistMatch && request.method === "DELETE") {
-        await store.deleteSpecialist(specialistMatch[1]!);
-        sendJson(response, 200, { deleted: specialistMatch[1] });
+        await answerSpecialistRoute(response, request, url.pathname, 200, async () => {
+          await store.deleteSpecialist(specialistMatch[1]!);
+          return { deleted: specialistMatch[1] };
+        });
         return;
       }
       if (request.method === "POST" && url.pathname === "/api/skills") {
@@ -2625,12 +2787,15 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       const providerModelsMatch = url.pathname.match(/^\/api\/providers\/([^/]+)\/models$/);
       if (providerModelsMatch && request.method === "GET") {
         const providerId = providerModelsMatch[1]!;
-        const provider = store.getProvider(providerId);
-        if (!provider) throw new ApiStatusError(404, "Provider not found");
+        const source = store.getProvider(providerId);
+        const revision = store.providerDiscoveryRevision(providerId);
+        if (!source || !revision) throw new ApiStatusError(404, "Provider not found");
+        const provider = structuredClone(source);
         const profileFor = (modelId: string) =>
           store.listModels().find((profile) => profile.providerId === providerId && profile.model === modelId)?.id;
         const refresh = url.searchParams.get("refresh") === "1";
         let cached = providerModelListCache.get(providerId);
+        if (cached?.revision !== revision) cached = undefined;
         if (refresh || !cached || Date.now() - Date.parse(cached.fetchedAt) > PROVIDER_MODEL_CACHE_TTL_MS) {
           try {
             const models = await listProviderModels({
@@ -2639,9 +2804,15 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
               discovery: provider.modelDiscovery,
               proxy: resolveProxyForUrl(store.resolveProxy(provider.proxyPolicy), provider.baseUrl),
             });
-            cached = { fetchedAt: new Date().toISOString(), models };
+            if (store.providerDiscoveryRevision(providerId) !== revision) {
+              throw new ApiStatusError(409, "Provider connection changed while loading models. Refresh the model list.");
+            }
+            cached = { revision, fetchedAt: new Date().toISOString(), models };
             providerModelListCache.set(providerId, cached);
           } catch (error) {
+            if (store.providerDiscoveryRevision(providerId) !== revision) {
+              throw new ApiStatusError(409, "Provider connection changed while loading models. Refresh the model list.");
+            }
             if (error instanceof ModelDiscoveryError) {
               // Surface the upstream failure honestly; the UI keeps manual
               // model entry available as the fallback path.
@@ -2668,7 +2839,9 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
         // Seed the profile from the best facts available: explicit request,
         // then the live listing, then the curated catalog. A model typed by
         // hand simply has no listing entry, so it lands on the same path.
-        const remote = providerModelListCache.get(providerId)?.models.find((model) => model.id === modelId);
+        const cached = providerModelListCache.get(providerId);
+        const remote = cached?.revision === store.providerDiscoveryRevision(providerId)
+          ? cached?.models.find((model) => model.id === modelId) : undefined;
         const catalog = modelId ? lookupModelCatalog(modelId, provider.presetId) : undefined;
         const vision = body.vision ?? remote?.vision ?? catalog?.vision;
         const label = body.label ?? remote?.displayName ?? catalog?.label;
@@ -2696,7 +2869,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
             UNTITLED_SESSION_TITLE,
             {},
             {},
-            { allowUnconfiguredModel: true },
+            { allowUnconfiguredModel: true, selectFallbackModel: true },
           );
           sendJson(response, 201, { ...project, firstSession, project });
         } catch (error) {
@@ -2781,6 +2954,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
           }
         }
         await store.deleteProject(projectMatch[1]!, body.confirmationId ?? "");
+        exportPreviews.cancel(projectMatch[1]!);
         void Promise.all(impact.sessionIds.map(sid => ideaResearch.cleanup(projectMatch[1]!, sid))).catch(error => {
           console.warn("Could not clean up deleted Project research:", error);
         });
@@ -2835,6 +3009,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
           },
           {
             allowUnconfiguredModel: body.modelId === undefined && body.settingsOverrides?.modelId === undefined,
+            selectFallbackModel: true,
           },
         ));
         return;
@@ -3066,7 +3241,10 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       if (sessionMatch && request.method === "GET") {
         const session = await store.getSessionDetail(sessionMatch[1]!);
         if (!session) return sendError(response, 404, "Session not found");
-        if (!session.researchSnapshot || session.researchSnapshot.state === "ready") exportPreviews.watch(session.projectId, session.id);
+        // Reading a session must not start an export build: warming here ran
+        // five full preview profiles per read and per 3 s tick, exhausting the
+        // default heap on large projects (#1085). The export dialog warms on
+        // its own `defaults` request instead.
         sendJson(response, 200, session);
         return;
       }
@@ -3134,6 +3312,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
         await reviewerAuditCoordinator.cancelSession(sessionMatch[1]!);
         const researchProjectId = store.getSession(sessionMatch[1]!)!.projectId;
         await store.deleteSession(sessionMatch[1]!, body.confirmationId ?? "");
+        exportPreviews.cancel(researchProjectId, sessionMatch[1]!);
         void ideaResearch.cleanup(researchProjectId, sessionMatch[1]!).catch(error => {
           console.warn("Could not clean up deleted Session research:", error);
         });
@@ -3598,6 +3777,24 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
         return;
       }
 
+      const evolveDraftMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/evolve\/draft$/);
+      if (evolveDraftMatch && request.method === "POST") {
+        const sessionId = decodeURIComponent(evolveDraftMatch[1]!);
+        const session = store.assertSessionWritable(sessionId);
+        const body = await readJson<{ task?: unknown }>(request);
+        const task = typeof body.task === "string" ? body.task.trim() : "";
+        if (!task || task.length > 8000) return sendError(response, 400, "Enter a task of 1–8000 characters.");
+        const model = store.getModel(store.resolveRuntimeSettings(sessionId).effective.modelId);
+        const apiToken = model && store.getModelApiToken(model.id);
+        if (!model || !apiToken) return sendError(response, 409, "Configure a model for this session to generate a draft.");
+        const abort = new AbortController();
+        response.once("close", () => abort.abort());
+        const draft = await draftEvolveDirection(store, session, model, apiToken, task, abort.signal);
+        if (!draft) return sendError(response, 502, "The model did not return a usable JSON draft.");
+        sendJson(response, 200, draft);
+        return;
+      }
+
       if (url.pathname === "/api/evolve/runs" && request.method === "GET") {
         await handleEvolveListRuns(response, evolutionStore, url.searchParams.get("sessionId"));
         return;
@@ -3800,6 +3997,13 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       }
       const artifactVersionProvenanceMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/artifact-versions\/([^/]+)\/provenance$/);
       if (artifactVersionProvenanceMatch && request.method === "GET") {
+        // The same answer the sibling content route gives: a version id that does not
+        // exist is a missing resource, not a server fault. The helper throws a plain
+        // Error for it, which the catch-all cannot classify, so it would answer 500 and
+        // log an unclassified_request_error for a stale link.
+        if (!store.getArtifactVersion(artifactVersionProvenanceMatch[1]!, artifactVersionProvenanceMatch[2]!)) {
+          return sendError(response, 404, "Artifact version not found");
+        }
         sendJson(response, 200, await artifactVersionProvenance(
           store,
           provenanceRecorder,
@@ -3811,12 +4015,24 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       }
       const artifactVersionDiffMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/artifact-versions\/([^/]+)\/diff$/);
       if (artifactVersionDiffMatch && request.method === "GET") {
+        // Both ids on this route name a version: the one being described and the
+        // `against` comparison base. Neither is a server fault when it does not exist,
+        // and the helper's plain Error for them reaches the catch-all as a 500.
+        const described = store.getArtifactVersion(artifactVersionDiffMatch[1]!, artifactVersionDiffMatch[2]!);
+        if (!described) return sendError(response, 404, "Artifact version not found");
+        const against = url.searchParams.get("against") ?? undefined;
+        // `against` is resolved inside the described artifact's own version list, so an
+        // id from another artifact, or one retention removed, is missing here as well.
+        if (against && !store.listArtifactVersions(artifactVersionDiffMatch[1]!, described.artifactId)
+          .some((version) => version.id === against)) {
+          return sendError(response, 404, "Artifact version not found");
+        }
         sendJson(response, 200, await artifactVersionDiff(
           store,
           provenanceRecorder,
           artifactVersionDiffMatch[1]!,
           artifactVersionDiffMatch[2]!,
-          url.searchParams.get("against") ?? undefined,
+          against,
         ));
         return;
       }
@@ -4245,9 +4461,22 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       if (filesMatch && request.method === "POST") {
         store.assertSessionWritable(filesMatch[1]!);
         const body = await readJson<UploadFileRequest>(request);
-        const target = resolveWorkspaceFile(store.workspacePath(filesMatch[1]!), body.path ?? "");
+        const workspaceRoot = store.workspacePath(filesMatch[1]!);
+        const target = resolveWorkspaceFile(workspaceRoot, body.path ?? "");
+        // A segment named for a Windows device is not a file there: the write
+        // targets the device, fails, or, for CON, goes to the console. The rule is
+        // checked on every host and on both separators, so the answer does not
+        // depend on which platform serves the request.
+        const deviceSegment = findWindowsReservedDeviceSegment(workspaceRoot, target);
+        if (deviceSegment) {
+          return sendError(
+            response,
+            400,
+            `Workspace path names the reserved Windows device "${deviceSegment}"; rename it before writing`,
+          );
+        }
         if (Buffer.byteLength(body.content ?? "") > 1_000_000) return sendError(response, 413, "File exceeds 1 MB");
-        await withWorkspaceMutation(new VersionStore(store.dataDir), store.workspacePath(filesMatch[1]!), async () => {
+        await withWorkspaceMutation(new VersionStore(store.dataDir), workspaceRoot, async () => {
           await mkdir(dirname(target), { recursive: true });
           await writeFile(target, body.content ?? "", "utf8");
           await provenanceRecorder.registerWorkspaceArtifact({
@@ -4255,7 +4484,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
             originMeta: { uploadedFilename: body.path },
             path: body.path,
             sessionId: filesMatch[1]!,
-            workspaceRoot: store.workspacePath(filesMatch[1]!),
+            workspaceRoot,
           });
         }, { kind: "user-file-write" });
         sendJson(response, 201, (await listWorkspaceFiles(store, filesMatch[1]!)).find((file) => file.path === body.path));
@@ -4388,6 +4617,11 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       else if (code === "SKILL_LIBRARY_CONFLICT") sendError(response, 409, message);
       else if (code === "SKILL_LIBRARY_VALIDATION") sendError(response, 400, message);
       else if (code === "INVALID_WEB_SETTINGS") sendError(response, 400, message);
+      // A refused upload name is the caller's own input, whatever the wording of
+      // the guard that refused it: `sanitizeUploadFilename` tags every branch with
+      // this code, so the status follows the code rather than the prose of a
+      // message a later edit could reword.
+      else if (code === "INVALID_UPLOAD_PATH") sendError(response, 400, message);
       else if (/^(Project|Session|Proxy server|Provider|Model) not found(?:: .+)?$/.test(message)) sendError(response, 404, message);
       else if (/^(Execution|Transfer|Timer|Subagent) not found: .+$/.test(message)) sendError(response, 404, message);
       else if (message === "Session is archived and read-only") sendError(response, 409, message);
@@ -4556,6 +4790,13 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
 }
 
 export async function startApiServer(config = loadServerConfig()): Promise<Server> {
+  // Resolve and validate the foot-guns before the socket exists. A bad
+  // `SCIENCE_AGENT_API_MAX_OLD_SPACE_MB` used to throw here, after `listen`, and
+  // the entry point's catch only logs and sets `process.exitCode`: the process
+  // kept the socket open, answered /api/health with 200, and never registered
+  // SIGTERM handling or the memory watch (#1105 F1).
+  const budget = heapBudget();
+  const trajectoryEvents = trajectoryMaxEvents();
   const server = createApiServer(config);
   await new Promise<void>((resolveListen, reject) => {
     server.once("error", reject);
@@ -4567,6 +4808,12 @@ export async function startApiServer(config = loadServerConfig()): Promise<Serve
   const address = server.address();
   const port = typeof address === "object" && address ? address.port : config.port;
   apiLog.info("service_started", { host: config.host, port });
+  // The budget and the sampled heap belong to the launched service, not to a
+  // server created in a test: a fixture gets no 30 s timeline and no boot line
+  // it did not ask for (#1063).
+  const stopMemoryWatch = createMemoryWatch({ log: apiLog, budget }).start();
+  server.once("close", stopMemoryWatch);
+  apiLog.info("api_trajectory_budget", { maxEvents: trajectoryEvents });
   console.log(`ScienceDiscovery listening on http://${config.host}:${port}`);
   for (const line of accessTokenBanner({ ...config, port: config.publicPort ?? port })) console.log(line);
   if (config.host !== "127.0.0.1" && config.host !== "localhost" && config.host !== "::1") {

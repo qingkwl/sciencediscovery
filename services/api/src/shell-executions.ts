@@ -88,6 +88,14 @@ const RUNNER_CONFLICT_MESSAGES: Readonly<{
   EXECUTION_RESULT_CONFLICT: "Runner execution result conflict",
 };
 const RUNNER_REQUEST_TIMEOUT_MS = 10_000;
+/** A cancel for an execution the Runner may no longer hold must not hold the
+ *  caller open: the caller is already ending this work, and a project delete
+ *  waits behind it (#1012). Two seconds is enough for a Runner that has the
+ *  record; one that does not answers immediately with 404. */
+const CANCELLED_UNCONFIRMED_TIMEOUT_MS = 2_000;
+/** Attempts at committing an already-produced result before the record stops
+ *  being rewritten. See `unavailable()`. */
+const COMMIT_RETRY_LIMIT = 5;
 class RecordedRunnerFailure extends Error {}
 
 /**
@@ -340,7 +348,8 @@ export class ShellExecutions {
   private async scanPending(runnerId?: string, force = false): Promise<void> {
     if (this.closed || !this.recovery) return;
     const rows = this.db.prepare(`SELECT record FROM shell_executions
-      WHERE json_extract(record, '$.provenance') != 'committed' AND (json_type(record, '$.originalExecutionContext') = 'object' OR json_type(record, '$.recoveryContext.permissionEpoch') = 'object')
+      WHERE json_extract(record, '$.provenance') != 'committed' AND json_extract(record, '$.state') = 'unknown'
+      AND (json_type(record, '$.originalExecutionContext') = 'object' OR json_type(record, '$.recoveryContext.permissionEpoch') = 'object')
       AND (? IS NULL OR json_extract(record, '$.runnerId') = ?)
       AND (? OR coalesce(json_extract(record, '$.observation.lastError.retryable'), 1) != 0)
       AND (? OR coalesce(json_extract(record, '$.observation.nextRetryAt'), '') <= ?)
@@ -376,6 +385,21 @@ export class ShellExecutions {
     if (value.receipt) { execution.receipt = value.receipt; execution.expectedRunnerInstanceId = value.receipt.runnerInstanceId; }
     if (value.evidence) execution.evidence = value.evidence;
     if (value.startedAt && !execution.startedAt) execution.startedAt = new Date().toISOString();
+    // A retry of a pinned, already-failed commit must not reopen the outcome for
+    // the duration of the attempt: the package carries `state`, so a projection
+    // read mid-attempt would see `running`/`pending` for a record whose outcome
+    // never changed (#1018 review F2). Receipts and evidence still advance; the
+    // verdict the export reads does not.
+    if (this.retryingPinnedCommit(execution)) {
+      execution.observation = {
+        ...execution.observation, status: "fresh", lastObservedAt: new Date().toISOString(),
+        lastRunnerState: value.state,
+        // The attempt counter survives, or the budget below can never run out.
+        failureCount: execution.observation?.failureCount ?? 0,
+      };
+      this.save(execution);
+      return;
+    }
     execution.observation = { status: "fresh", lastObservedAt: new Date().toISOString(), lastRunnerState: value.state, failureCount: 0, nextRetryAt: new Date(Date.now() + 1_000).toISOString() };
     execution.state = value.state === "queued" ? "queued" : value.state === "unknown" ? "unknown" : "running";
     execution.finalization = "pending";
@@ -383,6 +407,16 @@ export class ShellExecutions {
     delete execution.error;
     delete execution.finishedAt;
     this.save(execution);
+  }
+
+  /** True while a record is retrying a commit that has already failed once. Both
+   *  provenance commits are covered: an existing result pins `candidateResultRef`, a
+   *  terminal failure pins `candidateFailure`, and without the second term the failure
+   *  commit was reopened by every attempt and its budget could never run out. */
+  private retryingPinnedCommit(execution: Record): boolean {
+    return execution.finalization === "failed"
+      && Boolean(execution.candidateResultRef || execution.candidateFailure)
+      && execution.observation?.lastError?.code === "PROVENANCE_COMMIT_FAILED";
   }
 
   private assertTerminalEvidence(observed: ManagedExecution): void {
@@ -440,6 +474,15 @@ export class ShellExecutions {
       "PROCESS_STATE_UNVERIFIABLE", "RECOVERY_CONTEXT_UNAVAILABLE"].includes(code)
       && (httpStatus === undefined || httpStatus >= 500);
     const failureCount = (execution.observation?.failureCount ?? 0) + 1;
+    // A failed provenance commit is deterministic: the same bytes are committed
+    // again, so a storage problem either clears within a few attempts or never.
+    // Past this limit the retry only rewrites the ledger every few seconds,
+    // which kept a session's export revision moving forever (#1018). The record
+    // stays `unknown` and keeps blocking new work — an unconfirmed outcome is
+    // settled by an explicit cancel, not by a timeout — it just stops churning.
+    // `>=`, not `>`: the limit is a number of attempts, so the fifth exhausting
+    // attempt stops the loop and the message below names the same number.
+    const commitRetryExhausted = fallback === "PROVENANCE_COMMIT_FAILED" && failureCount >= COMMIT_RETRY_LIMIT;
     // Never retain arbitrary HTTP bodies, command arguments or authentication values.
     const transportCode = observationFailureChain(error).map(failure => failure.code)
       .find((value): value is string => typeof value === "string" && /^(?:E[A-Z0-9_]{1,30}|UND_ERR_[A-Z0-9_]+)$/.test(value));
@@ -451,15 +494,26 @@ export class ShellExecutions {
       : `${exhausted ? exhausted[0] : fallback === "PROVENANCE_COMMIT_FAILED"
         ? "Existing execution result could not be committed; retry uses the same result"
         : "Runner observation is unavailable; the original execution was not replayed"}${transportCode ? ` (${transportCode})` : ""}`;
-    execution.error = detail;
+    // Diagnosability without opening the redaction boundary this function
+    // documents above: only allowlisted identifiers are retained, never the
+    // message chain (which can wrap a Runner response body or a token).
+    const safeCause = transportCode ?? (error instanceof RecoveryError ? error.code : undefined);
+    // The stopped explanation has to land in `execution.error`: that is the field the
+    // panel renders (`AgentActivityPanel.tsx:99`), while `observation.lastError` is not
+    // read by any client. Churn-safe: the export projection takes `lastError.code`, and
+    // the stop happens once because nothing reschedules it afterwards.
+    const stopped = `${detail}. Retrying the commit stopped after ${COMMIT_RETRY_LIMIT} attempts; the result may still exist on the Runner. This workspace refuses new shell commands until this execution settles: restarting the local service retries the commit once, and cancel asks the Runner to stop it.`;
+    execution.error = commitRetryExhausted ? stopped : detail;
     execution.state = "unknown";
     execution.provenance = "unconfirmed";
     execution.finalization = fallback === "PROVENANCE_COMMIT_FAILED" ? "failed" : "pending";
     delete execution.finishedAt;
     execution.observation = { ...execution.observation, status: "blocked", failureCount,
-      ...(retryable ? { nextRetryAt: new Date(Date.now() + Math.min(1_000 * 2 ** Math.min(failureCount - 1, 6), 60_000)).toISOString() } : {}),
-      lastError: { code, message: detail, retryable, ...(httpStatus ? { httpStatus } : {}) } };
-    if (!retryable) delete execution.observation.nextRetryAt;
+      ...(retryable && !commitRetryExhausted ? { nextRetryAt: new Date(Date.now() + Math.min(1_000 * 2 ** Math.min(failureCount - 1, 6), 60_000)).toISOString() } : {}),
+      lastError: { code, message: commitRetryExhausted ? stopped : detail,
+        retryable: retryable && !commitRetryExhausted,
+        ...(safeCause && safeCause !== code ? { cause: safeCause } : {}), ...(httpStatus ? { httpStatus } : {}) } };
+    if (!retryable || commitRetryExhausted) delete execution.observation.nextRetryAt;
     this.save(execution);
   }
 
@@ -510,7 +564,13 @@ export class ShellExecutions {
   /** Observation and existing-result finalization only. This method cannot submit. */
   async reconcile(id: string, owner: ExecutionOwner, handlers = this.recovery, runner?: RunnerResolver, signal?: AbortSignal): Promise<AgentShellExecution> {
     let execution = this.record(id, owner);
-    if (execution.historical || execution.provenance === "committed" || this.active.has(id) || (!handlers && !runner) || this.closed) return this.get(id, owner);
+    // `finish()` is the only writer of `finalization: "committed"`, and a cancel
+    // settlement is deliberately left `provenance: "unconfirmed"`, so provenance alone
+    // does not identify it. Without this term the status read the workspace guard tells
+    // the agent to make (`get`/`wait` reconcile before reading) would push a settled
+    // record back to `unknown` and re-block the workspace — #1012 again.
+    if (execution.historical || execution.provenance === "committed" || execution.finalization === "committed"
+      || this.active.has(id) || (!handlers && !runner) || this.closed) return this.get(id, owner);
     if (!this.acquire(id)) return this.get(id, owner);
     const heartbeat = this.heartbeat(id);
     let following = false;
@@ -609,6 +669,35 @@ export class ShellExecutions {
     const args = agentId === undefined ? [sessionId] : [sessionId, agentId];
     return this.db.prepare(`SELECT record FROM shell_executions WHERE ${where} ORDER BY rowid`).all(...args)
       .map((row) => publicRecord(readRecord(String(row.record))));
+  }
+
+  /**
+   * The executions as the export revision should see them: only what a package
+   * would carry, never the retry bookkeeping.
+   *
+   * `snapshot()` includes `observation.nextRetryAt` and `failureCount`, which a
+   * rescheduled retry rewrites every few seconds while the session itself is
+   * unchanged. Hashing that made the revision move forever, so a session with
+   * one execution stuck in the commit-retry loop could never be exported
+   * (#1018). A real change — state, provenance, finalization, the error code or
+   * the committed result — still changes this projection.
+   */
+  revisionSnapshot(sessionId: string): Array<{
+    accepted: boolean; error: string | undefined; finalization: string | undefined;
+    finishedAt: string | undefined; id: string; provenance: string;
+    resultRef: unknown; startedAt: string | undefined; state: string;
+  }> {
+    return this.snapshot(sessionId).map((record) => ({
+      accepted: record.accepted,
+      error: (record.observation?.lastError as { code?: string } | undefined)?.code,
+      finalization: record.finalization,
+      finishedAt: record.finishedAt,
+      id: record.id,
+      provenance: record.provenance,
+      resultRef: record.resultRef,
+      startedAt: record.startedAt,
+      state: record.state,
+    }));
   }
 
   list(owner: ExecutionOwner): AgentShellExecution[] {
@@ -973,12 +1062,71 @@ export class ShellExecutions {
     return runner(execution.runnerId).shellExecutionLogs(id, owner, cursor, AbortSignal.timeout(RUNNER_REQUEST_TIMEOUT_MS));
   }
 
+  /**
+   * Cancel one execution.
+   *
+   * For an unconfirmed outcome (`state="unknown"`) the Runner call is
+   * best-effort: that execution may already be gone from the Runner's ledger,
+   * and a cancel that waits on a Runner which will never answer is what left the
+   * request line unfinished in #1012, with the project delete parked behind it
+   * until the adapter's read deadline. The caller asked to end this work, so the
+   * record settles as `cancelled` locally either way — otherwise the workspace
+   * guard keeps refusing every new command in it and the only recovery is
+   * restarting the stack.
+   *
+   * Only an explicit cancel settles an unknown record. The guard keeps its
+   * meaning for everyone who has not asked: work that never reported may still
+   * be running out there.
+   */
   async cancel(id: string, owner: ExecutionOwner, runner: (id: string) => RunnerClient): Promise<AgentShellExecution> {
-    const execution = this.record(id, owner);
+    let execution = this.record(id, owner);
     // Unknown after restart may still be running remotely; cancellation is safe, resubmission is not.
     if (!execution.historical && (!terminal(execution.state) || execution.state === "unknown")) {
-      await runner(execution.runnerId).cancelShellExecution(id, owner, AbortSignal.timeout(RUNNER_REQUEST_TIMEOUT_MS));
+      const unconfirmed = execution.state === "unknown";
+      try {
+        await runner(execution.runnerId).cancelShellExecution(id, owner,
+          AbortSignal.timeout(unconfirmed ? CANCELLED_UNCONFIRMED_TIMEOUT_MS : RUNNER_REQUEST_TIMEOUT_MS));
+      } catch (error) {
+        // A confirmed-running execution keeps failing loudly: the caller needs to
+        // know the Runner did not take the cancel. An unconfirmed one has no
+        // Runner answer to wait for, so the local settlement below is the answer.
+        if (!unconfirmed) throw error;
+        this.log.warn("shell_execution_cancel_unconfirmed", {
+          ...correlation(execution), failure: errorDetail(error), state: execution.state,
+        });
+      }
+      if (unconfirmed) this.settleCancelled(id, owner, execution);
     }
     return this.get(id, owner);
+  }
+
+  /** Settle a record the caller cancelled although its outcome was never confirmed.
+   *
+   *  An observer write can land while the Runner call above is pending — `reconcile`
+   *  runs before every `execution_status` and `wait`, and each of those rewrites an
+   *  `unknown` record — so `finish`'s revision CAS can come back `STALE_OBSERVER`.
+   *  Cancelling is idempotent, so re-read and repeat instead of answering 500 and
+   *  settling nothing: this is the one action the whole change exists to make
+   *  reliable, and the race is the normal shape of the #1012 flow rather than an
+   *  exotic one. */
+  private settleCancelled(id: string, owner: ExecutionOwner, start: Record): void {
+    let execution = start;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const reason = execution.error ?? "the outcome was never confirmed";
+      try {
+        this.finish(execution, {
+          error: `Cancelled before the Runner confirmed the outcome; it may have run. (${reason})`,
+          provenance: "unconfirmed",
+          state: "cancelled",
+        });
+        return;
+      } catch (error) {
+        if (!(error instanceof RecoveryError) || error.code !== "STALE_OBSERVER" || attempt === 2) throw error;
+        execution = this.record(id, owner);
+        // Another writer reached a final verdict first; the caller wanted this
+        // execution stopped and it is settled, so accept what is stored.
+        if (execution.finalization === "committed" && terminal(execution.state)) return;
+      }
+    }
   }
 }

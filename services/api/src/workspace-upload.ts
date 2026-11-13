@@ -16,7 +16,7 @@ import { access, lstat, mkdir, readdir, readFile, rename, rm, stat, writeFile } 
 import type { IncomingMessage } from "node:http";
 import { basename, dirname, extname, relative, resolve, sep } from "node:path";
 
-import { resolveWorkspaceFile } from "@sciencediscovery/workspace";
+import { isWindowsReservedDeviceName, resolveWorkspaceFile } from "@sciencediscovery/workspace";
 import { sha256, sha256File } from "@sciencediscovery/cas";
 import type { WorkspaceFile } from "@sciencediscovery/schema";
 
@@ -90,6 +90,12 @@ export function sanitizeUploadFilename(filename: string): string {
   const base = basename(normalized);
   if (!base || base === "." || base === "..") {
     throw Object.assign(new Error("Upload filename is missing or invalid"), { code: "INVALID_UPLOAD_PATH" });
+  }
+  if (isWindowsReservedDeviceName(base)) {
+    throw Object.assign(
+      new Error(`Upload filename "${base}" is a reserved device name on Windows; rename the file before uploading`),
+      { code: "INVALID_UPLOAD_PATH" },
+    );
   }
   return base;
 }

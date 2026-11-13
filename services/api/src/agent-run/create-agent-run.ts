@@ -49,6 +49,10 @@ export interface AgentRunHandle {
   abort(): void;
   beginExternalWait(): () => void;
   execute(): Promise<AgentRunResult>;
+  /** The turn bound the executor actually enforced, when it can name one. A
+   *  native loop reports its composed bound; an external runtime cannot, so the
+   *  caller keeps the configured value there (#1113 review). */
+  readonly enforcedMaxModelTurns?: number;
 }
 
 /** The native loop, unless the deployment selected the JiuwenSwarm executor. */
@@ -92,6 +96,9 @@ export function createAgentRun(
     ...(bindings.runIdleTimeoutMs !== undefined
       ? { runIdleTimeoutMs: bindings.runIdleTimeoutMs }
       : {}),
+    // The child's declared budget now reaches the loop; the engine clamps it to
+    // its own ceiling and reports the effective bound (#1106).
+    maxModelTurns: profile.budget.maxModelTurns,
     runTimeoutMs: profile.budget.runTimeoutMs,
     ...(input.runContract ? { runContract: input.runContract } : {}),
     ...(bindings.suspendAfterTurn ? { suspendAfterTurn: bindings.suspendAfterTurn } : {}),
@@ -104,9 +111,17 @@ export function createAgentRun(
     },
     workspaceRoot: profile.workspaceRoot,
   });
+  // Both backends report one `model_usage` per model turn and then one
+  // whole-loop `usage` summary. A run observer sums every `model_usage` it
+  // receives, so forwarding that summary as another `model_usage` counted each
+  // turn twice (#1109). Forward it only when the backend reported no per-turn
+  // figure at all, which keeps such a backend's total and nothing more.
+  let sawTurnUsage = false;
   const unsubscribe = bindings.observer ? agent.subscribe((event) => {
-    // Run observers retain one invocation record. The final summary is the whole loop, not its last call.
-    if (event.type === "usage") bindings.observer!({ ...event, type: "model_usage", usageReported: true });
+    if (event.type === "model_usage") sawTurnUsage = true;
+    if (event.type === "usage" && !sawTurnUsage) {
+      bindings.observer!({ ...event, type: "model_usage", usageReported: true });
+    }
     bindings.observer!(event);
   }) : () => undefined;
   const abort = () => agent.abort();
@@ -117,6 +132,14 @@ export function createAgentRun(
   return {
     abort,
     beginExternalWait: () => agent.beginExternalWait(),
+    // Read the bound from the executor every time instead of snapshotting it
+    // here: a specialist whose external runtime reports itself unavailable only
+    // builds its native fallback inside `execute()`, so a value captured at this
+    // point would be missing for exactly the path that enforces the ceiling
+    // (#1113 review).
+    get enforcedMaxModelTurns() {
+      return (agent as NativeAgentHandle).enforcedMaxModelTurns;
+    },
     async execute() {
       if (executed) throw new Error(`AgentRun ${input.agentRunId} has already been executed`);
       executed = true;

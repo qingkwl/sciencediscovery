@@ -38,16 +38,16 @@ import { createWorkspaceExecutionBindings } from "./workspace-bindings.js";
 for (const scenario of [
   { name: "missing shell utilities", sandbox: "none", ready: false, reason: "dependency-unavailable",
     shell: { available: false, name: "bash", utilities: [], unavailableReason: "Managed Bash is missing required utilities: head" },
-    expected: /Managed Bash is missing required utilities: head.*Recreate or update the starter environment/ },
+    expected: /Recreate or update the starter environment on the target Runner/ },
   { name: "ready Runner with unavailable shell", sandbox: "none", ready: true, reason: "ready",
     shell: { available: false, name: "bash", utilities: [], unavailableReason: "Managed Bash is missing required utilities: head" },
-    expected: /Managed Bash is missing required utilities: head.*Recreate or update the starter environment/ },
+    expected: /Recreate or update the starter environment on the target Runner/ },
   { name: "missing managed Bash", sandbox: "none", ready: false, reason: "dependency-unavailable",
     shell: { available: false, name: "bash", utilities: [], unavailableReason: "Managed Bash is unavailable: ENOENT" },
-    expected: /Managed Bash is unavailable: ENOENT.*Recreate or update the starter environment/ },
+    expected: /Recreate or update the starter environment on the target Runner/ },
   { name: "shell failure without detail", sandbox: "none", ready: false, reason: "dependency-unavailable",
     shell: { available: false, name: "bash", utilities: [] },
-    expected: /The managed shell environment is unavailable.*Recreate or update the starter environment/ },
+    expected: /Recreate or update the starter environment on the target Runner/ },
   { name: "missing sandbox executable", sandbox: "bubblewrap", ready: false, reason: "dependency-unavailable",
     expected: /Install or repair the sandbox executable/ },
   { name: "unusable sandbox with available shell", sandbox: "bubblewrap", ready: false, reason: "sandbox-unusable",
@@ -90,6 +90,80 @@ for (const scenario of [
   });
 }
 
+  test("check_runner names the route instead of a green light over a dead Shell", async t => {
+    // The tool-facing binding is what a model reads, so this goes through
+    // `runnerReadiness.check` rather than `checkRunner`: the default it hard-codes
+    // is exactly what used to hide the Shell route (#1108 criterion 5).
+    const queue = new ExecutionBlocks();
+    t.after(() => queue.close());
+    const capability: RunnerExecutionCapability = {
+      instanceId: "runner", checkedAt: new Date().toISOString(), sandbox: "none",
+      dependencyAvailable: true, sandboxUsable: false, ready: true, reason: "shell-unavailable",
+      readyFor: { python: true, shell: false },
+      detail: "Managed Bash is missing required utilities: head",
+      shell: { available: false, name: "bash", utilities: [], unavailableReason: "Managed Bash is missing required utilities: head" },
+    };
+    const bindings = createWorkspaceExecutionBindings({
+      agentId: "main", executionId: "run", sessionId: "s", workspaceRoot: "/workspace", permissionScopeLabel: "test",
+      runnerClient: { executionCapability: async () => capability } as RunnerClient,
+      permission: {} as AgentPermissionRuntime,
+      provenanceRecorder: {} as ProvenanceRecorder,
+      store: { executionBlocks: queue, assertSessionWritable() {}, assertSessionAllowsRunner() {} } as unknown as SessionStore,
+    });
+    const result = await bindings.runnerReadiness!.check("local");
+    // The model-visible object names the routes, so `python: true` cannot be read
+    // as "my Shell call will run" (#1108 criteria 1 and 2).
+    assert.deepEqual(result.readyFor, { python: true, shell: false });
+    assert.deepEqual(result.capability?.readyFor, { python: true, shell: false });
+    assert.equal(result.capability?.reason, "shell-unavailable");
+    // The tool binding takes no route argument — that is why the verdict has to
+    // be structural: a Shell caller reading this same object finds
+    // `readyFor.shell === false` without having to ask a different question.
+    assert.equal(bindings.runnerReadiness!.check.length, 2, "the tool surface cannot be told which route it is asking about");
+    const visible = JSON.stringify(result);
+    assert.match(visible, /"readyFor":\{"python":true,"shell":false\}/);
+    assert.doesNotMatch(visible, /"reason":"ready"/);
+    // The provisioning transcript is carried once, bounded by the Runner, and not
+    // repeated into the advice (#1108 criterion 8).
+    assert.doesNotMatch(result.suggestions.join(" "), /Managed Bash is/);
+  });
+
+  test("a Shell refusal on a sandboxed Runner reports the sandbox, not a Shell gap", async t => {
+    // `readyFor.shell` is false here because the sandbox is unusable, and an
+    // absent `shell` field must not be described as a dead managed Shell
+    // (#1118 review 1).
+    const queue = new ExecutionBlocks();
+    t.after(() => queue.close());
+    const capability: RunnerExecutionCapability = {
+      instanceId: "runner", checkedAt: new Date().toISOString(), sandbox: "bubblewrap",
+      dependencyAvailable: true, sandboxUsable: false, ready: false, reason: "sandbox-unusable",
+      readyFor: { python: false, shell: false },
+      detail: "bubblewrap cannot create a user namespace here",
+    };
+    const bindings = createWorkspaceExecutionBindings({
+      agentId: "main", executionId: "run", sessionId: "s", workspaceRoot: "/workspace", permissionScopeLabel: "test",
+      runnerClient: { executionCapability: async () => capability } as RunnerClient,
+      permission: { requirePrivilege: async () => ({ outcome: "allowed" }) } as unknown as AgentPermissionRuntime,
+      provenanceRecorder: {} as ProvenanceRecorder,
+      store: { executionBlocks: queue, assertSessionWritable() {}, assertSessionAllowsRunner() {} } as unknown as SessionStore,
+    });
+    const shell = await bindings.runnerReadiness!.check("local");
+    assert.deepEqual(shell.readyFor, { python: false, shell: false });
+    assert.match(shell.reason, /bubblewrap cannot create a user namespace here/);
+    assert.doesNotMatch(shell.reason, /managed Shell environment is unavailable/);
+    assert.match(shell.suggestions[0] ?? "", /Inspect the target Runner logs and host\/container sandbox permissions/);
+    // `check` leaves `requiresShell` false, so it cannot pin the clause that
+    // decides a Shell refusal's reason. Drive the Shell route as well: this is
+    // the answer a model gets from `run_shell` on the same capability (#1118
+    // review 2, F1).
+    await assert.rejects(bindings.executeShell!("echo hi", "ephemeral"), (error: Error) => {
+      const refusal = (error as unknown as { result: { runner: { reason: string } } }).result;
+      assert.equal(error.name, "RunnerUnavailableError");
+      assert.match(refusal.runner.reason, /bubblewrap cannot create a user namespace here/);
+      assert.doesNotMatch(refusal.runner.reason, /managed Shell environment is unavailable/i);
+      return true;
+    });
+  });
 for (const action of ["retry", "cancel", "switch"] as const) {
   test(`execution readiness ${action} is pre-dispatch and releases the external wait`, async t => {
     const dataDir = await mkdtemp(resolve(tmpdir(), "binding-readiness-"));
@@ -182,6 +256,8 @@ test("an explicitly unavailable managed Shell blocks run_shell before any execut
     assert.equal(result.runner.ready, false);
     assert.equal(result.runner.reason, unavailableReason);
     assert.match(result.instruction, /no Shell execution record was created/);
+    assert.match(result.instruction, /independent Python execution channel is unaffected/);
+    assert.match(result.instruction, /python -c through run_shell still requires Bash/);
     return true;
   });
   assert.equal(f.shellDispatches.length, 0, "no Shell execution is recorded or dispatched");

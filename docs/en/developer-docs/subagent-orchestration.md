@@ -38,7 +38,7 @@ The main first-user input and each child's delegated prompt/Brief/handoff are in
 
 ## 4. Result contract
 
-`task` returns status/stop reason, token usage, model name, a short result brief and SHA256, validation, and validated/raw structured results. With `outputJsonSchema`, the server validates the last non-empty assistant output as one JSON object. Failure marks the child failed rather than treating invalid content as normal structured output.
+`task` returns status/stop reason, token usage, model name, the child's delivered final text (`finalText`) and its SHA256, validation, and validated/raw structured results. With `outputJsonSchema`, the server validates the last non-empty assistant output as one JSON object. Failure marks the child failed rather than treating invalid content as normal structured output.
 
 ### 4.1 Subagent Brief v1 contract
 
@@ -85,3 +85,5 @@ Native task dispatch owns the task catalog whether the executor is the native lo
 Task directory entries contain immutable `SubagentAuthority` references rather than inline transcripts. Each reference preserves the complete task record at capture time, including its continuation context reference. Unchanged catalog objects reuse their reference; updating a task or its Brief creates a new revision. UI and native task APIs continue to read full records from the catalog. Existing snapshots remain readable; no persisted catalog migration is required.
 
 This isolates snapshot contents, not model prompts or authorization policy. State Pool closure validation still checks referenced objects, including continuation history. Historical closure traversal and duplication of other shared resource snapshots remain separate performance work; this change alone does not establish an end-to-end timeout fix.
+
+`finalText` means **the child's last contiguous run of assistant output**: the streaming runtime splits one answer across adjacent assistant steps and those adjacent fragments are merged, while earlier content separated from it by a tool step is not delivered. A child that needs its whole output to reach the parent must close the answer itself, or the parent reads the full text through `subagent_result_ref`, which is published only when the body was cut.

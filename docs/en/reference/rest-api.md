@@ -31,7 +31,13 @@ This page records the key HTTP interfaces used by the current Web UI, based on `
 curl -fsS http://127.0.0.1:4310/health
 ```
 
-A successful response is `200` and includes:
+Without a valid bearer token, `/health` and `/api/health` return HTTP `200` with only `{"service":"sciencediscovery-api","liveness":"ok"}`. The Runner returns only `{"status":"ok"}`. These public responses report liveness and do not probe dependencies. The public API body carries `liveness`, never `status`: `status` in the authenticated body is derived from the Runner, so a reader that gates on `status: "ok"` can only be reading a detail it was authorized to see.
+
+With a valid token, the API returns the deployment details below:
+
+```bash
+curl -fsS -H "authorization: Bearer $TOKEN" http://127.0.0.1:4310/health
+```
 
 ```json
 {
@@ -163,11 +169,14 @@ All routes below require bearer authentication. See [Configure the network proxy
 |---|---|---|
 | `GET /api/proxy/settings` | none | `200`, `{defaultPolicy, servers}`; authenticated settings include usable full proxy URLs |
 | `PUT /api/proxy/settings` | `{"defaultPolicy":"none"}` or `proxy:<id>` | `200`, updated settings |
+| `POST /api/proxy/test` | `{mode: "environment" \| "direct" \| "url", url?, noProxy?}` | Download-source connectivity diagnostic; does not save settings |
 | `POST /api/proxy/servers` | `{name, kind, url?}` | `201`, created proxy |
 | `PUT /api/proxy/servers/:id` | `{name?, kind?, url?}` | `200`, updated proxy |
 | `DELETE /api/proxy/servers/:id` | none | `200`, `{"deleted":"<id>"}`; `409` while referenced |
 | `GET /api/mcp/proxy-policies` | none | `200`, `{"policies":{...}}` |
 | `PUT /api/mcp/proxy-policies` | `{"policies":{"server-id":"inherit|none|proxy:<id>"}}` | `200`, normalized map |
+
+`GET/PUT /api/proxy/settings` also supports optional `noProxy` (comma-separated bypass hosts); an empty value clears the stored list, so the process environment's `NO_PROXY` applies again. Environment summaries mask proxy credentials.
 
 `kind` is `custom_url`, `environment`, or `system`; `custom_url` requires `url`:
 

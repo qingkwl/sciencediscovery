@@ -17,7 +17,9 @@ import { createIdeaResearchClient } from "../idea-tree/research.js";
 import { resolve } from "node:path";
 
 import { McpSourceCatalog, type McpTransportClient } from "@sciencediscovery/data-source";
+import { SourceOutages } from "@sciencediscovery/data-source";
 import { RemoteComputeClient } from "@sciencediscovery/executor";
+import { isLoopback } from "@sciencediscovery/network";
 import { createIdeaTreeAuthorityRegistry, type IdeaTreePersistence } from "@sciencediscovery/idea-tree";
 import { ideaTreeRepositoryForSession } from "../idea-tree/python-client.js";
 import { createMcpSourceRegistry } from "@sciencediscovery/mcp-sources";
@@ -53,7 +55,8 @@ import { describeEvolveBudget } from "../evolution/call-budget.js";
 import { endpointCanDisableThinking } from "../evolution/model-thinking.js";
 import { startProposedRun, summariseRun } from "../evolution/proposal.js";
 import { stopEvolveRunForSession } from "../evolution/stop-run.js";
-import { latestEvolveCommandApprovesUnisolated } from "@sciencediscovery/evolve";
+import { readEvolveDirection } from "@sciencediscovery/schema";
+import { isEvolveCommand, evolveCommandApprovesUnisolated } from "@sciencediscovery/evolve";
 import type { EvolveRuntimeFactory } from "../runs/index.js";
 import { ensureConnectorContinuation, publishApprovalModeChange, recoverSessionRuns, scheduleSessionRuns } from "../runs/index.js";
 import { seedSampleSession } from "../sample-session/index.js";
@@ -155,7 +158,7 @@ export function createPlatformServices(
     uploadMaxRequestBytes: config.workspaceUpload.maxRequestBytes,
   }, config.memoryGraph.neo4jPassword, config.memoryGraph.available !== false);
   const skillCatalog = new SkillCatalog(config.dataDir, repositoryRoot);
-  const runnerClient = new RunnerClient(config.runnerUrl, config.runnerToken);
+  const runnerClient = new RunnerClient(config.runnerUrl, config.runnerToken, () => store.resolveProxy());
   // Execution router: registry + capability probing (reuses the runner's
   // /execution-capability and /health, no new wire format). Providers B/C are
   // stubs at this stage; refresh re-probes via POST /api/execution-provider.
@@ -242,7 +245,10 @@ export function createPlatformServices(
     }
     return map;
   };
-  const mcpCatalog = new McpSourceCatalog(mcpRegistry, mcpGateway, mcpProxyMap, (catalog) => customMcpServers.applyCatalog(catalog));
+    // One instance for both sides: the broker records an outage and the catalog
+  // reports it in `getStatus`, so they must not fall back to two defaults.
+  const mcpSourceOutages = new SourceOutages();
+  const mcpCatalog = new McpSourceCatalog(mcpRegistry, mcpGateway, mcpProxyMap, (catalog) => customMcpServers.applyCatalog(catalog), mcpSourceOutages);
   // WebBroker mirrors successful web_search / web_fetch to the graph (WebPage
   // nodes by URL); the registry's ``toolGraphType(...)`` gates the emit. The
   // sink is the same instance used by the MCP broker — fire-and-forget in
@@ -254,7 +260,7 @@ export function createPlatformServices(
     mcpRegistry,
     mcpCatalog,
     mcpGateway,
-    { memoryGraphSink },
+    { memoryGraphSink, outages: mcpSourceOutages },
   );
   const paperService = new PaperService(store, config.paperPythonPath, config.paperWorkerPath);
   const artifactManager = new GovernedDownloadManager(
@@ -405,9 +411,6 @@ export function createPlatformServices(
    *  `/evolve-design` inherits nothing from an earlier approval. A checkpoint
    *  answer does not move the anchor — it is not a command — so the design
    *  this run belongs to is still the latest one there. */
-  const userApprovedUnisolated = async (sessionId: string) =>
-    latestEvolveCommandApprovesUnisolated(await store.readMessages(sessionId));
-
   const casHasEvolve = async (hash: string) => {
     try {
       await evolveCas.read(hash);
@@ -451,8 +454,18 @@ export function createPlatformServices(
       // it. Accept it only when the session's own `/evolve-design` command
       // carried `--allow-direct`; otherwise drop it and let pre-flight's
       // `unisolated_run_unconfirmed` refusal say what is missing.
+      const messages = await store.readMessages(turn.sessionId);
+      const command = messages.findLast(message => message.role === "user" && isEvolveCommand(message.content));
+      const direction = command ? readEvolveDirection(command.content) : undefined;
+      if (direction === "invalid") return { refusedBecause: "The user-selected JSON or field list is invalid. Reopen the Evolve direction card to confirm it again." };
+      if (direction && input.mode === "test_gate") {
+        return { refusedBecause: "The user selected a JSON baseline. Choose a scoring mode that evaluates it as the candidate." };
+      }
+      const proposal = direction ? {
+        ...input, startingPointPath: undefined, startingPointText: direction.baseline, editableFields: direction.editable,
+      } : input;
       const requested = input.allowUnisolated === true;
-      const approvedUnisolated = requested && await userApprovedUnisolated(turn.sessionId);
+      const approvedUnisolated = requested && command !== undefined && evolveCommandApprovesUnisolated(command.content);
       if (requested && !approvedUnisolated) {
         apiLog.warn("evolve_unisolated_not_confirmed", { sessionId: turn.sessionId });
       }
@@ -464,7 +477,7 @@ export function createPlatformServices(
       // permission prompt gets, for the same reason — the wait is real work.
       const releaseWait = turn.beginExternalWait?.();
       try {
-        const result = await startProposedRun(input, {
+        const result = await startProposedRun(proposal, {
           approvedUnisolated,
           // The create path refuses a second search while one is live. The
           // tool's description asks the agent to stop the running one first;
@@ -476,6 +489,12 @@ export function createPlatformServices(
           model: (id: string) => store.getModel(id),
           modelId: turn.modelId,
           orchestrator: evolveOrchestrator,
+          // The same store, read back: an evaluator handed in as a path is
+          // checked as the bytes the run will execute, not as the path it came
+          // from. `evolveCas` reaches both the agent-state pool the content
+          // writes land in and the workspace pool a `store({path})` ref names.
+          readText: async (hash: string) =>
+            (await evolveCas.read(hash.replace(/^sha256:/, ""))).toString("utf8"),
           sessionId: turn.sessionId,
           thinking: turn.thinkingMode ?? "auto",
           thinkingEffort: turn.thinkingEffort,
@@ -584,6 +603,16 @@ export function createPlatformServices(
         // provisioner themselves; this installation keeps one per architecture
         // and hands it over when it deploys their Runner.
         provisionerCacheDir: resolve(config.dataDir, "provisioners"),
+        // The Runner cannot reach a proxy that lives on this machine only: forwarded as-is
+        // it would aim every outbound request at itself. A loopback proxy stays local to
+        // the API process and the remote Runner keeps its own environment instead.
+        environmentProxy: () => {
+          const proxy = store.resolveProxy();
+          if (proxy.mode === "url" && isLoopback(proxy.url)) {
+            throw new Error("The global proxy uses localhost on this machine and cannot be forwarded to a remote Runner. Point the proxy at an address the remote machine can reach, or choose environment mode so the Runner uses its own proxy settings.");
+          }
+          return proxy;
+        },
       },
     ),
     runnerClient,

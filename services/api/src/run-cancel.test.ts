@@ -268,6 +268,86 @@ function startUsageGateway(context: TestContext): Promise<{ origin: string; runC
   });
 }
 
+/** Two model turns: a tool call, then the final answer. */
+function startMultiTurnUsageGateway(context: TestContext): Promise<{ origin: string; runCount: () => number }> {
+  let runCount = 0;
+  const server = createHttpServer((request, response) => {
+    if (request.url === "/chat/completions" && request.method === "POST") {
+      runCount += 1;
+      const turn = runCount;
+      request.resume();
+      request.on("end", () => {
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        if (turn === 1) {
+          writeSseEvent(response, {
+            choices: [{ delta: { tool_calls: [{ index: 0, id: "call-read", type: "function", function: { name: "read_file", arguments: JSON.stringify({ path: "absent.txt" }) } }] } }],
+          });
+          writeSseEvent(response, { choices: [], usage: { prompt_tokens: 7, completion_tokens: 3, total_tokens: 10 } });
+          writeSseEvent(response, { choices: [{ delta: {}, finish_reason: "tool_calls" }] });
+        } else {
+          writeSseEvent(response, { choices: [{ delta: { content: "Done" } }] });
+          writeSseEvent(response, { choices: [], usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 } });
+          writeSseEvent(response, { choices: [{ delta: {}, finish_reason: "stop" }] });
+        }
+        response.write("data: [DONE]\n\n");
+        response.end();
+      });
+      return;
+    }
+    response.writeHead(404).end();
+  });
+  context.after(() => new Promise<void>((done) => {
+    server.close(() => done());
+    server.closeAllConnections();
+  }));
+  return new Promise((ready) => {
+    server.listen(0, "127.0.0.1", () => ready({
+      origin: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+      runCount: () => runCount,
+    }));
+  });
+}
+
+/** Delegates one task on the first turn, then answers. */
+function startDelegatedUsageGateway(context: TestContext): Promise<{ origin: string; runCount: () => number }> {
+  let runCount = 0;
+  const server = createHttpServer((request, response) => {
+    if (request.url === "/chat/completions" && request.method === "POST") {
+      runCount += 1;
+      const turn = runCount;
+      request.resume();
+      request.on("end", () => {
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        if (turn === 1) {
+          writeSseEvent(response, {
+            choices: [{ delta: { tool_calls: [{ index: 0, id: "call-task", type: "function", function: { name: "task", arguments: JSON.stringify({ description: "Check the workspace", prompt: "Reply with the word done and nothing else." }) } }] } }],
+          });
+          writeSseEvent(response, { choices: [], usage: { prompt_tokens: 7, completion_tokens: 3, total_tokens: 10 } });
+          writeSseEvent(response, { choices: [{ delta: {}, finish_reason: "tool_calls" }] });
+        } else {
+          writeSseEvent(response, { choices: [{ delta: { content: "Done" } }] });
+          writeSseEvent(response, { choices: [], usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 } });
+          writeSseEvent(response, { choices: [{ delta: {}, finish_reason: "stop" }] });
+        }
+        response.write("data: [DONE]\n\n");
+        response.end();
+      });
+      return;
+    }
+    response.writeHead(404).end();
+  });
+  context.after(() => new Promise<void>((done) => {
+    server.close(() => done());
+    server.closeAllConnections();
+  }));
+  return new Promise((ready) => {
+    server.listen(0, "127.0.0.1", () => ready({
+      origin: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+      runCount: () => runCount,
+    }));
+  });
+}
+
 /** Only `/health` is reached in these tests; no Runner execution is started. */
 function startStubRunner(context: TestContext): Promise<string> {
   const server = createHttpServer((request, response) => {
@@ -460,10 +540,18 @@ async function waitForGatewayTurn(api: TestApi, expected: number): Promise<void>
   assert.equal(api.gatewayRunCount(), expected, "the agent turn reached the gateway and hung there");
 }
 
+/**
+ * Poll until the run reports `status`, at most `attempts` times 25ms.
+ *
+ * The 200-attempt default is 5s, sized for the built-in loop's in-process model call. A run that
+ * delegates to a `task` child under the real JiuwenSwarm adapter pays for the child's own model turn
+ * on top of the parent's, so the delegated case below passes a swarm-sized budget.
+ */
 async function waitForRunStatus(
   api: TestApi, sessionId: string, runId: string, status: SessionRun["status"], requireReplay = false,
+  attempts = 200,
 ): Promise<SessionRun> {
-  for (let attempt = 0; attempt < 200; attempt += 1) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
     const run = (await listRuns(api, sessionId)).find((candidate) => candidate.id === runId);
     if (run?.status === status) {
       if (!requireReplay) return run;
@@ -554,10 +642,78 @@ test("GET session usage reports gateway token usage for a completed run", { tags
   const usage = await getUsage(api, sessionId);
   assert.equal(usage.sessionId, sessionId);
   assert.equal(usage.totals.invocationCount, 1);
+  // One row per invocation, holding that invocation's spend (#1109). This
+  // gateway answers with `finish_reason: "stop"` and no tool call, so the run is
+  // a single model turn: the row is that turn's 7/3/10, not the whole-loop
+  // summary counted on top of it.
   assert.equal(usage.totals.inputTokens, 7);
   assert.equal(usage.totals.outputTokens, 3);
   assert.equal(usage.totals.totalTokens, 10);
   assert.equal(usage.totals.unreportedInvocationCount, 0);
+  assert.equal(usage.invocations[0]?.turnsRecorded, 1);
+});
+
+test("a multi-turn run's usage row is the sum of its turns", { tags: ["swarm:required"] }, async (context) => {
+  const api = await startApi(context, "usage-multi-turn", startMultiTurnUsageGateway);
+  const sessionId = await createSession(api, "Usage multi turn");
+
+  // The first turn calls a tool and the second answers, so the loop reports
+  // 7/3/10 and then 5/2/7, two reported turns, summed to 12/5/17 once.
+  const run = await createRun(api, sessionId, "Measure a multi-turn run");
+  await waitForRunStatus(api, sessionId, run.id, "completed");
+  assert.equal(api.gatewayRunCount(), 2, "the run took two model turns");
+
+  const usage = await getUsage(api, sessionId);
+  assert.equal(usage.totals.invocationCount, 1);
+  assert.equal(usage.totals.inputTokens, 12);
+  assert.equal(usage.totals.outputTokens, 5);
+  assert.equal(usage.totals.totalTokens, 17);
+  assert.equal(usage.totals.reportedInvocationCount, 1);
+  assert.equal(usage.invocations[0]?.turnsRecorded, 2);
+});
+
+// A delegated run is the only one here that pays for a whole extra agent turn, and under the real
+// JiuwenSwarm adapter the shared 200-attempt (5 s) status poll is not enough: in the merge queue (run
+// 43170129650, group-551, backend jiuwenswarm) the parent was still `running` when those 5 s expired,
+// the file's suite failed on that assertion, and the worker never exited, so the group was killed at
+// its 600 s WORKER_TIMEOUT. The case does pass tagged when it has the time: PR #1119's UT job (run
+// 43162635488, group-549, backend jiuwenswarm) ran this file 11/11 in 48.7 s. So the fix is a budget
+// sized for a delegated turn, not a weaker gate: the case keeps `swarm:required` and takes the 90 s
+// poll below. JiuwenSwarm 0.2.6's documented nested-`task` stall (gap 10,
+// `docs/en/reference/jiuwenswarm-migration-status.md`; `services/api/src/server.test.ts:192`) can still
+// exceed that, so the poll can still fail; the `finally` cancel below then stops the run instead of
+// leaving it `running` (it keeps its old 5 s wait, so a failure path adds no budget here).
+test("a delegated child writes exactly one delegation-track usage row", { tags: ["swarm:required"] }, async (context) => {
+  const api = await startApi(context, "usage-delegated", startDelegatedUsageGateway);
+  const sessionId = await createSession(api, "Usage delegated");
+
+  // Swarm-sized only for this case: the delegated child's extra turn is what the 5 s default misses.
+  const statusAttempts = onJiuwenSwarm ? 3_600 : 200;
+
+  const run = await createRun(api, sessionId, "Delegate one task");
+  try {
+    await waitForRunStatus(api, sessionId, run.id, "completed", true, statusAttempts);
+
+    // Delegated spend belongs to the same run but a different invocation, so the
+    // child's 5/2/7 is one `delegation-track` row of its own (#1109). The parent
+    // row keeps the parent's two turns (7/3/10 + 5/2/7).
+    const usage = await getUsage(api, sessionId);
+    const delegated = usage.invocations.filter((invocation) => invocation.invocationKind === "delegation-track");
+    assert.equal(delegated.length, 1);
+    assert.equal(delegated[0]?.runId, run.id);
+    assert.equal(delegated[0]?.totalTokens, 7);
+    assert.equal(delegated[0]?.turnsRecorded, 1);
+    const parent = usage.invocations.find((invocation) => invocation.invocationKind === "task");
+    assert.equal(parent?.totalTokens, 17);
+    assert.equal(parent?.turnsRecorded, 2);
+    assert.equal(usage.totals.invocationCount, 2);
+  } finally {
+    const current = (await listRuns(api, sessionId)).find((candidate) => candidate.id === run.id);
+    if (current && ["queued", "running", "blocked"].includes(current.status)) {
+      await cancelRunById(api, sessionId, run.id);
+      await waitForRunStatus(api, sessionId, run.id, "cancelled", true);
+    }
+  }
 });
 
 test("cancelling a blocked run preserves reported model usage", { tags: ["swarm:required"] }, async (context) => {

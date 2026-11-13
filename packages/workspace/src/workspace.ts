@@ -135,6 +135,11 @@ function shellExecutionModelView(execution: Pick<AgentShellExecution,
       exitCode: result.exitCode,
       ...(result.stdout !== undefined ? { stdout: result.stdout } : {}),
       ...(result.stderr !== undefined ? { stderr: result.stderr } : {}),
+      ...(result.diagnostic ? { diagnostic: {
+        code: result.diagnostic.code,
+        command: result.diagnostic.command,
+        instruction: result.diagnostic.instruction,
+      } } : {}),
       ...(result.createdFiles !== undefined ? { createdFiles: result.createdFiles } : {}),
       ...(result.modifiedFiles !== undefined ? { modifiedFiles: result.modifiedFiles } : {}),
       ...(result.networkDeniedHosts?.length ? { networkDeniedHosts: result.networkDeniedHosts } : {}),
@@ -292,8 +297,7 @@ export function subagentFinalText(subagent: Pick<Subagent, "steps">): string | u
   return text || undefined;
 }
 
-function summarizeSubagentResult(subagent: Subagent): {
-  brief?: string;
+async function summarizeSubagentResult(subagent: Subagent, saveSubagentResult?: WorkspaceToolOptions["saveSubagentResult"]): Promise<{
   error?: string;
   finalText?: string;
   id: string;
@@ -304,8 +308,19 @@ function summarizeSubagentResult(subagent: Subagent): {
   structuredResult?: unknown;
   subagent_error?: string;
   subagent_model_name?: string;
-  subagent_result_brief?: string;
+  /** Present only when the child's final output did not fit. Without it a
+   *  caller had no way to tell a full handoff from a cut one (#1107). */
+  subagent_result_truncated?: true;
+  /** Characters delivered and characters the child actually produced. */
+  subagent_result_chars?: { delivered: number; full: number };
+  /** A resolvable pointer to the full text: `read_tool_output(ref, offset, limit)`. */
+  subagent_result_ref?: string;
   subagent_result_sha256?: string;
+  /** The configured budget and the bound the engine actually enforced. They
+   *  differ when the configuration asks for more turns than the engine ceiling;
+   *  reporting only the configured value let a child that stopped at the ceiling
+   *  look like it had finished inside its budget (#1106). */
+  subagent_turn_budget?: { configured: number; effective: number };
   subagent_status: Subagent["status"];
   subagent_stop_reason?: SubagentContractStopReason;
   subagent_token_usage?: {
@@ -315,16 +330,27 @@ function summarizeSubagentResult(subagent: Subagent): {
   };
   turnCount: number;
   usage?: Subagent["usage"];
-} {
+}> {
   const fullFinalText = subagentFinalText(subagent);
   const finalText = fullFinalText?.slice(0, SUBAGENT_RESULT_TEXT_LIMIT);
+  const truncated = fullFinalText !== undefined && finalText !== undefined && fullFinalText.length > finalText.length;
+  // Only an oversized body needs a ref; a full handoff stays self-contained.
+  // A failing sink is not fatal: `ToolOutputGuard` already treats it that way, and
+  // the parent is better served by a marked truncated body than by a tool error
+  // that loses the whole handoff (#1107 review).
+  let resultRef: string | undefined;
+  if (truncated) {
+    try { resultRef = (await saveSubagentResult?.(fullFinalText))?.ref; } catch { resultRef = undefined; }
+  }
   const stopReason = subagentStopReason(subagent);
   const subagentContractStopReason = contractStopReason(stopReason);
   const tokenUsage = subagentTokenUsage(subagent.usage);
   const modelName = subagent.model?.model ?? subagent.model?.name;
   return {
-    ...(finalText ? { brief: finalText } : {}),
     ...(subagent.error ? { error: subagent.error } : {}),
+    // One copy of the body. `brief` and `subagent_result_brief` carried the same
+    // string, which tripled an oversized handoff and pushed it past the
+    // tool-output projection bound, where it stopped being parseable JSON (#1107).
     ...(finalText ? { finalText } : {}),
     id: subagent.id,
     ...(subagent.rawStructuredResult ? { rawStructuredResult: subagent.rawStructuredResult } : {}),
@@ -336,9 +362,20 @@ function summarizeSubagentResult(subagent: Subagent): {
     stopReason,
     ...(subagent.error && subagent.status !== "completed" ? { subagent_error: subagent.error.slice(0, SUBAGENT_RESULT_TEXT_LIMIT) } : {}),
     ...(modelName ? { subagent_model_name: modelName } : {}),
-    ...(subagent.status === "completed" && finalText ? { subagent_result_brief: finalText } : {}),
-    ...(subagent.status === "completed" && fullFinalText
-      ? { subagent_result_sha256: createHash("sha256").update(fullFinalText).digest("hex") }
+    ...(truncated
+      ? {
+        subagent_result_chars: { delivered: finalText!.length, full: fullFinalText!.length },
+        ...(resultRef ? { subagent_result_ref: resultRef } : {}),
+        subagent_result_truncated: true as const,
+      }
+      : {}),
+    // Hash what the parent received. Hashing the uncut text made an integrity
+    // check fail on a handoff that was reported `completed` (#1107).
+    ...(subagent.status === "completed" && finalText
+      ? { subagent_result_sha256: createHash("sha256").update(finalText).digest("hex") }
+      : {}),
+    ...(subagent.maxTurns !== undefined
+      ? { subagent_turn_budget: { configured: subagent.maxTurns, effective: subagent.effectiveMaxTurns ?? subagent.maxTurns } }
       : {}),
     subagent_status: subagent.status,
     ...(subagentContractStopReason ? { subagent_stop_reason: subagentContractStopReason } : {}),
@@ -349,6 +386,11 @@ function summarizeSubagentResult(subagent: Subagent): {
 }
 
 export interface WorkspaceToolOptions {
+  /** Persist a child's oversized final text so the parent can read it back.
+   *  `read_tool_output(ref, offset, limit)` already exists on the tool-output
+   *  store; this is the only seam the workspace layer needs to publish a ref
+   *  for content it had to cut (#1107). */
+  saveSubagentResult?: (text: string) => Promise<{ ref: string } | undefined>;
   mcpReadiness?: {
     summary: string;
     decide(action: "continue" | "wait" | "check", reason: string, sourceIds: string[], signal?: AbortSignal, toolCallId?: string): Promise<unknown>;
@@ -574,6 +616,42 @@ export interface WorkspaceToolOptions {
     name: string;
   }>;
   toolPolicy?: ToolFilterPolicy;
+}
+
+/**
+ * Names Windows resolves to a device in every directory, whatever the extension:
+ * a file called `CON.csv` or `nul.txt` is never created there — opening the path
+ * targets the device instead, so the write fails with EPERM, or, for `CON`, is sent
+ * to the console. COM0 and LPT0 are not reserved, and the naming document counts
+ * the superscript digits 1-3 as port numbers as well.
+ * https://learn.microsoft.com/windows/win32/fileio/naming-a-file#naming-conventions
+ */
+const WINDOWS_RESERVED_DEVICE_NAME = /^(?:con|prn|aux|nul|com[1-9\u00b9\u00b2\u00b3]|lpt[1-9\u00b9\u00b2\u00b3]|conin\$|conout\$)$/i;
+
+/**
+ * Whether one path segment names a Windows device instead of a file.
+ *
+ * The extension is irrelevant (`nul.txt` is `nul`), Windows ignores a trailing dot
+ * or space (`nul.`, `CON `), and the named-stream syntax addresses the same device
+ * (`NUL:x`, `CON:$DATA`), so only the part before the first colon and the first dot
+ * is tested — a colon in front of an ordinary stem (`report:2024.csv`) is a legal
+ * name. Callers pass one segment, never a whole path.
+ */
+export function isWindowsReservedDeviceName(segment: string): boolean {
+  const stem = (segment.split(":")[0] ?? "").split(".")[0] ?? "";
+  return WINDOWS_RESERVED_DEVICE_NAME.test(stem.replace(/[. ]+$/, ""));
+}
+
+/**
+ * The first segment of `target` under `workspaceRoot` that Windows would resolve to
+ * a device instead of a file, or `undefined` for an ordinary path.
+ *
+ * Splits on both separators: `CON\notes.txt` is one segment on POSIX and a nested
+ * path on Windows, and the rule has to answer the same way on every host.
+ */
+export function findWindowsReservedDeviceSegment(workspaceRoot: string, target: string): string | undefined {
+  const root = resolve(workspaceRoot);
+  return relative(root, target).split(/[\\/]+/).find((segment) => isWindowsReservedDeviceName(segment));
 }
 
 function assertWorkspacePath(workspaceRoot: string, path: string): string {
@@ -1598,7 +1676,7 @@ export function createWorkspaceTools(workspaceRoot: string, options: WorkspaceTo
     const checkParameters = Type.Object({ runner_id: Type.Optional(Type.String({ minLength: 1 })) });
     const check: AgentTool<typeof checkParameters> = {
       name: "check_runner", label: "Check Runner", parameters: checkParameters,
-      description: "Refresh execution readiness on an authorized Runner (default local) and update its capability report. Works without a usable sandbox. Reports the platform, Shell, guaranteed utilities, sandbox diagnostics and repair suggestions. Does not execute scientific code, repair the host, grant permission, or wait for user input.",
+      description: "Refresh execution readiness on an authorized Runner (default local) and update its capability report. Works without a usable sandbox. Reports the platform, Shell, guaranteed utilities, sandbox diagnostics and repair suggestions. The verdict is route-scoped: `readyFor.python` covers Python execution (a Shell gap never blocks it) and `readyFor.shell` covers Shell calls, so read the route you intend to use rather than treating `ready` as a green light for both. Does not execute scientific code, repair the host, grant permission, or wait for user input.",
       execute: async (_id, params, signal) => {
         const value = await options.runnerReadiness!.check(params.runner_id, signal);
         return { content: [{ type: "text", text: JSON.stringify(value) }], details: value };
@@ -2259,7 +2337,7 @@ const taskArgumentMessage = (missing: readonly string[]): string =>
   + "Re-issue this call with a complete prompt.";
 
 /** Default delegation preserves the established request/result and budget semantics. */
-export function createSubagentTools(options: Pick<WorkspaceToolOptions, "runSubagent" | "specialists" | "toolPolicy" | "listArtifacts">): AgentTool[] {
+export function createSubagentTools(options: Pick<WorkspaceToolOptions, "runSubagent" | "specialists" | "toolPolicy" | "listArtifacts" | "saveSubagentResult">): AgentTool[] {
   const tools: AgentTool[] = [];
   if (options.runSubagent) {
     const specialistSummary = summarizeSpecialistsForTaskTool(options.specialists);
@@ -2340,7 +2418,7 @@ export function createSubagentTools(options: Pick<WorkspaceToolOptions, "runSuba
         const artifacts = (await options.listArtifacts?.() ?? [])
           .filter((artifact) => !artifact.deletedAt && artifact.originMeta?.subagentId === subagent.id)
           .map((artifact) => ({ artifact_id: artifact.id, name: artifact.name, version: artifact.currentVersion }));
-        const summary = { ...summarizeSubagentResult(subagent), artifacts,
+        const summary = { ...await summarizeSubagentResult(subagent, options.saveSubagentResult), artifacts,
           artifact_read_hint: "Use read_artifact with artifact_id and version. Child workspace paths are not parent-local paths." };
         return { content: [{ type: "text", text: JSON.stringify(summary) }], details: { subagent, summary } };
       },

@@ -593,7 +593,7 @@ test("desktop skill switches import a new package and preserve global state on r
     else process.env.SCIENCE_AGENT_EXECUTOR = previous.executor;
     if (previous.adapter === undefined) delete process.env.SCIENCE_AGENT_ADAPTER_URL;
     else process.env.SCIENCE_AGENT_ADAPTER_URL = previous.adapter;
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   });
   await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
   const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -606,6 +606,43 @@ test("desktop skill switches import a new package and preserve global state on r
     assert.equal(installed[0]?.enabled, enabled);
   }
   assert.equal(importedPaths.length, 1, "subsequent toggles reuse JiuwenSwarm's installed package");
+});
+
+test("API health exposes details only with a valid token on both routes", async (context) => {
+  const root = resolve(process.cwd(), ".tmp", `api-health-${Date.now()}-${process.pid}`);
+  await mkdir(root, { recursive: true });
+  context.after(() => removeTestRoot(root));
+  const { origin } = await startTestApi(context, root);
+  for (const path of ["/health", "/api/health"]) {
+    for (const headers of [undefined, { authorization: "Bearer wrong-token" }]) {
+      const response = await fetch(`${origin}${path}`, { headers });
+      assert.equal(response.status, 200);
+      assert.deepEqual(await response.json(), { service: "sciencediscovery-api", liveness: "ok" });
+    }
+    const response = await fetch(`${origin}${path}`, { headers: authorization });
+    assert.equal(response.status, 200);
+    const health = await response.json() as { runner: RunnerHealth; workspace: unknown; sandboxNetwork: unknown; memoryGraph: string };
+    assert.equal(health.runner.platform, process.platform);
+    assert.equal(health.runner.executionTimeoutMs, 60_000);
+    assert.ok(health.workspace);
+    assert.ok(health.sandboxNetwork);
+    assert.equal(typeof health.memoryGraph, "string");
+  }
+});
+
+test("API health is degraded when the Runner answers without its detail", async (context) => {
+  const root = resolve(process.cwd(), ".tmp", `api-health-liveness-${Date.now()}-${process.pid}`);
+  await mkdir(root, { recursive: true });
+  context.after(() => removeTestRoot(root));
+  // A Runner that does not accept this token still answers 200, with the public
+  // body and no readiness record. The authenticated detail must not read that as
+  // a healthy stack: nothing was consulted to say so.
+  const { origin } = await startTestApi(context, root, undefined, { runnerToken: "a-token-the-runner-will-not-accept" });
+  const response = await fetch(`${origin}/health`, { headers: authorization });
+  assert.equal(response.status, 200);
+  const health = await response.json() as { runner: { execution?: unknown; status: string }; status: string };
+  assert.equal(health.runner.execution, undefined);
+  assert.equal(health.status, "degraded");
 });
 
 test("closing the API server drains active connections before closing the MCP transport", async (context) => {
@@ -668,10 +705,10 @@ test("request errors after headers terminate the response without rejecting the 
   const root = resolve(process.cwd(), ".tmp", `sent-headers-${randomUUID()}`);
   await mkdir(root, { recursive: true });
   const server = createApiServer(testConfig(root));
-  context.after(async () => {
-    await removeTestRoot(root);
-    await closeApiServer(server);
-  });
+  // removeTestRoot cancels outstanding runs and closes the API before deleting
+  // the data directory. Keep teardown ownership in one place so a second
+  // close cannot race the final write drain.
+  context.after(() => removeTestRoot(root));
   // Capture escaped rejections so the unfixed handler fails an assertion instead
   // of crashing the test process with ERR_HTTP_HEADERS_SENT.
   const handler = server.listeners("request")[0]!;
@@ -1037,7 +1074,7 @@ test("global Runner management routes remotely, requires authentication and neve
     await closeApiServer(server);
     store.close();
     assert.equal(transportClosed, true, "API dependencies must finish closing before removing their data directory");
-    await rm(root, { recursive: true, force: true });
+    await removeTestRoot(root);
   });
   const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   const prefix = `${origin}/api/remote-hosts/${host.id}`;
@@ -1088,7 +1125,7 @@ test("updating SSH credentials immediately probes with the newly stored username
   context.after(async () => {
     // Drain asynchronous API cleanup before removing the stores it still owns.
     await closeApiServer(server);
-    await rm(tempRoot, { force: true, recursive: true });
+    await removeTestRoot(tempRoot);
   });
   const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 
@@ -1149,6 +1186,89 @@ async function createTestModel(
   assert.equal(result.response.status, 201);
   return result.body;
 }
+
+test("Evolve draft validates task and model, and records usable and unusable mock replies", async (context) => {
+  const root = resolve(process.cwd(), ".tmp", `evolve-draft-${randomUUID()}`);
+  context.after(() => removeTestRoot(root));
+  const { origin } = await startTestApi(context, root);
+  const headers = { ...authorization, "content-type": "application/json" };
+  const project = await jsonRequest<CreateProjectResponse>(`${origin}/api/projects`, {
+    method: "POST", headers, body: JSON.stringify({ name: "Evolve draft test" }),
+  });
+  assert.equal(project.response.status, 201);
+  const sessionPath = `${origin}/api/projects/${project.body.id}/sessions`;
+  const draft = (sessionId: string, task: string) => fetch(`${origin}/api/sessions/${sessionId}/evolve/draft`, {
+    method: "POST", headers, body: JSON.stringify({ task }),
+  });
+  const sessionId = project.body.firstSession.id;
+  for (const task of ["  ", "x".repeat(8001)]) {
+    const response = await draft(sessionId, task);
+    assert.equal(response.status, 400);
+    await response.json();
+  }
+  const noModel = await draft(sessionId, "Tune policy");
+  assert.equal(noModel.status, 409);
+  await noModel.json();
+
+  const startingFields = { weight: 1, fixed: 32 };
+  let calls = 0;
+  const provider = createHttpServer((request, response) => {
+    request.resume();
+    const content = ++calls === 1
+      ? "Not a JSON draft"
+      : JSON.stringify({ baseline: startingFields, editable: ["weight", "missing"] });
+    response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({
+      choices: [{ message: { role: "assistant", content } }],
+      usage: { prompt_tokens: 14, completion_tokens: 6, total_tokens: 20 },
+    }));
+  });
+  await new Promise<void>(done => provider.listen(0, "127.0.0.1", done));
+  context.after(() => new Promise<void>(done => {
+    provider.close(() => done());
+    provider.closeAllConnections();
+  }));
+  const baseUrl = `http://127.0.0.1:${(provider.address() as AddressInfo).port}/v1`;
+  const tokenless = await jsonRequest<ModelProfile>(origin + "/api/models", {
+    method: "POST", headers,
+    body: JSON.stringify({ baseUrl, apiProtocol: "openai-chat-completions", model: "fixture", name: "Tokenless model" }),
+  });
+  assert.equal(tokenless.response.status, 201);
+  const createSession = async (modelId: string) => {
+    const session = await jsonRequest<Session>(sessionPath, {
+      method: "POST", headers, body: JSON.stringify({ title: "Tune policy", modelId }),
+    });
+    assert.equal(session.response.status, 201, JSON.stringify(session.body));
+    return session.body.id;
+  };
+  assert.equal(tokenless.body.hasApiToken, false);
+  const settings = await jsonRequest<RuntimeSettingsDetails>(origin + "/api/sessions/" + sessionId + "/settings", { headers });
+  assert.equal(settings.response.status, 200);
+  assert.equal(settings.body.effective.modelId, tokenless.body.id);
+  const noToken = await draft(sessionId, "Tune policy");
+  assert.equal(noToken.status, 409);
+  await noToken.json();
+  assert.equal(calls, 0);
+
+  const model = await createTestModel(origin, { baseUrl, apiVariant: "openai", name: "Draft mock model" });
+  const configured = await createSession(model.id);
+  const unusable = await draft(configured, "Tune policy");
+  assert.equal(unusable.status, 502);
+  await unusable.json();
+  const usable = await draft(configured, "Tune policy");
+  assert.equal(usable.status, 200);
+  assert.deepEqual(await usable.json(), { baseline: JSON.stringify(startingFields), editable: ["weight"] });
+  assert.equal(calls, 2);
+
+  const usage = await jsonRequest<SessionUsageSummary>(`${origin}/api/sessions/${configured}/usage`, { headers });
+  assert.equal(usage.response.status, 200);
+  assert.deepEqual(usage.body.invocations.map(record => record.outcome).sort(), ["completed", "failed"]);
+  for (const record of usage.body.invocations) {
+    assert.equal(record.invocationKind, "evolve");
+    assert.equal(record.modelProfileId, model.id);
+    assert.equal(record.sessionId, configured);
+    assert.equal(record.totalTokens, 20);
+  }
+});
 
 test("authenticated proxy REST returns complete settings URLs and manages MCP policies", async (context) => {
   const tempRoot = resolve(process.cwd(), ".tmp", `proxy-api-${Date.now()}-${process.pid}`);
@@ -3442,16 +3562,19 @@ test("authenticated environment catalog routes proxy create, install, uninstall,
     {
       channels: ["https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge"],
       manager: "conda",
+      networkProxy: { mode: "environment" },
       packages: ["scanpy=1.10"],
     },
     {
       indexUrl: "https://mirrors.huaweicloud.com/repository/pypi/simple",
       manager: "pip",
+      networkProxy: { mode: "environment" },
       packages: ["mindspore==2.7.0"],
     },
     {
       indexUrl: "https://download.pytorch.org/whl/cpu",
       manager: "pip",
+      networkProxy: { mode: "environment" },
       packages: ["torch", "torchvision"],
     },
   ]);
@@ -3906,6 +4029,73 @@ test("skill lifecycle APIs author, import, edit, select, audit impact, and delet
   assert.ok(diff.body.lines.some((line) => line.kind === "added" && line.text === "Corrected value with units."));
 });
 
+test("ART-001 a missing artifact version answers 404 on provenance and diff like content", async (context) => {
+  const tempRoot = resolve(process.cwd(), ".tmp", `artifact-version-missing-${Date.now()}-${process.pid}`);
+  await mkdir(tempRoot, { recursive: true });
+  context.after(() => removeTestRoot(tempRoot));
+  const { origin } = await startTestApi(context, tempRoot);
+  const model = await createTestModel(origin);
+  const project = await jsonRequest<Project>(`${origin}/api/projects`, {
+    body: JSON.stringify({ name: "Missing artifact version" }),
+    headers: { ...authorization, "content-type": "application/json" },
+    method: "POST",
+  });
+  const session = await jsonRequest<Session>(`${origin}/api/projects/${project.body.id}/sessions`, {
+    body: JSON.stringify({ modelId: model.id, title: "Missing artifact version" }),
+    headers: { ...authorization, "content-type": "application/json" },
+    method: "POST",
+  });
+  assert.equal(session.response.status, 201);
+  // Two writes of one path give the artifact versions 1 and 2, so the routes below have
+  // a real version to describe and to compare against while the ids under test do not exist.
+  for (const content of ["# Result\n\nOriginal value.\n", "# Result\n\nCorrected value.\n"]) {
+    const saved = await fetch(`${origin}/api/sessions/${session.body.id}/files`, {
+      body: JSON.stringify({ content, path: "report.md" }),
+      headers: { ...authorization, "content-type": "application/json" },
+      method: "POST",
+    });
+    assert.equal(saved.status, 201);
+  }
+  const artifacts = await jsonRequest<ScientificArtifact[]>(
+    `${origin}/api/sessions/${session.body.id}/artifacts`,
+    { headers: authorization },
+  );
+  const artifact = artifacts.body.find((item) => item.logicalName === "report.md")!;
+  const versions = await jsonRequest<ScientificArtifactVersion[]>(
+    `${origin}/api/sessions/${session.body.id}/artifacts/${artifact.id}/versions`,
+    { headers: authorization },
+  );
+  assert.deepEqual(versions.body.map((version) => version.version), [1, 2]);
+
+  const answer = async (suffix: string) => {
+    const response = await fetch(`${origin}/api/sessions/${session.body.id}/artifact-versions/${suffix}`, { headers: authorization });
+    const body = await response.json() as { error?: string };
+    return { error: body.error, status: response.status };
+  };
+  const notFound = { error: "Artifact version not found", status: 404 };
+  // A stale version link is the caller's own bad id on every artifact route, and the
+  // provenance and diff routes must not answer it as an internal fault.
+  assert.deepEqual(await answer("missing/content"), notFound);
+  assert.deepEqual(await answer("missing/provenance"), notFound);
+  assert.deepEqual(await answer("missing/diff"), notFound);
+  // The comparison base is a version id too: one that this artifact does not have, or
+  // one retention removed, is missing rather than a server error.
+  assert.deepEqual(await answer(`${versions.body[1]!.id}/diff?against=missing`), notFound);
+  assert.deepEqual(await answer(`${versions.body[1]!.id}/diff?against=${versions.body[0]!.id + "-gone"}`), notFound);
+
+  // A version that exists keeps its answers.
+  const provenance = await jsonRequest<ArtifactVersionProvenance>(
+    `${origin}/api/sessions/${session.body.id}/artifact-versions/${versions.body[1]!.id}/provenance`,
+    { headers: authorization },
+  );
+  assert.equal(provenance.response.status, 200);
+  const diff = await jsonRequest<ArtifactVersionDiff>(
+    `${origin}/api/sessions/${session.body.id}/artifact-versions/${versions.body[1]!.id}/diff`,
+    { headers: authorization },
+  );
+  assert.ok(diff.body.lines.some((line) => line.kind === "added" && line.text === "Corrected value."));
+});
+
 test("Agent-created Skill stays in draft until review publishes it to a Skill Library", { tags: ["swarm:required"] }, async (context) => {
   const tempRoot = resolve(process.cwd(), ".tmp", `agent-skill-creator-${Date.now()}-${process.pid}`);
   await mkdir(tempRoot, { recursive: true });
@@ -4167,7 +4357,7 @@ test("API runs a configured OpenAI-compatible model through the gateway and Pyth
     name: "Tool test model",
   });
 
-  const health = await jsonRequest<{ runner: RunnerHealth; status: string }>(`${origin}/health`);
+  const health = await jsonRequest<{ runner: RunnerHealth; status: string }>(`${origin}/health`, { headers: authorization });
   assert.equal(health.response.status, 200);
   assert.equal(health.body.status, "ok");
   assert.equal(health.body.runner.seccompBaseline, "multiarch-v1-profile-aware");
@@ -7359,7 +7549,7 @@ test("Workspace HTTP writes wait for the active writer and publish refs before r
     await closeApi();
     await closeGraph();
     closeStore();
-    await rm(dataDir, { recursive: true, force: true });
+    await removeTestRoot(dataDir);
   });
   const uploads: Record<string, unknown>[] = [];
   const graph = createHttpServer((request, response) => {
@@ -7580,6 +7770,88 @@ test("WSP-003 rejects traversal upload paths and leaves the host untouched", asy
     "outside.txt",
   );
   await assert.rejects(stat(workspaceOutside), { code: "ENOENT" });
+});
+
+test("WSP-004 a reserved device name in an upload answers 400 and names the file", async (context) => {
+  const tempRoot = resolve(process.cwd(), ".tmp", `wsp-reserved-${Date.now()}-${process.pid}`);
+  await mkdir(tempRoot, { recursive: true });
+  context.after(() => removeTestRoot(tempRoot));
+  const { origin } = await startTestApi(context, tempRoot);
+  const model = await createTestModel(origin);
+  const project = await jsonRequest<Project>(`${origin}/api/projects`, {
+    body: JSON.stringify({ name: "Reserved device name" }),
+    headers: { ...authorization, "content-type": "application/json" },
+    method: "POST",
+  });
+  const session = await jsonRequest<Session>(`${origin}/api/projects/${project.body.id}/sessions`, {
+    body: JSON.stringify({ modelId: model.id, title: "Reserved device name" }),
+    headers: { ...authorization, "content-type": "application/json" },
+    method: "POST",
+  });
+  assert.equal(session.response.status, 201);
+  // The guard refuses the name while the parts are read, before anything is
+  // written, so the caller sees its own bad input and can say what to rename.
+  const form = new FormData();
+  form.append("files", new Blob([Buffer.from("metric,value\nrows,3\n")], { type: "text/csv" }), "CON.csv");
+  const refused = await jsonRequest<{ error?: string }>(
+    `${origin}/api/sessions/${session.body.id}/workspace/upload`,
+    { body: form, headers: authorization, method: "POST" },
+  );
+  assert.equal(refused.response.status, 400);
+  assert.match(refused.body.error ?? "", /CON\.csv/);
+  assert.match(refused.body.error ?? "", /reserved device name/);
+  // Nothing landed under the refused name, so the workspace still holds nothing.
+  const listed = await jsonRequest<WorkspaceFile[]>(
+    `${origin}/api/sessions/${session.body.id}/files`,
+    { headers: authorization },
+  );
+  assert.deepEqual(listed.body, []);
+});
+
+test("WSP-005 a reserved device name on the file-write route answers 400 and writes nothing", async (context) => {
+  const tempRoot = resolve(process.cwd(), ".tmp", `wsp-device-${Date.now()}-${process.pid}`);
+  await mkdir(tempRoot, { recursive: true });
+  context.after(() => removeTestRoot(tempRoot));
+  const { origin } = await startTestApi(context, tempRoot);
+  const model = await createTestModel(origin);
+  const project = await jsonRequest<Project>(`${origin}/api/projects`, {
+    body: JSON.stringify({ name: "Reserved device name write" }),
+    headers: { ...authorization, "content-type": "application/json" },
+    method: "POST",
+  });
+  const session = await jsonRequest<Session>(`${origin}/api/projects/${project.body.id}/sessions`, {
+    body: JSON.stringify({ modelId: model.id, title: "Reserved device name write" }),
+    headers: { ...authorization, "content-type": "application/json" },
+    method: "POST",
+  });
+  assert.equal(session.response.status, 201);
+  const write = async (path: string) => jsonRequest<{ error?: string }>(
+    `${origin}/api/sessions/${session.body.id}/files`,
+    {
+      body: JSON.stringify({ content: "x", path }),
+      headers: { ...authorization, "content-type": "application/json" },
+      method: "POST",
+    },
+  );
+  // Refused on every host: the plain device name, the extension form, the trailing
+  // space Windows ignores, the named-stream syntax, and the backslash spelling that
+  // is one segment on POSIX but a nested device path on Windows.
+  for (const path of ["CON", "nul.txt", "COM1.log", "CON .csv", "nul:stream", "con:$DATA", "CON\\notes.txt", "notes\\CON.txt"]) {
+    const refused = await write(path);
+    assert.equal(refused.response.status, 400, path);
+    assert.match(refused.body.error ?? "", /reserved Windows device/, path);
+  }
+  const named = await write("CON");
+  assert.match(named.body.error ?? "", /"CON"/);
+  // A name that merely begins with a reserved word is an ordinary file.
+  const accepted = await write("conifer.csv");
+  assert.equal(accepted.response.status, 201);
+  // Nothing landed under a refused name.
+  const listed = await jsonRequest<WorkspaceFile[]>(
+    `${origin}/api/sessions/${session.body.id}/files`,
+    { headers: authorization },
+  );
+  assert.deepEqual(listed.body.map((file) => file.path), ["conifer.csv"]);
 });
 
 test("same-named uploads remain physically isolated and append one Project artifact version chain", async (context) => {

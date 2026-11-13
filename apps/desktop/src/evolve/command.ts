@@ -71,6 +71,20 @@ export function evolveCommandGoal(text: string): string | undefined {
   return afterCommand(text).slice(leadingFlags(text).length).trim();
 }
 
+/** The task a composer draft carries into the setup dialog.
+ *
+ *  A command contributes the sentence after its flags. Any other draft that is
+ *  not a slash command is a sentence the person wrote before opening the
+ *  surface, and it becomes the task rather than being thrown away. A bare
+ *  slash query is a palette pick, not a task. */
+export function evolveDraftTask(text: string): string | undefined {
+  const goal = evolveCommandGoal(text);
+  if (goal !== undefined) return goal === "" ? undefined : goal;
+  const draft = text.trim();
+  if (draft === "" || draft.startsWith("/")) return undefined;
+  return draft;
+}
+
 /** Whether the design pauses at each checkpoint, as the command says.
  *
  *  Read here so the setup detour keeps the choice: a command typed with
@@ -79,6 +93,60 @@ export function evolveCommandGoal(text: string): string | undefined {
 export function evolveCommandCheckpointMode(text: string): EvolveCheckpointMode | undefined {
   if (!isEvolveCommand(text)) return undefined;
   return /--no-confirm\b/.test(leadingFlags(text)) ? "auto" : "confirm";
+}
+
+/** The pace of the design the Session is on: its latest `/evolve-design`
+ *  command, or the one still being sent.
+ *
+ *  The auto-continue reads this to decide whether it may act at all. A design
+ *  started with pauses is waiting for a person by construction, and a client
+ *  that pushed it forward would be answering a question the user asked to be
+ *  asked. Reading it from the transcript rather than remembering a switch
+ *  keeps a second client's design, and a reopened Session, on the same rule. */
+export function latestEvolveCheckpointMode(
+  messages: ReadonlyArray<{ content: string; role: string }>,
+  pending?: string,
+): EvolveCheckpointMode | undefined {
+  const commands = messages
+    .filter((message) => message.role === "user" && isEvolveCommand(message.content))
+    .map((message) => message.content);
+  if (pending !== undefined && isEvolveCommand(pending)) commands.push(pending);
+  const latest = commands.at(-1);
+  return latest === undefined ? undefined : evolveCommandCheckpointMode(latest);
+}
+
+/** Whether the design the Session is on already has a search of its own.
+ *
+ *  A search the Session holds may belong to an earlier design: the run list is
+ *  per Session and survives a new `/evolve-design`. Asking it the Session-wide
+ *  question would silence the cardless-stall push for a second no-confirm
+ *  design that has not started anything yet — the exact stall the push exists
+ *  for. A run counts only when it was created after the latest design command,
+ *  which is also what makes the answer survive a reopened window: both times
+ *  come from the server, not from a counter this client keeps.
+ *
+ *  `pending` is the message being sent right now. The hook acts on the running
+ *  → idle transition, and at that moment the design's command is still only
+ *  that pending message — the transcript is written when the turn settles. The
+ *  persisted latest command would then be the *previous* design's, and its run
+ *  would answer yes for a design that owns nothing. A design whose command is
+ *  not persisted yet cannot own a run, so the answer is no; a run this very
+ *  turn created is already covered by `run.evolveRunsCreated`. */
+export function designHasSearch(
+  runs: ReadonlyArray<{ createdAt: string }>,
+  messages: ReadonlyArray<{ content: string; createdAt: string; role: string }>,
+  pending?: string,
+): boolean {
+  if (pending !== undefined && isEvolveCommand(pending)) return false;
+  const command = messages
+    .filter((message) => message.role === "user" && isEvolveCommand(message.content))
+    .at(-1);
+  const startedAt = command === undefined ? Number.NaN : Date.parse(command.createdAt);
+  if (Number.isNaN(startedAt)) return false;
+  return runs.some((run) => {
+    const created = Date.parse(run.createdAt);
+    return !Number.isNaN(created) && created >= startedAt;
+  });
 }
 
 /** The search the command names, as `--algorithm` says.

@@ -388,7 +388,7 @@ export function normalizeWebSettings(value: unknown): WebSettings {
   const freeInput = migrated.freeSearchEngines ?? { ...DEFAULT_WEB_SETTINGS.freeSearchEngines };
   if (!isRecord(freeInput)) throw new Error("freeSearchEngines must be an object");
   const unknownEngine = Object.keys(freeInput).find((key) => !FREE_SEARCH_ORDER.includes(key as FreeSearchEngine));
-  if (unknownEngine) throw new Error(`Unknown free search engine: ${unknownEngine}`);
+  if (unknownEngine) throw Object.assign(new Error(`Unknown free search engine: ${unknownEngine}`), { code: "INVALID_WEB_SETTINGS" });
   const freeSearchEngines = Object.fromEntries(FREE_SEARCH_ORDER.map((engine) => {
     const enabled = freeInput[engine];
     if (enabled !== undefined && typeof enabled !== "boolean") {
@@ -428,6 +428,10 @@ export function normalizeProxyUrl(value: string): string {
     throw new Error("The proxy URL must use http, https, or socks5");
   }
   if (parsed.hash) throw new Error("The proxy URL cannot contain a fragment");
+  // Only scheme://host:port is used when connecting; accepting a path or query
+  // would store something the proxy never receives.
+  if (parsed.search) throw new Error("The proxy URL cannot contain a query");
+  if (parsed.pathname !== "" && parsed.pathname !== "/") throw new Error("The proxy URL cannot contain a path");
   return parsed.toString();
 }
 

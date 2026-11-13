@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { createElement } from "react";
 import { act, create, type ReactTestInstance, type ReactTestRenderer } from "react-test-renderer";
 import type { ApiClient } from "../src/api.js";
+import { ApiRequestError } from "../src/api/auth.js";
 import { LocaleProvider } from "../src/i18n/index.js";
 import { ResearchPackageDialogs } from "../src/research-package/ResearchPackageActions.js";
 import { ExportPreviewCache } from "../src/research-package/export-preview-cache.js";
@@ -111,5 +112,153 @@ test("file selection shows inspection progress immediately and supports success,
   } finally {
     if (renderer) await act(async () => renderer!.unmount());
     globalThis.document = previousDocument;
+  }
+});
+test("a deleted scope keeps the last estimate but disables both export buttons", async (context) => {
+  context.mock.timers.enable({ apis: ["setInterval"] });
+  const previousDocument = globalThis.document;
+  const previousWindow = globalThis.window;
+  globalThis.window = { setInterval, clearInterval } as unknown as Window & typeof globalThis;
+  globalThis.document = { activeElement: null, addEventListener: () => undefined, removeEventListener: () => undefined } as unknown as Document;
+  const preview = { revision: "r1", estimatedBytes: 1024, files: [{ path: "data/result.csv", size: 20, selected: true }], omissions: [] };
+  const defaults = { revision: "r1", necessary: preview, complete: preview, completeWithTrajectory: preview, completeWithMemoryGraph: preview, completeWithTrajectoryAndMemoryGraph: preview };
+  let fail = false;
+  const client = {
+    getResearchPackagePreviews: async () => {
+      if (fail) throw new ApiRequestError("该项目或会话已不存在；上方为删除前的大小，已不能导出。", 410, "EXPORT_PREVIEW_RESOURCE_DELETED");
+      return defaults;
+    },
+    previewResearchPackage: async () => preview,
+    exportResearchPackage: async () => new Blob(),
+    startResearchPackageExport: async () => ({ id: "task", status: "queued", filename: "x.sdresearch" }),
+  } as unknown as ApiClient;
+  let renderer: ReactTestRenderer | undefined;
+  try {
+    await new ExportPreviewCache(client).refreshDefaults("project-a", "session-a");
+    await act(async () => {
+      renderer = create(createElement(LocaleProvider, { initialLocale: "zh-CN" }, createElement(ResearchPackageDialogs, {
+        client,
+        onClose: () => undefined,
+        target: { projectId: "project-a", sessionId: "session-a", kind: "package" },
+      })));
+    });
+    // Ready to export while the scope exists.
+    assert.equal(button(renderer!, "立即导出").props.disabled, false);
+    assert.ok(renderer!.root.findAllByType("strong").some((node) => node.children.join("").includes("预计 1.0 KiB")));
+    // The Project is deleted elsewhere; the dialog's own 3 s poll answers `deleted`.
+    fail = true;
+    await act(async () => { context.mock.timers.tick(3_000); });
+    await act(async () => { await Promise.resolve(); });
+    assert.equal(button(renderer!, "立即导出").props.disabled, true, "a gone scope cannot be exported");
+    assert.equal(button(renderer!, "后台导出").props.disabled, true);
+    // The last estimate stays on screen as the pre-deletion snapshot, and the
+    // sentence points at it (above, never below — #1074 F6).
+    assert.ok(renderer!.root.findAllByType("strong").some((node) => node.children.join("").includes("预计 1.0 KiB")));
+    assert.equal(renderer!.root.findByProps({ role: "alert" }).children.join(""), "该项目或会话已不存在；上方为删除前的大小，已不能导出。");
+  } finally {
+    if (renderer) await act(async () => renderer!.unmount());
+    globalThis.document = previousDocument;
+    globalThis.window = previousWindow;
+    context.mock.timers.reset();
+  }
+});
+
+test("a scope already gone at open claims no snapshot and stops promising a size", async (context) => {
+  context.mock.timers.enable({ apis: ["setInterval"] });
+  const previousDocument = globalThis.document;
+  const previousWindow = globalThis.window;
+  globalThis.window = { setInterval, clearInterval } as unknown as Window & typeof globalThis;
+  globalThis.document = { activeElement: null, addEventListener: () => undefined, removeEventListener: () => undefined } as unknown as Document;
+  const client = {
+    getResearchPackagePreviews: async () => { throw new ApiRequestError("该项目或会话已不存在；上方为删除前的大小，已不能导出。", 410, "EXPORT_PREVIEW_RESOURCE_DELETED"); },
+    previewResearchPackage: async () => ({ revision: "r1", estimatedBytes: 1024, files: [], omissions: [] }),
+    exportResearchPackage: async () => new Blob(),
+  } as unknown as ApiClient;
+  let renderer: ReactTestRenderer | undefined;
+  try {
+    // No refreshDefaults() for this scope: the dialog opens with no cached
+    // snapshot, which is the state the F6 finding is about.
+    await act(async () => {
+      renderer = create(createElement(LocaleProvider, { initialLocale: "zh-CN" }, createElement(ResearchPackageDialogs, {
+        client,
+        onClose: () => undefined,
+        target: { projectId: "project-gone", sessionId: "session-gone", kind: "package" },
+      })));
+    });
+    await act(async () => { await Promise.resolve(); });
+    assert.equal(button(renderer!, "立即导出").props.disabled, true);
+    // Without a snapshot the sentence must not claim there is one.
+    assert.equal(renderer!.root.findByProps({ role: "alert" }).children.join(""), "该项目或会话已不存在，已无法再读取大小。");
+    // And nothing will ever be calculated, so the dialog must not keep saying it will.
+    const strongs = renderer!.root.findAllByType("strong").map((node) => node.children.join(""));
+    assert.equal(strongs.some((text) => text.includes("正在计算大小")), false);
+    assert.ok(strongs.includes("—"), `expected the estimate to read as unavailable, got ${JSON.stringify(strongs)}`);
+  } finally {
+    if (renderer) await act(async () => renderer!.unmount());
+    globalThis.document = previousDocument;
+    globalThis.window = previousWindow;
+    context.mock.timers.reset();
+  }
+});
+
+test("a gone scope still admits the sizes its scope cards are showing", async (context) => {
+  context.mock.timers.enable({ apis: ["setInterval"] });
+  const previousDocument = globalThis.document;
+  const previousWindow = globalThis.window;
+  globalThis.window = { setInterval, clearInterval } as unknown as Window & typeof globalThis;
+  globalThis.document = { activeElement: null, addEventListener: () => undefined, removeEventListener: () => undefined } as unknown as Document;
+  const preview = { revision: "r1", estimatedBytes: 1024, files: [{ path: "data/result.csv", size: 20, selected: true }], omissions: [] };
+  const defaults = { revision: "r1", necessary: preview, complete: { ...preview, estimatedBytes: 2048 }, completeWithTrajectory: preview, completeWithMemoryGraph: preview, completeWithTrajectoryAndMemoryGraph: preview };
+  let fail = false;
+  const client = {
+    getResearchPackagePreviews: async () => {
+      if (fail) throw new ApiRequestError("该项目或会话已不存在；上方为删除前的大小，已不能导出。", 410, "EXPORT_PREVIEW_RESOURCE_DELETED");
+      return defaults;
+    },
+    // Changing the file selection asks for a custom preview; after the deletion
+    // that request answers 404, so the estimate stays empty while the two scope
+    // cards keep the sizes they read from the cached defaults.
+    previewResearchPackage: async () => {
+      throw new ApiRequestError("Preview file is no longer available", 404, "EXPORT_PREVIEW_RESOURCE_DELETED");
+    },
+    exportResearchPackage: async () => new Blob(),
+    startResearchPackageExport: async () => ({ id: "task", status: "queued", filename: "x.sdresearch" }),
+  } as unknown as ApiClient;
+  let renderer: ReactTestRenderer | undefined;
+  try {
+    await new ExportPreviewCache(client).refreshDefaults("project-select", "session-select");
+    await act(async () => {
+      renderer = create(createElement(LocaleProvider, { initialLocale: "zh-CN" }, createElement(ResearchPackageDialogs, {
+        client,
+        onClose: () => undefined,
+        target: { projectId: "project-select", sessionId: "session-select", kind: "package" },
+      })));
+    });
+    const checked = renderer!.root.findAll((item) => item.type === "input" && item.props.type === "checkbox" && item.props.checked === true);
+    assert.ok(checked.length > 0, "the dialog must list the selectable workspace file");
+    await act(async () => { checked[0]!.props.onChange({ target: { checked: false } }); });
+    assert.equal(renderer!.root.findAllByType("strong").some((node) => node.children.join("") === "预计 1.0 KiB"), false, "the estimate is gone once a custom selection is pending");
+    fail = true;
+    // The gone answer arrives through the dialog's own poll; wait for the state
+    // instead of counting microtasks, so the assertion does not depend on how
+    // many awaits the microtask queue happens to need on a given host.
+    const alertText = () => renderer!.root.findAll((item) => item.props?.role === "alert").map((item) => item.children.join("")).join("|");
+    for (let attempt = 0; attempt < 20 && !alertText().includes("上方为删除前的大小"); attempt += 1) {
+      await act(async () => { context.mock.timers.tick(3_000); });
+      await act(async () => { await Promise.resolve(); });
+    }
+    // The estimate is empty, but both cards still carry their sizes from the
+    // cached defaults — so the sentence must admit that sizes remain visible.
+    const strongs = renderer!.root.findAllByType("strong").map((node) => node.children.join("")).join("|");
+    assert.ok(strongs.includes("—"), `the estimate should read as unavailable, got ${strongs}`);
+    const rendered = renderer!.root.findAll((item) => typeof item.type === "string")
+      .map((item) => item.children.filter((child) => typeof child === "string").join("")).join("|");
+    assert.ok(rendered.includes("1.0 KiB") && rendered.includes("2.0 KiB"), `the scope cards keep their sizes: ${rendered}`);
+    assert.equal(alertText(), "该项目或会话已不存在；上方为删除前的大小，已不能导出。");
+  } finally {
+    if (renderer) await act(async () => renderer!.unmount());
+    globalThis.document = previousDocument;
+    globalThis.window = previousWindow;
+    context.mock.timers.reset();
   }
 });

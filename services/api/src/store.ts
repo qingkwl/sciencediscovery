@@ -14,12 +14,12 @@
 
 import type { ConfigurationCapabilityId, ConfigurationValues, SkillLibrary } from "@sciencediscovery/schema";
 import { INHERITABLE_CONFIGURATION_FIELDS } from "./configuration/inherit-fields.js";
-import { canonical as canonicalConfiguration } from "./configuration/validation.js";
+import { canonical as canonicalConfiguration, ConfigurationError } from "./configuration/validation.js";
 import { filterEnabledMcpSources } from "@sciencediscovery/mcp-sources";
 import type { ConfigurationLiveActivation, ConfigurationSnapshot } from "./configuration/types.js";
 import { normalizeSpecialistRuntime } from "./specialist-runtime/config.js";
 import type { ConfigurationScope, ConfigurationValues as ScopedConfigurationValues } from "@sciencediscovery/schema";
-import { effectiveRunnerIds, isEvidenceSessionReadOnly } from "@sciencediscovery/schema";
+import { DEFAULT_MODEL_API_VARIANT, DEFAULT_MODEL_DISCOVERY, effectiveRunnerIds, isEvidenceSessionReadOnly } from "@sciencediscovery/schema";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { ExecutionBlocks } from "@sciencediscovery/governance";
 import { createHash, randomUUID } from "node:crypto";
@@ -1422,6 +1422,7 @@ export class SessionStore {
       projects,
       providers,
       proxyDefaultPolicy,
+      ...(typeof saved.proxyNoProxy === "string" ? { proxyNoProxy: saved.proxyNoProxy } : {}),
       proxyServers,
       quotaSettings,
       sandboxNetworkSettings,
@@ -2288,7 +2289,12 @@ export class SessionStore {
       // the retry.
       await replaceFile(temporaryPath, path);
     } finally {
-      await rm(temporaryPath, { force: true });
+      // The cleanup must not replace the failure that brought us here: when a
+      // scanner holds the freshly written file, the rename is refused and so is
+      // deleting it, and that bare EPERM would hide the errno and the syscall of
+      // the step that actually failed. The leftover file is inert — every array
+      // read goes to its exact path and nothing enumerates this directory.
+      await rm(temporaryPath, { force: true }).catch(() => undefined);
     }
   }
 
@@ -2454,6 +2460,50 @@ export class SessionStore {
     return { ids: [...this.skillIds].sort(), libraries: structuredClone(this.configurationSkillLibrarySource()), selectionAvailable: this.skillSelectionAvailable };
   }
 
+  private configurationMcpHeaderCredentialSource?: (target: string) => import("./configuration/mcp-header-credential-adapter.js").McpHeaderCredentialSnapshot;
+  setConfigurationMcpHeaderCredentialSource(source: (target: string) => import("./configuration/mcp-header-credential-adapter.js").McpHeaderCredentialSnapshot): void { this.configurationMcpHeaderCredentialSource = source; }
+  configurationMcpHeaderCredential(target: string) { return this.configurationMcpHeaderCredentialSource?.(target) ?? { items: [], current: undefined, header: undefined, version: undefined, target: "", destination: undefined }; }
+  private configurationMcpDeletionSource?: (id: string) => import("./configuration/mcp-delete-adapter.js").McpDeletionSnapshot;
+  setConfigurationMcpDeletionSource(source: (id: string) => import("./configuration/mcp-delete-adapter.js").McpDeletionSnapshot): void { this.configurationMcpDeletionSource = source; }
+  configurationMcpDeletion(id: string) { return this.configurationMcpDeletionSource?.(id) ?? { items: [], current: undefined, version: undefined }; }
+
+  private configurationMcpEnvironmentRemovalSource?: (target: string) => import("./configuration/mcp-env-removal-adapter.js").McpEnvironmentRemovalSnapshot;
+  setConfigurationMcpEnvironmentRemovalSource(source: (target: string) => import("./configuration/mcp-env-removal-adapter.js").McpEnvironmentRemovalSnapshot): void { this.configurationMcpEnvironmentRemovalSource = source; }
+  configurationMcpEnvironmentRemoval(target: string) { return this.configurationMcpEnvironmentRemovalSource?.(target) ?? { items: [], current: undefined, variable: undefined, caseSensitive: process.platform !== "win32", version: undefined }; }
+
+  private configurationMcpHeaderRemovalSource?: (target: string) => import("./configuration/mcp-header-removal-adapter.js").McpHeaderRemovalSnapshot;
+  setConfigurationMcpHeaderRemovalSource(source: (target: string) => import("./configuration/mcp-header-removal-adapter.js").McpHeaderRemovalSnapshot): void { this.configurationMcpHeaderRemovalSource = source; }
+  configurationMcpHeaderRemoval(target: string) { return this.configurationMcpHeaderRemovalSource?.(target) ?? { items: [], current: undefined, header: undefined, version: undefined }; }
+  private configurationMcpAvailabilitySource?: (id: string) => import("./configuration/mcp-availability-adapter.js").McpAvailabilitySnapshot;
+  setConfigurationMcpAvailabilitySource(source: (id: string) => import("./configuration/mcp-availability-adapter.js").McpAvailabilitySnapshot): void { this.configurationMcpAvailabilitySource = source; }
+  configurationMcpAvailability(id: string) { return this.configurationMcpAvailabilitySource?.(id) ?? { items: [], current: undefined, version: undefined }; }
+
+  private configurationMcpTimeoutSource?: (id: string) => import("./configuration/mcp-timeout-adapter.js").McpTimeoutSnapshot;
+  setConfigurationMcpTimeoutSource(source: (id: string) => import("./configuration/mcp-timeout-adapter.js").McpTimeoutSnapshot): void { this.configurationMcpTimeoutSource = source; }
+  configurationMcpTimeout(id: string) { return this.configurationMcpTimeoutSource?.(id) ?? { items: [], current: undefined, version: undefined }; }
+
+  private configurationMcpMetadataSource?: (id: string) => import("./configuration/mcp-metadata-adapter.js").McpMetadataSnapshot;
+  setConfigurationMcpMetadataSource(source: (id: string) => import("./configuration/mcp-metadata-adapter.js").McpMetadataSnapshot): void { this.configurationMcpMetadataSource = source; }
+  configurationMcpMetadata(id: string) { return this.configurationMcpMetadataSource?.(id) ?? { items: [], current: undefined, version: undefined }; }
+  private configurationMcpProxySource: () => Array<{ id: string; name: string; connectorIds: string[] }> = () => [];
+
+  setConfigurationMcpProxySource(source: () => Array<{ id: string; name: string; connectorIds: string[] }>): void {
+    this.configurationMcpProxySource = source;
+  }
+
+  /** Only safe catalog facts: never resolve/decrypt proxy URLs or MCP credentials. */
+  configurationMcpProxySettings() {
+    return { defaultPolicy: this.catalog.proxyDefaultPolicy,
+      services: this.configurationMcpProxySource().map(service => ({ ...structuredClone(service), proxyPolicy: this.mcpProxyPolicy(service.id) })).sort((a,b) => a.id.localeCompare(b.id)),
+      servers: this.catalog.proxyServers.map(server => ({ id: server.id, name: server.name, kind: server.kind })) };
+  }
+
+  applyMcpProxyConfigurationSync(serverId: string, proxyPolicy: ProxyPolicy): void {
+    if (!this.getConfigurationDatabase().isTransaction) throw new Error("MCP proxy configuration requires the shared transaction");
+    if (!this.configurationMcpProxySource().some(service => service.id === serverId)) throw new Error("The selected MCP server is no longer registered");
+    this.applyMcpProxyPoliciesSync({ policies: { ...this.catalog.mcpProxyPolicies, [serverId]: proxyPolicy } });
+  }
+
   private configurationConnectorRevisionSource?: (ids?: readonly string[]) => string;
 
   setConfigurationConnectorRevisionSource(source: (ids?: readonly string[]) => string): void {
@@ -2540,7 +2590,7 @@ export class SessionStore {
     const settings = this.getSessionSettings(sessionId);
     const project = this.getProject(session.projectId)!;
     const model = this.getModel(target);
-    const provider = this.getProvider(model?.providerId);
+    const provider = this.getProvider(["provider.connection", "provider.credential", "provider.remove_credential"].includes(capabilityId) ? target : model?.providerId);
     const version = (value: unknown) => createHash("sha256").update(canonicalConfiguration(value)).digest("hex");
     // Ciphertext generations, never plaintext token hashes, invalidate old approvals.
     const secretRows = this.getConfigurationDatabase().prepare("SELECT model_id,encrypted_token FROM model_secrets ORDER BY model_id").all();
@@ -2548,7 +2598,7 @@ export class SessionStore {
       settings: version([this.catalog.globalSettings, project.settingsOverrides, session.settingsOverrides]),
       models: version([this.catalog.models, this.catalog.providers]), credentials: version(secretRows),
       connectors: version([...this.connectorIds].sort()), connectorCatalog: this.configurationConnectorRevisionSource?.() ?? "not_attached",
-      policies: version([this.catalog.mcpProxyPolicies, this.catalog.proxyDefaultPolicy, this.catalog.proxyServers]),
+      policies: version([this.catalog.mcpProxyPolicies, this.catalog.proxyDefaultPolicy, this.catalog.proxyServers, this.catalog.proxyNoProxy]),
       autoConfigurationPolicy: version(session.autoApplyLowRiskConfiguration === true),
       skills: version([[...this.skillIds].sort(), this.configurationSkillLibrarySource()]),
       reviewer: version([this.getSessionReviewerSpecialistSettings(sessionId), this.catalog.reviewerSpecialistEnabled]),
@@ -2556,7 +2606,9 @@ export class SessionStore {
     const timeoutSettings = this.getTimeoutSettings();
     const quotaSettings = this.getQuotaSettings();
     const ideaTreeSettings = this.getIdeaTreeSettings();
+    const mcpMetadata = capabilityId === "mcp.header_credential" ? this.configurationMcpHeaderCredential(target) : capabilityId === "mcp.metadata" ? this.configurationMcpMetadata(target) : capabilityId === "mcp.timeout" ? this.configurationMcpTimeout(target) : capabilityId === "mcp.remove_header" ? this.configurationMcpHeaderRemoval(target) : capabilityId === "mcp.remove_env" ? this.configurationMcpEnvironmentRemoval(target) : capabilityId === "mcp.availability" ? this.configurationMcpAvailability(target) : capabilityId === "mcp.delete" ? this.configurationMcpDeletion(target) : undefined;
     let systemVersions: Record<string, string> | undefined;
+    if (mcpMetadata) systemVersions = { mcpMetadata: mcpMetadata.version ?? version([target, null]) };
     if (capabilityId === "timeouts.configure") systemVersions = { timeouts: version(timeoutSettings) };
     else if (capabilityId === "quotas.configure") systemVersions = { quotas: version(quotaSettings) };
     else if (capabilityId === "idea_tree.configure") systemVersions = { ideaTree: version(ideaTreeSettings) };
@@ -2570,8 +2622,37 @@ export class SessionStore {
       const json = this.configurationJsonViewerSettings(sessionId);
       systemVersions = { jsonViewer: version([json.modes, installedPlugins.find(plugin => plugin.id === "artifact-json")]) };
     }
+    if (capabilityId === "memory.enable") systemVersions = { memoryGraph: version(this.catalog.memoryGraphSettings) };
+    if (["provider.connection", "provider.credential", "provider.remove_credential"].includes(capabilityId)) {
+      const children = this.catalog.models.filter(model => model.providerId === target);
+      const keys = new Set([providerSecretKey(target), ...children.map(model => model.id)]);
+      systemVersions = { providerConnection: version([provider ?? null, children, this.providerDiscoveryRevision(target) ?? null,
+        secretRows.filter(row => keys.has(String(row.model_id)))]) };
+    }
+    if (capabilityId === "model.api_identity") systemVersions = { modelApiIdentity: version([model ?? null, provider ?? null,
+      secretRows.filter(row => row.model_id === target || model?.providerId && row.model_id === providerSecretKey(model.providerId))]) };
+    if (capabilityId === "proxy.resources") systemVersions = {
+      proxyCatalog: version(this.configurationProxyResources()),
+      proxyCredentials: version(this.getConfigurationDatabase().prepare("SELECT server_id,encrypted_url FROM proxy_server_secrets ORDER BY server_id").all()),
+      proxyReferences: version([this.catalog.proxyDefaultPolicy, this.catalog.webSettings.proxyPolicy,
+        this.catalog.sandboxNetworkSettings.egressProxyPolicy, this.catalog.models.map(item => [item.id, item.proxyPolicy]),
+        this.catalog.providers.map(item => [item.id, item.proxyPolicy]), this.catalog.mcpProxyPolicies]),
+    };
+    if (capabilityId === "proxy.provider") {
+      const selected = this.getProvider(target), children = this.catalog.models.filter(model => model.providerId === target);
+      const credentialIds = new Set([providerSecretKey(target), ...children.map(model => model.id)]);
+      systemVersions = { providerProxy: version([selected, children, secretRows.filter(row => credentialIds.has(String(row.model_id))),
+        this.catalog.proxyDefaultPolicy, this.catalog.proxyServers,
+        this.getConfigurationDatabase().prepare("SELECT server_id,encrypted_url FROM proxy_server_secrets ORDER BY server_id").all()]) };
+    }
+    if (capabilityId === "proxy.mcp") {
+      const selected = this.configurationMcpProxySettings().services.find(service => service.id === target);
+      systemVersions = { mcpProxy: version([selected, selected ? this.configurationConnectorRevisionSource?.(selected.connectorIds) ?? "not_attached" : "unavailable",
+        this.catalog.proxyDefaultPolicy, this.catalog.proxyServers,
+        this.getConfigurationDatabase().prepare("SELECT server_id,encrypted_url FROM proxy_server_secrets ORDER BY server_id").all()]) };
+    }
     const webCredentialVersion = () => version(this.getConfigurationDatabase().prepare("SELECT provider, encrypted_token FROM web_provider_secrets ORDER BY provider").all());
-    const webProxyVersion = () => version([this.catalog.proxyDefaultPolicy, this.catalog.proxyServers,
+    const webProxyVersion = () => version([this.catalog.proxyDefaultPolicy, this.catalog.proxyServers, this.catalog.proxyNoProxy,
       this.getConfigurationDatabase().prepare("SELECT server_id, encrypted_url FROM proxy_server_secrets ORDER BY server_id").all()]);
     if (capabilityId === "web.credential") systemVersions = {
       webSettings: version(this.catalog.webSettings),
@@ -2594,10 +2675,12 @@ export class SessionStore {
         autoConfigurationPolicy: resourceVersions.autoConfigurationPolicy,
       } : resourceVersions),
       data: {
+        ...(mcpMetadata ? { mcpMetadata } : {}),
         capabilityId, target, sessionId, effective: structuredClone(settings.effective), overrides: structuredClone(session.settingsOverrides),
         globalOverrides: structuredClone(this.catalog.globalSettings), models: structuredClone(this.catalog.models),
         model: model ? structuredClone(model) : undefined, provider: provider ? structuredClone(provider) : undefined,
         tokenOptional: model ? this.modelAllowsMissingToken(model) : false,
+        ...(["provider.connection", "provider.credential", "provider.remove_credential"].includes(capabilityId) ? { providerConnection: this.configurationProviderConnectionSource(target), providers: structuredClone(this.listProviders()) } : {}),
         installedConnectorIds: [...this.connectorIds], inheritedConnectorIds: [...this.getProjectSettings(project.id).effective.enabledConnectorIds],
         sources: structuredClone(settings.sources),
         projectOverrides: structuredClone(project.settingsOverrides),
@@ -2611,6 +2694,10 @@ export class SessionStore {
         timeoutSettings, quotaSettings, ideaTreeSettings,
         ...(capabilityId === "environment.sources" ? { environmentSourceSettings: this.getEnvironmentSourceSettings() } : {}),
         ...(capabilityId === "runner.assign" ? { runnerSelection: this.configurationRunnerSelection(sessionId), runnerResources: this.configurationRunnerResources() } : {}),
+        ...(capabilityId === "memory.enable" ? { memoryGraph: this.configurationMemoryGraph() } : {}),
+        ...(capabilityId === "proxy.resources" ? { proxyResources: this.configurationProxyResources() } : {}),
+        ...(capabilityId === "proxy.provider" ? { providerProxySettings: this.configurationProviderProxySettings() } : {}),
+        ...(capabilityId === "proxy.mcp" ? { mcpProxySettings: this.configurationMcpProxySettings() } : {}),
         ...(capabilityId === "web.credential" ? { webProviders: this.getWebSettings().providers } : {}),
         ...(capabilityId === "web.configure" ? { webSettings: this.getWebSettings(), webProxyPolicies: this.configurationWebProxyPolicies() } : {}),
 
@@ -2953,7 +3040,7 @@ export class SessionStore {
     if (!policy.startsWith("proxy:")) return;
     const serverId = policy.slice("proxy:".length);
     if (!this.getProxyServer(serverId)) {
-      throw new Error(`${field} references an unknown proxy server`);
+      throw new SessionStoreHttpError(`${field} references an unknown proxy server`, 400);
     }
   }
 
@@ -2968,7 +3055,8 @@ export class SessionStore {
   /** Resolve a module policy (undefined behaves like "inherit") into the
    *  transport-agnostic instruction consumed by outbound callers. */
   resolveProxy(policy?: ProxyPolicy): ResolvedProxy {
-    return resolveProxyPolicy(policy, this.proxyRegistryView());
+    const resolved = resolveProxyPolicy(policy, this.proxyRegistryView());
+    return this.catalog.proxyNoProxy !== undefined ? { ...resolved, noProxy: this.catalog.proxyNoProxy } : resolved;
   }
 
   /**
@@ -3015,6 +3103,7 @@ export class SessionStore {
     const environment = proxyEnvironmentDetails(resolveProxyEnvironment());
     return {
       defaultPolicy: this.catalog.proxyDefaultPolicy,
+      ...(this.catalog.proxyNoProxy !== undefined ? { noProxy: this.catalog.proxyNoProxy } : {}),
       servers: this.catalog.proxyServers
         .map((server) => this.proxyServerSettingsView(server, environment))
         .toSorted((left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id)),
@@ -3032,12 +3121,31 @@ export class SessionStore {
   async updateProxySettings(input: UpdateProxySettingsRequest): Promise<ProxySettingsDetails> {
     const defaultPolicy = normalizeProxyDefaultPolicy(isRecord(input) ? input.defaultPolicy : undefined);
     this.assertProxyPolicyKnown(defaultPolicy, "defaultPolicy");
+    const noProxyInput = isRecord(input) ? input.noProxy : undefined;
+    if (noProxyInput !== undefined) {
+      if (typeof noProxyInput !== "string" || noProxyInput.length > 4000 || /[\r\n]/.test(noProxyInput)) throw new Error("Invalid proxy bypass list");
+      // An emptied field stores nothing rather than "", so the process's own
+      // NO_PROXY applies again instead of being overridden by an empty list.
+      const noProxy = noProxyInput.trim();
+      if (noProxy) this.catalog.proxyNoProxy = noProxy;
+      else delete this.catalog.proxyNoProxy;
+    }
     this.catalog.proxyDefaultPolicy = defaultPolicy;
     await this.saveCatalog();
     return this.getProxySettings();
   }
 
-  async createProxyServer(input: CreateProxyServerRequest): Promise<ProxyServer> {
+  /** Metadata only: never reads proxy environment values or decrypts a URL. */
+  configurationProxyResources(): ProxyServer[] {
+    return this.catalog.proxyServers.map(({ id, name, kind, hasUrl, createdAt, updatedAt }) => ({ id, name, kind, hasUrl, createdAt, updatedAt }));
+  }
+
+  renameProxyResourceConfigurationSync(serverId: string, name: string): void {
+    if (!this.getConfigurationDatabase().isTransaction) throw new Error("Proxy configuration requires the shared transaction");
+    this.updateProxyServerSync(serverId, { name });
+  }
+
+  private createProxyServerSync(input: CreateProxyServerRequest): ProxyServer {
     if (!PROXY_SERVER_KINDS.has(input.kind)) {
       throw new Error("Proxy server kind must be custom_url, environment, or system");
     }
@@ -3054,16 +3162,23 @@ export class SessionStore {
       ).run(id, this.encryptModelApiToken(`proxy:${id}`, url));
       hasUrl = true;
     } else if (input.url !== undefined) {
-      throw new Error("Only custom_url proxy servers accept a proxy URL");
+      // "must" keeps this a classified client error (400) instead of a
+      // generic 500 when any other API client sends a url with the kind.
+      throw new Error("A proxy URL is only valid for custom_url proxy servers; other kinds must not send one");
     }
     const now = new Date().toISOString();
     const server: ProxyServer = { createdAt: now, hasUrl, id, kind: input.kind, name, updatedAt: now };
     this.catalog.proxyServers.push(server);
+    return server;
+  }
+
+  async createProxyServer(input: CreateProxyServerRequest): Promise<ProxyServer> {
+    const server = this.createProxyServerSync(input);
     await this.saveCatalog();
     return this.proxyServerSettingsView(server);
   }
 
-  async updateProxyServer(serverId: string, input: UpdateProxyServerRequest): Promise<ProxyServer> {
+  private updateProxyServerSync(serverId: string, input: UpdateProxyServerRequest): ProxyServer {
     const server = this.getProxyServer(serverId);
     if (!server) throw new Error("Proxy server not found");
     // Validate the complete request before mutating catalog state so a mixed
@@ -3078,7 +3193,7 @@ export class SessionStore {
     }
     const nextUrl = input.url === undefined ? undefined : normalizeProxyUrl(input.url);
     if (input.url !== undefined) {
-      if (nextKind !== "custom_url") throw new Error("Only custom_url proxy servers accept a proxy URL");
+      if (nextKind !== "custom_url") throw new Error("A proxy URL is only valid for custom_url proxy servers; other kinds must not send one");
       if (!this.database) throw new Error("Catalog database is not initialized");
       this.database.prepare(
         "INSERT INTO proxy_server_secrets (server_id, encrypted_url) VALUES (?, ?) ON CONFLICT(server_id) DO UPDATE SET encrypted_url = excluded.encrypted_url",
@@ -3092,11 +3207,16 @@ export class SessionStore {
     server.name = nextName;
     server.kind = nextKind;
     server.updatedAt = new Date().toISOString();
+    return server;
+  }
+
+  async updateProxyServer(serverId: string, input: UpdateProxyServerRequest): Promise<ProxyServer> {
+    const server = this.updateProxyServerSync(serverId, input);
     await this.saveCatalog();
     return this.proxyServerSettingsView(server);
   }
 
-  async deleteProxyServer(serverId: string): Promise<void> {
+  private deleteProxyServerSync(serverId: string): void {
     const server = this.getProxyServer(serverId);
     if (!server) throw new Error("Proxy server not found");
     const policy: ProxyPolicy = `proxy:${serverId}`;
@@ -3109,14 +3229,21 @@ export class SessionStore {
     for (const model of this.catalog.models) {
       if (model.proxyPolicy === policy) references.push(`model "${model.name}"`);
     }
+    for (const provider of this.catalog.providers) {
+      if (provider.proxyPolicy === policy) references.push(`provider "${provider.name}"`);
+    }
     for (const [mcpServerId, mcpPolicy] of Object.entries(this.catalog.mcpProxyPolicies)) {
       if (mcpPolicy === policy) references.push(`MCP server "${mcpServerId}"`);
     }
     if (references.length) {
-      throw new Error(`Proxy server is referenced by ${references.join(", ")} and cannot be deleted`);
+      throw new ConfigurationError("PROXY_RESOURCE_IN_USE", `Proxy server is referenced by ${references.join(", ")} and cannot be deleted`, 409);
     }
     this.database?.prepare("DELETE FROM proxy_server_secrets WHERE server_id = ?").run(serverId);
     this.catalog.proxyServers = this.catalog.proxyServers.filter((entry) => entry.id !== serverId);
+  }
+
+  async deleteProxyServer(serverId: string): Promise<void> {
+    this.deleteProxyServerSync(serverId);
     await this.saveCatalog();
   }
 
@@ -3129,14 +3256,19 @@ export class SessionStore {
     return this.catalog.mcpProxyPolicies[serverId] ?? "inherit";
   }
 
-  async updateMcpProxyPolicies(input: UpdateMcpProxyPoliciesRequest): Promise<McpProxyPolicies> {
+  private applyMcpProxyPoliciesSync(input: UpdateMcpProxyPoliciesRequest): McpProxyPolicies {
     const policies = normalizeMcpProxyPolicies(isRecord(input) ? input.policies : undefined);
     for (const [serverId, policy] of Object.entries(policies)) {
       this.assertProxyPolicyKnown(policy, `policies.${serverId}`);
     }
     this.catalog.mcpProxyPolicies = policies;
-    await this.saveCatalog();
     return this.getMcpProxyPolicies();
+  }
+
+  async updateMcpProxyPolicies(input: UpdateMcpProxyPoliciesRequest): Promise<McpProxyPolicies> {
+    const policies = this.applyMcpProxyPoliciesSync(input);
+    await this.saveCatalog();
+    return policies;
   }
 
   async replaceTimeoutSettings(value: unknown): Promise<SystemTimeoutSettings> {
@@ -3169,6 +3301,19 @@ export class SessionStore {
     const row = this.database.prepare("SELECT encrypted_password FROM memory_graph_secret WHERE id = 1")
       .get() as { encrypted_password: string } | undefined;
     return row ? this.decryptModelApiToken("memory-graph:neo4j", row.encrypted_password) : undefined;
+  }
+
+  /** Only the local gate is exposed to conversational configuration; never project a destination or decrypt a credential. */
+  configurationMemoryGraph(): { enabled: boolean; backend: "local" | "neo4j" } {
+    const { enabled, backend } = this.catalog.memoryGraphSettings;
+    return { enabled, backend };
+  }
+
+  applyMemoryGraphParticipationSync(enabled: boolean): void {
+    if (!this.getConfigurationDatabase().isTransaction) throw new Error("Memory configuration requires the shared transaction");
+    if (typeof enabled !== "boolean") throw new Error("Memory enabled must be a boolean");
+    if (this.catalog.memoryGraphSettings.backend !== "local") throw new Error("Conversational memory configuration supports only the local backend");
+    this.catalog.memoryGraphSettings = { ...this.catalog.memoryGraphSettings, enabled };
   }
 
   async updateMemoryGraphSettings(input: UpdateMemoryGraphSettingsRequest): Promise<Omit<MemoryGraphSettingsDetails, "memoryGraphStatus">> {
@@ -3886,6 +4031,34 @@ export class SessionStore {
     }
   }
 
+  private normalizeConnectionUpdateToken(value: string | null | undefined): string | undefined {
+    try { return normalizeApiToken(value); }
+    catch { throw new SessionStoreHttpError("A provided LLM API token must be a non-empty string of at most 16384 characters", 400); }
+  }
+
+  private applyModelMetadataSync(profile: ModelProfile, metadata: Pick<ModelProfile, "name" | "vision" | "thinkingMode" | "thinkingEffort" | "facts">, clearFacts: boolean): void {
+    Object.assign(profile, { name: metadata.name, vision: metadata.vision, thinkingMode: metadata.thinkingMode, thinkingEffort: metadata.thinkingEffort, updatedAt: new Date().toISOString() });
+    if (clearFacts) delete profile.facts;
+    else if (metadata.facts) profile.facts = structuredClone(metadata.facts);
+  }
+
+  configurationModelApiIdentityCandidate(profile: ModelProfile, values: ConfigurationValues) {
+    return validateLiveModel({ ...structuredClone(profile), model: values.apiModel === undefined ? profile.model : String(values.apiModel),
+      apiVariant: values.apiVariant === undefined ? profile.apiVariant : values.apiVariant as ModelProfile["apiVariant"] });
+  }
+
+  private applyModelApiIdentitySync(profile: ModelProfile, candidate: Pick<ModelProfile, "model" | "apiVariant" | "thinkingMode" | "thinkingEffort">): void {
+    Object.assign(profile, { model: candidate.model, apiVariant: candidate.apiVariant, thinkingMode: candidate.thinkingMode,
+      thinkingEffort: candidate.thinkingEffort, updatedAt: new Date().toISOString() });
+  }
+
+  applyModelApiIdentityConfigurationSync(modelId: string, values: ConfigurationValues): void {
+    if (!this.getConfigurationDatabase().isTransaction) throw new Error("Model API identity writes require the shared transaction");
+    const profile = this.getModel(modelId);
+    if (!profile) throw new Error("Model not found");
+    this.applyModelApiIdentitySync(profile, this.configurationModelApiIdentityCandidate(profile, values));
+  }
+
   async updateModel(modelId: string, input: UpdateModelProfileRequest): Promise<ModelProfile> {
     const profile = this.getModel(modelId);
     if (!profile) throw new Error("Model not found");
@@ -3894,18 +4067,21 @@ export class SessionStore {
     if (provider && (normalized.baseUrl !== provider.baseUrl || normalized.apiProtocol !== provider.apiProtocol)) {
       throw new Error("The base URL and API protocol of a provider model cannot be changed here; edit the provider instead");
     }
-    Object.assign(profile, normalized, { updatedAt: new Date().toISOString() });
-    // `null` is an explicit "drop my overrides" so the listing and the catalog
-    // answer again; an absent key keeps whatever was saved.
-    if (input.facts === null) delete profile.facts;
+    // Validate the complete candidate before touching the live connection object.
+    const proxyPolicy = input.proxyPolicy === undefined ? profile.proxyPolicy : this.normalizeModelProxyPolicy(input.proxyPolicy);
+    const apiToken = this.normalizeConnectionUpdateToken(input.apiToken);
+    const { name, vision, thinkingMode, thinkingEffort, facts, ...connection } = normalized;
+    Object.assign(profile, connection);
+    this.applyModelMetadataSync(profile, { name, vision, thinkingMode, thinkingEffort, facts }, input.facts === null);
+    this.applyModelApiIdentitySync(profile, normalized);
     if (input.proxyPolicy !== undefined) {
-      profile.proxyPolicy = this.normalizeModelProxyPolicy(input.proxyPolicy);
+      profile.proxyPolicy = proxyPolicy;
     }
     if (input.apiToken === null) {
       this.setModelApiToken(modelId, undefined);
       profile.hasApiToken = provider?.hasApiToken === true;
     } else if (input.apiToken !== undefined) {
-      this.setModelApiToken(modelId, normalizeApiToken(input.apiToken));
+      this.setModelApiToken(modelId, apiToken);
       profile.hasApiToken = true;
     }
     await this.saveCatalog();
@@ -3980,6 +4156,20 @@ export class SessionStore {
     return this.catalog.providers.find((provider) => provider.id === providerId);
   }
 
+  /** Internal discovery-cache identity. Credential generations are ciphertext, never plaintext key hashes. */
+  providerDiscoveryRevision(providerId: string): string | undefined {
+    const provider = this.getProvider(providerId);
+    if (!provider) return undefined;
+    const database = this.getConfigurationDatabase();
+    const policy = provider.proxyPolicy === "inherit" ? this.catalog.proxyDefaultPolicy : provider.proxyPolicy;
+    const proxyId = policy.startsWith("proxy:") ? policy.slice(6) : undefined;
+    return createHash("sha256").update(canonicalConfiguration([
+      provider, database.prepare("SELECT encrypted_token FROM model_secrets WHERE model_id=?").get(providerSecretKey(providerId)) ?? null,
+      policy, proxyId ? this.catalog.proxyServers.find(server => server.id === proxyId) ?? null : null,
+      proxyId ? database.prepare("SELECT encrypted_url FROM proxy_server_secrets WHERE server_id=?").get(proxyId) ?? null : null,
+    ])).digest("hex");
+  }
+
   private setProviderApiToken(providerId: string, apiToken: string | undefined): void {
     this.setModelApiToken(providerSecretKey(providerId), apiToken);
   }
@@ -4027,34 +4217,102 @@ export class SessionStore {
     return provider;
   }
 
-  async updateProvider(providerId: string, input: UpdateModelProviderRequest): Promise<ModelProvider> {
+  configurationProviderConnectionSource(providerId: string) {
+    const provider = this.getProvider(providerId);
+    return { provider: provider ? structuredClone(provider) : undefined,
+      children: this.catalog.models.filter(model => model.providerId === providerId).map(model => structuredClone(model)) };
+  }
+
+  private normalizeProviderConnection(provider: ModelProvider, input: UpdateModelProviderRequest) {
+    return validateLiveProvider({ apiProtocol: input.apiProtocol ?? provider.apiProtocol,
+      apiVariant: input.apiVariant ?? (input.apiProtocol !== undefined && input.apiProtocol !== provider.apiProtocol ? undefined : provider.apiVariant),
+      baseUrl: input.baseUrl ?? provider.baseUrl, modelDiscovery: input.modelDiscovery ?? provider.modelDiscovery,
+      name: input.name ?? provider.name, presetId: provider.presetId });
+  }
+
+  configurationProviderConnectionCandidate(provider: ModelProvider, values: ConfigurationValues) {
+    const input = { ...values } as UpdateModelProviderRequest;
+    if (input.apiProtocol !== undefined && input.apiProtocol !== provider.apiProtocol) {
+      input.apiVariant ??= DEFAULT_MODEL_API_VARIANT[input.apiProtocol];
+      input.modelDiscovery ??= DEFAULT_MODEL_DISCOVERY[input.apiProtocol];
+    }
+    return this.normalizeProviderConnection(provider, input);
+  }
+
+  private applyProviderConnectionSync(provider: ModelProvider, connection: ReturnType<SessionStore["normalizeProviderConnection"]>): void {
+    Object.assign(provider, connection, { updatedAt: new Date().toISOString() });
+  }
+
+  applyProviderConnectionConfigurationSync(providerId: string, values: ConfigurationValues): void {
+    if (!this.getConfigurationDatabase().isTransaction) throw new Error("Provider connection writes require the shared transaction");
     const provider = this.getProvider(providerId);
     if (!provider) throw new Error("Provider not found");
     const previousProtocol = provider.apiProtocol;
-    const normalized = validateLiveProvider({
-      apiProtocol: input.apiProtocol ?? provider.apiProtocol,
-      apiVariant: input.apiVariant
-        ?? (input.apiProtocol !== undefined && input.apiProtocol !== provider.apiProtocol ? undefined : provider.apiVariant),
-      baseUrl: input.baseUrl ?? provider.baseUrl,
-      modelDiscovery: input.modelDiscovery ?? provider.modelDiscovery,
-      name: input.name ?? provider.name,
-      presetId: provider.presetId,
-    });
-    Object.assign(provider, normalized, { updatedAt: new Date().toISOString() });
+    this.applyProviderConnectionSync(provider, this.configurationProviderConnectionCandidate(provider, values));
+    this.syncProviderModels(provider, previousProtocol);
+  }
+
+  /** Shared by formal settings and the transactional conversational credential adapter. */
+  private applyProviderCredentialSync(provider: ModelProvider, apiToken: string | undefined): void {
+    this.setProviderApiToken(provider.id, apiToken);
+    provider.hasApiToken = Boolean(apiToken);
+    provider.updatedAt = new Date().toISOString();
+    for (const profile of this.catalog.models) if (profile.providerId === provider.id) {
+      profile.hasApiToken = this.profileHasOwnToken(profile.id) || provider.hasApiToken;
+      profile.updatedAt = provider.updatedAt;
+    }
+  }
+
+  applyProviderCredentialConfigurationSync(providerId: string, apiToken: string): void {
+    if (!this.getConfigurationDatabase().isTransaction) throw new Error("Provider credential writes require the shared transaction");
+    const provider = this.getProvider(providerId);
+    if (!provider) throw new Error("Provider not found");
+    const normalized = this.normalizeConnectionUpdateToken(apiToken);
+    if (!normalized) throw new Error("A replacement credential is required");
+    this.applyProviderCredentialSync(provider, normalized);
+  }
+
+  removeProviderCredentialConfigurationSync(providerId: string): void {
+    if (!this.getConfigurationDatabase().isTransaction) throw new Error("Provider credential writes require the shared transaction");
+    const provider = this.getProvider(providerId);
+    if (!provider) throw new Error("Provider not found");
+    this.applyProviderCredentialSync(provider, undefined);
+  }
+
+  private applyProviderUpdateSync(providerId: string, input: UpdateModelProviderRequest): ModelProvider {
+    const provider = this.getProvider(providerId);
+    if (!provider) throw new Error("Provider not found");
+    const previousProtocol = provider.apiProtocol;
+    const normalized = this.normalizeProviderConnection(provider, input);
+    // Validate the complete candidate before touching the live connection object.
+    const proxyPolicy = input.proxyPolicy === undefined ? provider.proxyPolicy : this.normalizeModelProxyPolicy(input.proxyPolicy);
+    const apiToken = this.normalizeConnectionUpdateToken(input.apiToken);
+    this.applyProviderConnectionSync(provider, normalized);
     if (input.tokenOptional !== undefined) provider.tokenOptional = input.tokenOptional === true;
     if (input.proxyPolicy !== undefined) {
-      provider.proxyPolicy = this.normalizeModelProxyPolicy(input.proxyPolicy);
+      provider.proxyPolicy = proxyPolicy;
     }
-    if (input.apiToken === null) {
-      this.setProviderApiToken(providerId, undefined);
-      provider.hasApiToken = false;
-    } else if (input.apiToken !== undefined) {
-      this.setProviderApiToken(providerId, normalizeApiToken(input.apiToken));
-      provider.hasApiToken = true;
-    }
+    if (input.apiToken !== undefined) this.applyProviderCredentialSync(provider, apiToken);
     this.syncProviderModels(provider, previousProtocol);
+    return provider;
+  }
+
+  async updateProvider(providerId: string, input: UpdateModelProviderRequest): Promise<ModelProvider> {
+    const provider = this.applyProviderUpdateSync(providerId, input);
     await this.saveCatalog();
     return provider;
+  }
+
+  applyProviderProxyConfigurationSync(providerId: string, proxyPolicy: ProxyPolicy): void {
+    if (!this.getConfigurationDatabase().isTransaction) throw new Error("Provider proxy configuration requires the shared transaction");
+    this.applyProviderUpdateSync(providerId, { proxyPolicy });
+  }
+
+  configurationProviderProxySettings() {
+    return { defaultPolicy: this.catalog.proxyDefaultPolicy,
+      providers: this.listProviders().map(provider => ({ id: provider.id, name: provider.name, proxyPolicy: provider.proxyPolicy,
+        modelCount: this.catalog.models.filter(model => model.providerId === provider.id).length })),
+      servers: this.catalog.proxyServers.map(server => ({ id: server.id, name: server.name, kind: server.kind })) };
   }
 
   async deleteProvider(providerId: string, replacementModelId?: string | null): Promise<void> {
@@ -4439,6 +4697,8 @@ export class SessionStore {
     } = {},
     options: {
       allowUnconfiguredModel?: boolean;
+      /** Choose a saved model for a new interactive session when no default is set. */
+      selectFallbackModel?: boolean;
       researchSnapshot?: Session["researchSnapshot"];
       restorationSessionId?: string;
     } = {},
@@ -4449,10 +4709,23 @@ export class SessionStore {
       ? { modelId: input, reviewModelId: input }
       : input);
     if (settingsOverrides.defaultApprovalMode !== undefined) throw new SessionStoreHttpError("Approval defaults are only supported at Global and Project scope", 400);
-    const resolved = this.resolveSettingsLayers([
+    let resolved = this.resolveSettingsLayers([
       ...this.projectSettingsLayers(project),
       { overrides: settingsOverrides, source: "session" },
     ]);
+    if (options.selectFallbackModel && resolved.effective.modelId === undefined
+      && settingsOverrides.modelId === undefined) {
+      const fallback = this.listModels()[0];
+      if (fallback) {
+        // Persist only this new session's fallback. Global/Project defaults and
+        // existing sessions (including deleted explicit choices) stay intact.
+        settingsOverrides.modelId = fallback.id;
+        resolved = this.resolveSettingsLayers([
+          ...this.projectSettingsLayers(project),
+          { overrides: settingsOverrides, source: "session" },
+        ]);
+      }
+    }
     const selectedModel = this.getModel(resolved.effective.modelId);
     if (!selectedModel && !options.allowUnconfiguredModel) {
       throw new SessionStoreHttpError("A task model is required", 400, "SESSION_MODEL_UNAVAILABLE");
@@ -4677,6 +4950,9 @@ export class SessionStore {
     input: SubagentInput,
     execution: {
       maxTurns?: number;
+      /** The bound the engine enforces, which is lower than `maxTurns` when the
+       *  configured budget is above the engine ceiling (#1106). */
+      effectiveMaxTurns?: number;
       model?: ModelRunInfo;
       specialistConfigHash?: string;
       timeoutSeconds?: number;
@@ -4706,6 +4982,7 @@ export class SessionStore {
         subagentType: input.subagentType?.trim() || "general-purpose",
       },
       maxTurns: execution.maxTurns ?? input.maxTurns ?? DEFAULT_SUBAGENT_MAX_TURNS,
+      ...(execution.effectiveMaxTurns !== undefined ? { effectiveMaxTurns: execution.effectiveMaxTurns } : {}),
       ...(execution.model ? { model: structuredClone(execution.model) } : {}),
       parentTurnId,
       sessionId,
@@ -7023,19 +7300,58 @@ export class SessionStore {
     streamId: string,
     after = 0,
   ): Promise<SessionRunEvent[]> {
+    return await this.readRunStreamEvents(sessionId, runId, streamId, (record) => record.sequence > after);
+  }
+
+  /**
+   * One event type out of a run stream, without materialising the rest.
+   *
+   * The plan panel asks for `plan.updated` on every state query
+   * (`plugins/control.ts`), and reading the whole stream first made a panel
+   * refresh cost every delta of the run — the same allocation the cursor read
+   * above was fixed for (#1011). The envelope is identical to
+   * `listRunStreamEvents`, so a caller can swap between them.
+   */
+  async listRunStreamEventsOfType(
+    sessionId: string,
+    runId: string,
+    streamId: string,
+    type: SessionRunEvent["event"]["type"],
+  ): Promise<SessionRunEvent[]> {
+    return await this.readRunStreamEvents(sessionId, runId, streamId, (record) => record.event.type === type);
+  }
+
+  /**
+   * The two readers above share the same two-source walk and envelope, only the
+   * per-record predicate differs. Keeping it in one place means a third reader
+   * adds a predicate instead of a copy of the read-and-sort body.
+   */
+  private async readRunStreamEvents(
+    sessionId: string,
+    runId: string,
+    streamId: string,
+    keep: (record: { sequence: number; event: SessionRunEvent["event"] }) => boolean,
+  ): Promise<SessionRunEvent[]> {
     const run = await this.getSessionRun(sessionId, runId);
     if (!run) throw new Error("Run not found");
     assertValidStreamId(streamId);
     const records: SessionRunEvent[] = [];
     if (streamId === MAIN_RUN_STREAM) {
-      records.push(...await this.readArray<SessionRunEvent>(this.sessionRunEventsPath(sessionId, runId)));
+      // Apply the predicate while copying. Collecting first and filtering after
+      // made every cursor read cost the whole history twice: once as the stored
+      // array and once as the filtered copy (#1011).
+      for (const record of await this.readArray<SessionRunEvent>(this.sessionRunEventsPath(sessionId, runId))) {
+        if (keep(record)) records.push(record);
+      }
     }
-    for (const line of await this.readStreamLines(this.runStreamPath(sessionId, runId, streamId))) {
+    // The stream is ordered by sequence, so a line the predicate drops is
+    // discarded before its record is built: retention is the requested tail,
+    // not the file.
+    for await (const line of this.streamLines(this.runStreamPath(sessionId, runId, streamId))) {
+      if (!keep(line)) continue;
       records.push({ createdAt: line.createdAt, event: line.event, runId, sequence: line.sequence, sessionId });
     }
-    return records
-      .filter((record) => record.sequence > after)
-      .toSorted((left, right) => left.sequence - right.sequence);
+    return records.toSorted((left, right) => left.sequence - right.sequence);
   }
 
   async appendSessionRunEvent(
@@ -7052,7 +7368,15 @@ export class SessionStore {
       throw error;
     });
     const streams = new Set([MAIN_RUN_STREAM, ...names.filter((name) => name.endsWith(".jsonl")).map((name) => name.slice(0, -6))]);
-    return await Promise.all([...streams].map(async (streamId) => ({ streamId, events: await this.listRunStreamEvents(sessionId, runId, streamId) })));
+    // One stream at a time. The package still needs every event of every stream,
+    // so the result is the same size either way; reading them concurrently just
+    // multiplied the transient parse copies while the archive is being built
+    // (#1011).
+    const exported: Array<{ streamId: string; events: SessionRunEvent[] }> = [];
+    for (const streamId of streams) {
+      exported.push({ streamId, events: await this.listRunStreamEvents(sessionId, runId, streamId) });
+    }
+    return exported;
   }
 
   /** Restore archived observations without publishing live events or replaying work. */
@@ -7134,12 +7458,6 @@ export class SessionStore {
       }
     }
     return last;
-  }
-
-  private async readStreamLines(path: string): Promise<RunStreamLine[]> {
-    const records: RunStreamLine[] = [];
-    for await (const record of this.streamLines(path)) records.push(record);
-    return records;
   }
 
   /**
@@ -7353,6 +7671,11 @@ export class SessionStore {
           && record.invocationId === usage.invocationId
           && record.invocationKind === usage.invocationKind
           && record.attemptIndex === usage.attemptIndex)) {
+          // Absorbing an intentional replay is correct, but doing it silently made
+          // a writer that keyed distinct calls the same way look like correct
+          // idempotency: an Evolve run recorded one row for 73 calls and nothing
+          // anywhere said so (#1132). The key is named so the caller can be found.
+          console.warn(`model_usage_append_deduplicated: ${usage.invocationKind} ${usage.invocationId} attempt ${usage.attemptIndex} in session ${usage.sessionId}`);
           return;
         }
         records.push(this.normalizeModelInvocationUsage(usage));
@@ -7515,9 +7838,13 @@ export class SessionStore {
 
   async appendMcpInvocation(invocation: McpInvocation): Promise<void> {
     this.assertSessionWritable(invocation.sessionId);
-    const values = await this.listMcpInvocations(invocation.sessionId);
-    values.push(invocation);
-    await this.writeArray(this.mcpInvocationsPath(invocation.sessionId), values);
+    await this.mutateArray<McpInvocation, void>(
+      this.mcpInvocationsPath(invocation.sessionId),
+      (values) => {
+        this.assertSessionWritable(invocation.sessionId);
+        values.push(structuredClone(invocation));
+      },
+    );
   }
 
   async listMcpInvocations(sessionId: string): Promise<McpInvocation[]> {
@@ -7527,9 +7854,13 @@ export class SessionStore {
 
   async appendPaperAcquisition(acquisition: PaperAcquisition): Promise<void> {
     this.assertSessionWritable(acquisition.sessionId);
-    const values = await this.listPaperAcquisitions(acquisition.sessionId);
-    values.push(acquisition);
-    await this.writeArray(this.paperAcquisitionsPath(acquisition.sessionId), values);
+    await this.mutateArray<PaperAcquisition, void>(
+      this.paperAcquisitionsPath(acquisition.sessionId),
+      (values) => {
+        this.assertSessionWritable(acquisition.sessionId);
+        values.push(structuredClone(acquisition));
+      },
+    );
   }
 
   async listPaperAcquisitions(sessionId: string): Promise<PaperAcquisition[]> {
@@ -7539,9 +7870,13 @@ export class SessionStore {
 
   async appendPaperVisionRun(run: PaperVisionRun): Promise<void> {
     this.assertSessionWritable(run.sessionId);
-    const values = await this.listPaperVisionRuns(run.sessionId);
-    values.push(run);
-    await this.writeArray(this.paperVisionRunsPath(run.sessionId), values);
+    await this.mutateArray<PaperVisionRun, void>(
+      this.paperVisionRunsPath(run.sessionId),
+      (values) => {
+        this.assertSessionWritable(run.sessionId);
+        values.push(structuredClone(run));
+      },
+    );
   }
 
   async listPaperVisionRuns(sessionId: string): Promise<PaperVisionRun[]> {

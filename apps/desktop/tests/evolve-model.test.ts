@@ -25,8 +25,10 @@ import {
   evolveCommandAlgorithm,
   evolveCommandCheckpointMode,
   evolveCommandGoal,
+  evolveDraftTask,
   isEvolveCommand,
   isEvolveSkill,
+  latestEvolveCheckpointMode,
   splitEvolveCommand,
 } from "../src/evolve/command.js";
 import {
@@ -237,6 +239,18 @@ test("the command parses only as the first word", () => {
   );
 });
 
+test("a draft opens the dialog with the words already written", () => {
+  // A command contributes the sentence after its flags; the flags themselves
+  // are the dialog's own controls and are not re-asked as text.
+  assert.equal(evolveDraftTask("/evolve-design --algorithm openevolve faster"), "faster");
+  assert.equal(evolveDraftTask("/evolve-design"), undefined);
+  // A sentence typed before the surface opened is the task, not noise.
+  assert.equal(evolveDraftTask("  让压缩比更高  "), "让压缩比更高");
+  // A bare slash query is a palette pick, not a task.
+  assert.equal(evolveDraftTask("/evolve"), undefined);
+  assert.equal(evolveDraftTask("   "), undefined);
+});
+
 test("the pace flag is read as a flag, not as part of the goal", () => {
   // The dialog and a typed command produce the flags in the same order, but a
   // person may type them the other way round; both have to reach the agent
@@ -259,6 +273,21 @@ test("the pace flag is read as a flag, not as part of the goal", () => {
   assert.equal(evolveCommandCheckpointMode("/evolve-design --no-confirm faster"), "auto");
   assert.equal(evolveCommandCheckpointMode("/evolve-design faster"), "confirm");
   assert.equal(evolveCommandCheckpointMode("hello"), undefined);
+
+  // The pace the Session is on is the latest design command's, including one
+  // still being sent — a continuation, a question and an earlier design are
+  // not commands.
+  const user = (content: string) => ({ content, role: "user" });
+  const reply = (content: string) => ({ content, role: "assistant" });
+  assert.equal(latestEvolveCheckpointMode([]), undefined);
+  assert.equal(latestEvolveCheckpointMode([user("/evolve-design one")]), "confirm");
+  assert.equal(latestEvolveCheckpointMode([user("/evolve-design one"), reply("ok"), user("继续步骤 1/4")]), "confirm");
+  assert.equal(
+    latestEvolveCheckpointMode([user("/evolve-design --no-confirm one"), user("/evolve-design two")]),
+    "confirm",
+  );
+  assert.equal(latestEvolveCheckpointMode([user("/evolve-design one")], "/evolve-design --no-confirm two"), "auto");
+  assert.equal(latestEvolveCheckpointMode([user("/evolve-design --no-confirm one")], "继续步骤 1/4"), "auto");
 
   assert.equal(evolveCommandAlgorithm("/evolve-design --algorithm openevolve faster"), "openevolve");
   assert.equal(evolveCommandAlgorithm("/evolve-design --no-confirm --algorithm puct faster"), "puct");

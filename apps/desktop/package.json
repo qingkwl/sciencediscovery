@@ -6,7 +6,7 @@
   "scripts": {
     "build": "vite build",
     "dev": "vite",
-    "test": "tsx --test tests/*.test.ts tests/*.test.tsx",
+    "test": "tsx --import ./tests/support/css-preload.mjs --test tests/*.test.ts tests/*.test.tsx",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
@@ -17,7 +17,8 @@
     "react": "19.2.7",
     "react-dom": "19.2.7",
     "react-markdown": "^10.1.0",
-    "remark-gfm": "^4.0.1"
+    "remark-gfm": "^4.0.1",
+    "@sciencediscovery/configuration-ui": "workspace:*"
   },
   "devDependencies": {
     "@types/react": "19.2.17",

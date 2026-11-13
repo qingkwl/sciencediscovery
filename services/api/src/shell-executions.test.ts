@@ -414,6 +414,151 @@ test("explicit cancellation retains committed result and stopped Agent inbox wit
   assert.equal(f.notices.timers(owner)[0]!.state, "cancelled");
 });
 
+test("cancelling an unconfirmed execution settles it instead of blocking the workspace forever", async (context) => {
+  // #1012: the record was left `unknown` by a failed commit, the workspace guard
+  // then refused every new command in it, and `cancel` only forwarded to the
+  // Runner — which no longer held the execution, so the request never answered
+  // and the project delete waited behind it until the adapter deadline.
+  const f = await fixture(context);
+  let cancelled = 0;
+  const runner = {
+    startShellExecution: async () => { throw new TypeError("fetch failed"); },
+    cancelShellExecution: async () => { cancelled++; throw Object.assign(new Error("Execution not found for this Agent"), { statusCode: 404 }); },
+  } as unknown as RunnerClient;
+  const job = await f.service.start(owner, identity, () => runner, (id, dispatch) => dispatch(request(id)));
+  assert.equal(job.state, "unknown", "the lost submission is still unconfirmed");
+
+  const settled = await f.service.cancel(job.id, owner, () => runner);
+  assert.equal(cancelled, 1, "the Runner is still asked to cancel");
+  assert.equal(settled.state, "cancelled", "the local record reaches a terminal state anyway");
+  assert.equal(settled.provenance, "unconfirmed", "the outcome was never confirmed and the record says so");
+  assert.equal(settled.finalization, "committed");
+  assert.equal(settled.finishedAt !== undefined, true);
+  assert.match(settled.error ?? "", /Cancelled before the Runner confirmed the outcome/);
+
+  // The workspace is usable again: the guard no longer finds an unknown record.
+  let submissions = 0;
+  const healthy = {
+    startShellExecution: async (r: ShellExecutionRequest) => { submissions++; return { ...owner, id: r.executionId, state: "running", queuedAt: "now" }; },
+  } as unknown as RunnerClient;
+  await assert.doesNotReject(f.service.start(owner, identity, () => healthy, (id, dispatch) => dispatch(request(id))));
+  assert.equal(submissions, 1, "a cancelled unknown no longer blocks new work");
+});
+
+test("a cancelled unconfirmed execution is not reopened by the recovery scan", async (context) => {
+  // The settlement only holds if the scan leaves it alone: `scanPending` used to
+  // select anything whose provenance was not `committed`, so the next tick
+  // reopened a cancelled record as `unknown` and the workspace blocked again.
+  const f = await fixture(context);
+  const runner = {
+    startShellExecution: async () => { throw new TypeError("fetch failed"); },
+    cancelShellExecution: async () => { throw Object.assign(new Error("Execution not found"), { statusCode: 404 }); },
+  } as unknown as RunnerClient;
+  const job = await f.service.start(owner, identity, () => runner, (id, dispatch) => dispatch(request(id)), recoveryContext);
+  const settled = await f.service.cancel(job.id, owner, () => runner);
+  assert.equal(settled.state, "cancelled");
+
+  f.service.configureRecovery({ runner: () => runner, finalize: async (_context: unknown, result: ShellExecutionResult) => result });
+  await f.service.reconcilePending(undefined, true);
+  const after = await f.service.get(job.id, owner);
+  assert.equal(after.state, "cancelled", "a settled record is not reopened");
+  assert.equal(after.provenance, "unconfirmed");
+  assert.equal(after.finalization, "committed");
+  assert.equal(after.finishedAt, settled.finishedAt);
+  assert.equal(after.observation?.lastError?.code, settled.observation?.lastError?.code);
+
+  // A context-carrying submission is the shape the workspace guard checks.
+  let submissions = 0;
+  const healthy = {
+    startShellExecution: async (r: ShellExecutionRequest) => { submissions++; return { ...owner, id: r.executionId, state: "running", queuedAt: "now" }; },
+  } as unknown as RunnerClient;
+  await assert.doesNotReject(f.service.start(owner, identity, () => healthy, (id, dispatch) => dispatch(request(id)), recoveryContext));
+  assert.equal(submissions, 1, "the workspace accepts work after the cancel and a full scan");
+});
+
+test("an explicit status read does not reopen a cancelled record", async (context) => {
+  // `agent-run/workspace-bindings.ts` reconciles before every `get`/`wait`, and a
+  // settled cancel is deliberately `provenance: "unconfirmed"`, so reading the status
+  // the guard recommends used to push the record back to `unknown` — #1012 again, this
+  // time through the one action the guard's own message asks for.
+  const f = await fixture(context);
+  const runner = {
+    startShellExecution: async () => { throw new TypeError("fetch failed"); },
+    cancelShellExecution: async () => { throw Object.assign(new Error("Execution not found"), { statusCode: 404 }); },
+    getShellExecution: async () => { throw Object.assign(new Error("Execution not found"), { statusCode: 404 }); },
+  } as unknown as RunnerClient;
+  const job = await f.service.start(owner, identity, () => runner, (id, dispatch) => dispatch(request(id)), recoveryContext);
+  const settled = await f.service.cancel(job.id, owner, () => runner);
+  assert.equal(settled.state, "cancelled");
+
+  const after = await f.service.reconcile(job.id, owner,
+    { runner: () => runner, finalize: async (_context: unknown, result: ShellExecutionResult) => result });
+  assert.equal(after.state, "cancelled", "a status read leaves the settlement alone");
+  assert.equal(after.provenance, "unconfirmed");
+  assert.equal(after.finalization, "committed");
+  assert.equal(after.finishedAt, settled.finishedAt);
+  assert.equal(after.observation?.lastError?.code, settled.observation?.lastError?.code);
+
+  let submissions = 0;
+  const healthy = {
+    startShellExecution: async (r: ShellExecutionRequest) => { submissions++; return { ...owner, id: r.executionId, state: "running", queuedAt: "now" }; },
+  } as unknown as RunnerClient;
+  await assert.doesNotReject(f.service.start(owner, identity, () => healthy, (id, dispatch) => dispatch(request(id)), recoveryContext));
+  assert.equal(submissions, 1, "the workspace accepts work after the status read");
+});
+
+test("a concurrent observer write during cancel does not fail the settlement", async (context) => {
+  // `reconcile` runs before every `execution_status` / `wait`, and each of those
+  // rewrites an `unknown` record, so the settlement's revision CAS can lose. The
+  // cancel is idempotent, so it must re-read and settle rather than answering 500
+  // with nothing settled — the guard's own message tells the agent to poll the
+  // status, so this overlap is the normal shape of the #1012 flow.
+  const f = await fixture(context);
+  const started: { id: string }[] = [];
+  const runner = {
+    startShellExecution: async () => { throw new TypeError("fetch failed"); },
+    getShellExecution: async () => { throw Object.assign(new Error("Execution not found"), { statusCode: 404 }); },
+    cancelShellExecution: async () => {
+      // An observer write lands while the cancel request is in flight.
+      await f.service.reconcile(started[0]!.id, owner,
+        { runner: () => runner, finalize: async (_context: unknown, result: ShellExecutionResult) => result });
+      throw Object.assign(new Error("Execution not found"), { statusCode: 404 });
+    },
+  } as unknown as RunnerClient;
+  const job = await f.service.start(owner, identity, () => runner, (id, dispatch) => dispatch(request(id)), recoveryContext);
+  started.push(job);
+  assert.equal(job.state, "unknown");
+  const before = await f.service.get(job.id, owner);
+
+  const settled = await f.service.cancel(job.id, owner, () => runner);
+  assert.ok((settled.observation?.failureCount ?? 0) > (before.observation?.failureCount ?? 0),
+    "the observer really rewrote the record mid-cancel");
+  assert.equal(settled.state, "cancelled", "the cancel still settles instead of rejecting");
+  assert.equal(settled.provenance, "unconfirmed");
+  assert.equal(settled.finalization, "committed");
+  assert.equal(settled.finishedAt !== undefined, true);
+
+  let submissions = 0;
+  const healthy = {
+    startShellExecution: async (r: ShellExecutionRequest) => { submissions++; return { ...owner, id: r.executionId, state: "running", queuedAt: "now" }; },
+  } as unknown as RunnerClient;
+  await assert.doesNotReject(f.service.start(owner, identity, () => healthy, (id, dispatch) => dispatch(request(id)), recoveryContext));
+  assert.equal(submissions, 1, "the workspace accepts work after the racing cancel");
+});
+
+test("a confirmed-running execution still reports a failed cancel", async (context) => {
+  // The best-effort path is only for an outcome nobody can read. A Runner that
+  // refuses to cancel work it knows about must keep failing loudly.
+  const f = await fixture(context);
+  const runner = {
+    cancelShellExecution: async () => { throw Object.assign(new Error("Runner refused"), { statusCode: 500 }); },
+    getShellExecution: async () => new Promise(() => undefined),
+    startShellExecution: async (r: ShellExecutionRequest) => ({ ...owner, id: r.executionId, state: "running", queuedAt: "now" }),
+  } as unknown as RunnerClient;
+  const job = await f.service.start(owner, identity, () => runner, async (id, dispatch) => dispatch(request(id)));
+  await assert.rejects(f.service.cancel(job.id, owner, () => runner), /Runner refused/);
+});
+
 test("lost submission and API restart are unknown, never command replay", async (context) => {
   const f = await fixture(context); let submitted = 0;
   const runner = { startShellExecution: async () => { submitted++; throw new Error("lost response"); } } as unknown as RunnerClient;
@@ -666,6 +811,129 @@ test("failed finalization retries pinned bytes across restart despite later Runn
   const restarted = new ShellExecutions(f.db, f.versions, f.notices);
   const final = await restarted.reconcile(lost.job.id, owner, { runner: () => lost.runner, finalize: async (_, result) => { assert.deepEqual(result, first); return result; } });
   assert.equal(final.state, "completed"); assert.equal(lost.submissions(), 1); assert.equal(reads, 2);
+});
+
+test("a failing provenance commit stops being retried and stops rewriting the record", async context => {
+  // #1018: the record was rescheduled every few seconds forever, and each retry
+  // rewrote the ledger. An export revision hashes that ledger, so the session
+  // became permanently un-exportable. The outcome still must not settle by
+  // itself — that needs an explicit cancel — but the churn has to end.
+  const f = await fixture(context);
+  const lost = await lostAck(f, async id => recoveredTerminal(id, f));
+  const handlers = { runner: () => lost.runner,
+    finalize: async () => { throw new Error("storage unavailable"); } };
+  let record = await f.service.reconcile(lost.job.id, owner, handlers);
+  assert.equal(record.finalization, "failed");
+  assert.equal(record.state, "unknown");
+  assert.equal(record.observation?.lastError?.retryable, true, "the first attempts still retry");
+
+  const before = JSON.stringify(record.observation);
+  // Keep forcing reconciliation; the retry budget has to run out.
+  for (let round = 0; round < 12; round += 1) {
+    record = await f.service.reconcile(lost.job.id, owner, handlers);
+  }
+  assert.equal(record.observation?.lastError?.retryable, false, "retrying stopped");
+  assert.equal(record.observation?.nextRetryAt, undefined, "nothing schedules another attempt");
+  assert.match(record.observation?.lastError?.message ?? "", /Retrying the commit stopped after 5 attempts/);
+  assert.equal(record.state, "unknown", "the outcome stays unconfirmed until someone cancels it");
+  assert.notEqual(JSON.stringify(record.observation), before);
+});
+
+test("a failing authoritative-failure commit is bounded too, not just an existing result", async context => {
+  // The other provenance commit in this file: a terminal failure with no result goes
+  // through `finalizeFailure`, so it pins `candidateFailure` and never a
+  // `candidateResultRef`. The budget used to require the result ref, so `observed()`
+  // reopened this record on every attempt, `failureCount` never left 1 and the loop ran
+  // forever — the #1018 churn, through the second commit shape.
+  const f = await fixture(context);
+  const lost = await lostAck(f, async id => ({ ...owner, id, state: "failed", queuedAt: "now", receipt: receipt(2),
+    finishedAt: "2026-01-01T00:00:01.000Z", error: "Admission denied",
+    evidence: { runnerInstanceId: "original-ledger", runnerBootId: "boot-one", revision: 2, processTerminated: true, terminationReason: "not_started" } }));
+  let attempts = 0;
+  let during: unknown;
+  const handlers = { runner: () => lost.runner, finalize: async (_: unknown, result: ShellExecutionResult) => result,
+    finalizeFailure: async () => {
+      attempts += 1;
+      if (attempts === 2) during = f.service.revisionSnapshot(owner.sessionId);
+      throw new Error("audit storage unavailable");
+    } };
+  let record = await f.service.reconcile(lost.job.id, owner, handlers);
+  assert.equal(record.finalization, "failed");
+  assert.equal(record.observation?.lastError?.retryable, true, "the first attempts still retry");
+  const blocked = f.service.revisionSnapshot(owner.sessionId);
+
+  for (let round = 0; round < 12; round += 1) {
+    record = await f.service.reconcile(lost.job.id, owner, handlers);
+  }
+  assert.deepEqual(during, blocked, "a retry of the failure commit does not reopen the record");
+  assert.equal(record.observation?.lastError?.retryable, false, "retrying stopped");
+  assert.equal(record.observation?.nextRetryAt, undefined, "nothing schedules another attempt");
+  assert.match(record.observation?.lastError?.message ?? "", /Retrying the commit stopped after 5 attempts/);
+  assert.equal(record.state, "unknown", "the outcome stays unconfirmed until someone cancels it");
+  assert.equal(record.provenance, "unconfirmed");
+  // The explanation has to be in the field a client renders. `observation` is not read
+  // by the panel, so a stop described only there is invisible to the user.
+  assert.match(f.service.list(owner)[0]?.error ?? "", /Retrying the commit stopped after 5 attempts/);
+  assert.equal(f.service.list(owner)[0]?.finalization, "failed");
+});
+
+test("the export projection holds its blocked value while a commit retry is in flight", async context => {
+  // #1018 review F2: `observed()` used to reopen the record as `running` for the
+  // duration of every attempt, so a preview sampled mid-retry still saw a moving
+  // revision. The package carries `state`, so the projection must not move.
+  //
+  // Attempt 1 fails the commit on purpose, so the second call is a genuine retry
+  // of a pinned commit. The read happens while that retry is blocked inside
+  // `finalize` — signalled from inside it, not after a tick — so nothing races.
+  const f = await fixture(context);
+  const lost = await lostAck(f, async id => recoveredTerminal(id, f));
+  const entered = deferred<void>();
+  const gate = deferred<void>();
+  let attempts = 0;
+  const handlers = { runner: () => lost.runner,
+    finalize: async (_context: unknown, result: ShellExecutionResult) => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("storage unavailable");
+      entered.resolve();
+      await gate.promise;
+      return result;
+    } };
+  await f.service.reconcile(lost.job.id, owner, handlers).catch(() => undefined);
+  const before = f.service.revisionSnapshot(owner.sessionId);
+  assert.equal(before[0]?.state, "unknown");
+  assert.equal(before[0]?.finalization, "failed");
+
+  const inFlight = f.service.reconcile(lost.job.id, owner, handlers).catch(() => undefined);
+  await entered.promise;
+  assert.deepEqual(f.service.revisionSnapshot(owner.sessionId), before,
+    "a preview read during the attempt sees the same blocked record");
+
+  gate.resolve();
+  await inFlight;
+  assert.equal((await f.service.get(lost.job.id, owner)).state, "completed",
+    "and the retry still commits once the storage problem clears");
+});
+
+test("the export revision projection ignores retry bookkeeping", async context => {
+  // The projection is what the revision hashes: two records that differ only in
+  // `nextRetryAt` / `failureCount` must project identically, or a stuck retry
+  // keeps the revision moving.
+  const f = await fixture(context);
+  const lost = await lostAck(f, async id => recoveredTerminal(id, f));
+  const handlers = { runner: () => lost.runner, finalize: async () => { throw new Error("storage unavailable"); } };
+  await f.service.reconcile(lost.job.id, owner, handlers);
+  const first = f.service.revisionSnapshot(owner.sessionId);
+  const record = await f.service.get(lost.job.id, owner);
+  assert.equal(first.length, 1);
+  assert.deepEqual(Object.keys(first[0]!).sort(),
+    ["accepted", "error", "finalization", "finishedAt", "id", "provenance", "resultRef", "startedAt", "state"]);
+  assert.equal(first[0]!.state, "unknown");
+  assert.equal(first[0]!.error, "PROVENANCE_COMMIT_FAILED");
+
+  // Same record, one more retry: the projection is unchanged.
+  await f.service.reconcile(lost.job.id, owner, handlers);
+  assert.deepEqual(f.service.revisionSnapshot(owner.sessionId), first);
+  assert.equal(record.id, first[0]!.id);
 });
 
 test("provenance conflict is a non-retryable block and background scans never re-finalize it", async context => {

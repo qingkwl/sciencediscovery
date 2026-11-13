@@ -200,18 +200,29 @@ export function createEvolveTools(runtime?: EvolveToolRuntime): AgentTool[] {
     datasetPath: Type.Optional(Type.String({
       description: "dataset_metric only: the CSV to score against. Relative to the workspace, "
         + "or the /workspace/... path as you saw it in a tool result — both are accepted. "
-        + "A custom_script evaluator reads nothing: it builds case `i` from the shard index.",
+        + "A custom_script evaluator the run executes sees no workspace files: it builds case "
+        + "`i` from the shard index, and the evaluator itself travels in evaluatorSource or "
+        + "evaluatorPath.",
       maxLength: 2_000, minLength: 1,
     })),
     direction: Type.Optional(Type.Union([Type.Literal("maximize"), Type.Literal("minimize")])),
     entrypointPath: Type.Optional(Type.String({
-      description: "test_gate only: which file in the project a candidate replaces. "
-        + "Not where an evaluator lives — a custom_script evaluator is passed verbatim "
-        + "in evaluatorSource and never read from a path.",
+      description: "test_gate only: which file in the project a candidate replaces.",
+      maxLength: 2_000, minLength: 1,
+    })),
+    evaluatorPath: Type.Optional(Type.String({
+      description: "custom_script only: a workspace file holding the whole evaluator, instead "
+        + "of writing it inline in evaluatorSource. Use it when the evaluator is too large to "
+        + "write in one tool call — a frozen truth table of thousands of points, for instance: "
+        + "build the file with run_shell, check it, then point here. Relative, or the "
+        + "/workspace/... path as you saw it in a tool result. The file is read ONCE when this "
+        + "call is made, checked for the shard/result contract, stored and frozen — editing it "
+        + "afterwards does not change the run. Exactly one of this and evaluatorSource.",
       maxLength: 2_000, minLength: 1,
     })),
     evaluatorSource: Type.Optional(Type.String({
-      description: "custom_script only: the whole evaluator, verbatim. It is executed as a "
+      description: "custom_script only: the whole evaluator, verbatim. Use evaluatorPath "
+        + "instead when it is too large to write in one call. It is executed as a "
         + "script with __name__ == \"__main__\" (runpy.run_path), with the scratch directory "
         + "first on sys.path — so top-level code runs, a `if __name__ == \"__main__\":` guard "
         + "runs, and `import candidate` resolves. It runs ALONE in that "
@@ -224,13 +235,16 @@ export function createEvolveTools(runtime?: EvolveToolRuntime): AgentTool[] {
         + "SCIENCE_AGENT_SHARDS (the shard is "
         + "an index, and what index i means is the evaluator's choice — generate case i, or "
         + "look it up); write {\"valid\": true, \"metrics\": {\"score\": 0.83}} to the path "
-        + "in SCIENCE_AGENT_RESULT. Score is 0-1, larger is better. Also write an `error` "
+        + "in SCIENCE_AGENT_RESULT. With a user-confirmed JSON baseline, read candidate bytes as data via "
+        + "json.load(open(os.environ[\"SCIENCE_AGENT_CANDIDATE\"])) instead of importing candidate. "
+        + "Score is 0-1, larger is better. Also write an `error` "
         + "string carrying each failure's own MESSAGE — repr(e) or a trimmed "
         + "traceback.format_exc(), never bare type(e).__name__: that is the only channel to "
         + "whoever writes the next candidate, and six identical \"IndexError\"s give it "
         + "nothing to fix, so it discards the approach and re-rolls instead of repairing.",
       maxLength: 200_000, minLength: 1,
     })),
+    editableFields: Type.Optional(Type.Array(Type.String({ maxLength: 80, minLength: 1 }), { maxItems: 50 })),
     expansions: Type.Integer({ maximum: 40, minimum: 1 }),
     frozenGlobs: Type.Optional(Type.Array(Type.String({ maxLength: 500, minLength: 1 }), { maxItems: 50 })),
     howScored: Type.String({ maxLength: 400, minLength: 1 }),
@@ -241,7 +255,7 @@ export function createEvolveTools(runtime?: EvolveToolRuntime): AgentTool[] {
     })),
     mode: Type.Union([
       Type.Literal("dataset_metric"), Type.Literal("test_gate"),
-      Type.Literal("custom_script"), Type.Literal("llm_judge"),
+      Type.Literal("custom_script"), Type.Literal("llm_judge"), Type.Literal("npu_job"),
     ], {
       description: "Take the first that fits, in this order. dataset_metric: cases with known "
         + "answers and a number to move — generate the table if it does not exist yet, that is "
@@ -249,7 +263,9 @@ export function createEvolveTools(runtime?: EvolveToolRuntime): AgentTool[] {
         + "says \"write tests\" or \"make these pass\". custom_script: the FALLBACK, for when "
         + "neither fits — you write and own the measuring apparatus, so every mistake in it is "
         + "yours, and the framework can no longer do the splitting or the freezing for you. "
-        + "llm_judge: only when quality is a reading rather than a computation.",
+        + "llm_judge: only when quality is a reading rather than a computation. "
+        + "npu_job: the fixed evaluator runs on this conversation's selected runner. "
+        + "The starting point is JSON. editableFields names the fields that may change.",
     }),
     normalize: Type.Optional(Type.Union([
       Type.Literal("identity"), Type.Literal("reciprocal"),

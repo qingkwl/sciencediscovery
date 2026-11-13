@@ -116,7 +116,7 @@ const MAX_BODY_BYTES = 2_000_000;
  * scripts, and 64 MiB of base64 is far past anything a Session should select.
  */
 const MAX_SKILL_BUNDLE_BYTES = 67_108_864;
-type RunnerInstallEnvironmentRequest = InstallEnvironmentRequest & { workspaceRoot?: string; runnerWorkspaceKey?: string };
+type RunnerInstallEnvironmentRequest = InstallEnvironmentRequest & { workspaceRoot?: string; runnerWorkspaceKey?: string; networkProxy?: import("@sciencediscovery/schema").ResolvedProxy };
 interface NpuJobSessionRequest {
   sessionId?: string;
 }
@@ -552,6 +552,10 @@ export function createRunnerServer(
     try {
       const url = new URL(request.url ?? "/", "http://runner.local");
       if (request.method === "GET" && url.pathname === "/health") {
+        if (!authorized(request, config.authToken)) {
+          sendJson(response, 200, { status: "ok" });
+          return;
+        }
         sendJson(response, 200, {
           execution: await readiness.get(),
           cgroupDelegated: false,
@@ -574,7 +578,11 @@ export function createRunnerServer(
           sandboxNetwork: await sandboxNetworkCapability(executorSandboxKind(config), gateways),
           scientificEnvs: environmentStore?.capability ?? DISABLED_SCIENTIFIC_ENVS,
           seccompBaseline: executorSandboxKind(config) === "bubblewrap" ? SECCOMP_BASELINE_VERSION : null,
-          status: "ok",
+          // A setup that reached a terminal failure is not "ok": when the managed
+          // scientific environment is dead, every run_shell call returns
+          // RUNNER_UNAVAILABLE while the process keeps answering, and a headline
+          // that says ok is what made the outage invisible (#1104).
+          status: environmentStore?.setup.state === "failed" ? "degraded" : "ok",
           workerConcurrency: null,
         } satisfies RunnerHealth);
         return;
@@ -867,7 +875,7 @@ export function createRunnerServer(
         if (!environmentStore) throw new Error("Scientific environments are unavailable");
         const input = JSON.parse(await readBody(request)) as SetupScientificEnvironmentsRequest;
         if (input.confirmed !== true) throw new Error("Scientific environment setup requires explicit confirmation");
-        sendJson(response, 202, environmentStore.startManagedEnvironmentSetup());
+        sendJson(response, 202, environmentStore.withNetworkProxy(input.networkProxy, () => environmentStore.startManagedEnvironmentSetup()));
         return;
       }
       if (request.method === "GET" && url.pathname === "/environment-revisions") {
@@ -926,8 +934,8 @@ export function createRunnerServer(
       }
       if (request.method === "POST" && url.pathname === "/environments") {
         if (!environmentStore) throw new Error("Scientific environments are unavailable");
-        const input = JSON.parse(await readBody(request)) as CreateEnvironmentRequest;
-        sendJson(response, 201, await environmentStore.createTask(input.name, input.language, input.baseEnvironmentId));
+        const input = JSON.parse(await readBody(request)) as CreateEnvironmentRequest & { networkProxy?: import("@sciencediscovery/schema").ResolvedProxy };
+        sendJson(response, 201, await environmentStore.withNetworkProxy(input.networkProxy, () => environmentStore.createTask(input.name, input.language, input.baseEnvironmentId)));
         return;
       }
       const environmentMatch = url.pathname.match(/^\/environments\/([^/]+)$/);
@@ -955,14 +963,14 @@ export function createRunnerServer(
           ? await validatedWorkspace(config.dataDir, await remoteWorkspaceRoot(config.dataDir, input.runnerWorkspaceKey))
           : input.workspaceRoot ? await validatedWorkspace(config.dataDir, input.workspaceRoot, config.extraWorkspaceRoots) : undefined;
         const previousRevisionId = environmentStore.list().find((environment) => environment.id === environmentId)?.currentRevisionId;
-        const revision = await environmentStore.install(
+        const revision = await environmentStore.withNetworkProxy(input.networkProxy, () => environmentStore.install(
           environmentId,
           input.packages,
           input.channels,
           input.manager,
           workspaceRoot,
           input.indexUrl,
-        );
+        ));
         if (kernelManager && previousRevisionId) {
           await kernelManager.teardownRevision(previousRevisionId, "Environment Revision changed; persistent memory was lost");
         }
@@ -1188,6 +1196,24 @@ export async function startRunnerServer(config = loadRunnerConfig()): Promise<Se
   );
   const capability = await readiness.get();
   if (!capability.ready) logger.warn("execution_unavailable", { ...capability });
+  // A dead managed Shell is not "unavailable" for the Python channel, so the
+  // check above cannot fire on that branch — the gap the 10-hour capture in
+  // #1108 produced no startup complaint from. It is reported after the starter
+  // environment has settled, because on a fresh data dir the probe taken here
+  // already says "not configured" and the bootstrap below is about to install
+  // it; warning now taught operators to ignore the one line meant to surface a
+  // genuinely dead Shell (#1118 review 2, F2).
+  const reportDeadManagedShell = async () => {
+    const settled = await readiness.get();
+    if (settled.shell?.available !== false) return;
+    logger.warn("managed_shell_unavailable", {
+      runnerInstanceId: settled.instanceId,
+      sandbox: settled.sandbox,
+      readyFor: settled.readyFor,
+      reason: settled.shell.unavailableReason ?? "The managed Shell environment is unavailable",
+    });
+    console.warn(`Managed Shell unavailable on this Runner: Shell routes will be refused until the starter environment is repaired. Python execution is unaffected. ${settled.shell.unavailableReason ?? ""}`.trim());
+  };
   // The operational log is a file. A missing execution dependency is a setup
   // step the operator must take, so it also goes to the starting terminal.
   if (capability.reason === "dependency-unavailable" && capability.detail) console.warn(capability.detail);
@@ -1297,9 +1323,20 @@ export async function startRunnerServer(config = loadRunnerConfig()): Promise<Se
     + `execution timeout: ${config.execTimeoutMs === 0 ? "unlimited" : `${config.execTimeoutMs / 1000}s`}`,
   );
   if (config.scientificEnvsEnabled === true) {
-    void environmentStore.setupManagedEnvironments().catch((error) => {
-      logger.warn("scientific_environment_bootstrap_failed", { errorMessage: shortErrorMessage(error) });
-    });
+    // The probe above runs before this bootstrap, so a first launch reports an
+    // unprovisioned Shell as dead. Report once the bootstrap settles, and also
+    // when it fails — the failure is its own line, and a Shell that is still
+    // dead after it is exactly the state this warning exists for.
+    void environmentStore.setupManagedEnvironments()
+      .then(reportDeadManagedShell)
+      .catch(async (error) => {
+        logger.warn("scientific_environment_bootstrap_failed", { errorMessage: shortErrorMessage(error) });
+        await reportDeadManagedShell();
+      });
+  } else {
+    // Nothing will install the Shell on this deployment, so the probe taken at
+    // startup is final.
+    void reportDeadManagedShell();
   }
   return server;
 }

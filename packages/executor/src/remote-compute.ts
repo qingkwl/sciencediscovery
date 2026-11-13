@@ -62,6 +62,7 @@ function errorMessage(error: unknown): string {
 }
 
 export interface RemoteComputeClientOptions {
+  environmentProxy?: () => import("@sciencediscovery/schema").ResolvedProxy;
   logger?: RemoteComputeLogger;
   /** Cache of pinned provisioners that can be uploaded to offline machines. */
   provisionerCacheDir?: string;
@@ -286,7 +287,7 @@ export class RemoteComputeClient {
     private readonly resolveAccess: RemoteSshAccessResolver = async () => {
       throw new Error("This machine has no stored SSH credentials");
     },
-    options: RemoteComputeClientOptions = {},
+    private readonly options: RemoteComputeClientOptions = {},
   ) {
     this.logger = options.logger ?? noopLogger;
     this.provisionerCacheDir = options.provisionerCacheDir;
@@ -351,7 +352,7 @@ export class RemoteComputeClient {
       protocol: endpoint.protocol,
     });
     try {
-      const client = new RunnerClient(directBaseUrl(endpoint), token);
+      const client = new RunnerClient(directBaseUrl(endpoint), token, this.options.environmentProxy);
       const health = await client.health();
       await client.status().catch(() => {
         throw new Error("The runner rejected this token");
@@ -729,24 +730,24 @@ export class RemoteComputeClient {
   /**
    * Connect to a runner the user started on another machine. The token is the
    * whole access control here, so it is checked against an authenticated
-   * endpoint before the connection counts as ready: `/health` is deliberately
-   * unauthenticated and would accept any token.
+   * endpoint before the connection counts as ready: older Runners return
+   * health details without validating the token.
    */
   private async connectDirectRunner(host: RemoteHostTarget, options: RemoteRunnerConnectOptions): Promise<RemoteRunnerStatus> {
     if (!host.endpoint) throw new Error("This runner has no address; re-register it with an IP address and port");
     const token = options.token?.trim();
     if (!token) throw new Error("This runner needs its connection token; re-register the machine with the token it was started with");
-    const client = new RunnerClient(directBaseUrl(host.endpoint), token);
+    const client = new RunnerClient(directBaseUrl(host.endpoint), token, this.options.environmentProxy);
     const health = await client.health().catch((error: unknown) => {
       throw new Error(`Could not reach the runner at ${host.endpoint!.host}:${host.endpoint!.port}: ${error instanceof Error ? error.message : "connection failed"}`);
     });
     this.logConnect(host.id, `The runner answered (version ${health.runnerVersion}); checking the token…`);
-    if (health.platform !== "linux") {
-      throw new Error(`Remote runners must run on Linux; ${host.alias} reports ${health.platform}`);
-    }
     await client.status().catch(() => {
       throw new Error("The runner rejected this token. Re-register the machine with the token it was started with.");
     });
+    if (health.platform !== "linux") {
+      throw new Error(`Remote runners must run on Linux; ${host.alias} reports ${health.platform}`);
+    }
     this.logConnect(host.id, "Token accepted; the runner is ready.");
     const status: RemoteRunnerStatus = {
       // Learned from the machine's own answers during the health check above.
@@ -853,7 +854,7 @@ export class RemoteComputeClient {
           resolveListen(typeof address === "object" && address ? address.port : 0);
         });
       });
-      const client = new RunnerClient(`http://127.0.0.1:${localPort}`, token);
+      const client = new RunnerClient(`http://127.0.0.1:${localPort}`, token, this.options.environmentProxy);
       record.client = client;
       this.runnerConnections.set(host.id, record);
       this.logConnect(host.id, "Runner process launched; waiting for its first answer…");

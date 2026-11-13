@@ -99,6 +99,29 @@ function config(dataDir: string): RunnerConfig {
   };
 }
 
+test("Runner health exposes only liveness without a valid token", async (context) => {
+  const root = await mkdtemp(resolve(tmpdir(), "runner-health-api-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const server = createRunnerServer(config(root));
+  await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+  context.after(() => new Promise<void>((done) => {
+    server.close(() => done());
+    server.closeAllConnections();
+  }));
+  const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  for (const headers of [undefined, { authorization: "Bearer wrong-token" }]) {
+    const response = await fetch(`${origin}/health`, { headers });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { status: "ok" });
+  }
+  const response = await fetch(`${origin}/health`, { headers: { authorization: "Bearer runner-test-token" } });
+  assert.equal(response.status, 200);
+  const health = await response.json() as RunnerHealth;
+  assert.equal(health.platform, process.platform);
+  assert.equal(health.executionTimeoutMs, 60_000);
+  assert.ok(health.runnerVersion);
+});
+
 test("Runner resources require authentication and report the remote workspace filesystem", async (context) => {
   const root = await mkdtemp(resolve(tmpdir(), "runner-resource-api-"));
   context.after(() => rm(root, { recursive: true, force: true }));
@@ -231,7 +254,7 @@ test("runner starts but rejects execution when the sandbox binary is missing", a
   });
   context.after(() => new Promise<void>(done => server.close(() => done())));
   const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-  const health = await fetch(`${origin}/health`).then(r => r.json()) as RunnerHealth;
+  const health = await fetch(`${origin}/health`, { headers: { authorization: "Bearer runner-test-token" } }).then(r => r.json()) as RunnerHealth;
   assert.equal(health.execution?.ready, false);
   assert.equal(health.execution?.reason, "dependency-unavailable");
   const execution = await fetch(`${origin}/execute`, { method: "POST", headers: { authorization: "Bearer runner-test-token" }, body: "{}" });
@@ -252,7 +275,7 @@ test("runner reports incompatible bubblewrap without preventing startup", async 
   });
   context.after(() => new Promise<void>(done => server.close(() => done())));
   const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-  const health = await fetch(`${origin}/health`).then(r => r.json()) as RunnerHealth;
+  const health = await fetch(`${origin}/health`, { headers: { authorization: "Bearer runner-test-token" } }).then(r => r.json()) as RunnerHealth;
   assert.equal(health.execution?.reason, "incompatible");
   assert.match(health.execution?.detail ?? "", /--seccomp/);
 });
@@ -732,7 +755,7 @@ test("runner HTTP service requires its internal token", async (context) => {
   });
   assert.equal(unauthorized.status, 401);
 
-  const health = await (await fetch(`${origin}/health`)).json() as RunnerHealth;
+  const health = await (await fetch(`${origin}/health`, { headers: { authorization: "Bearer runner-test-token" } })).json() as RunnerHealth;
   assert.equal(health.status, "ok");
   assert.equal(health.sandbox, "bubblewrap");
   assert.equal(health.cgroupMode, RESOURCE_LIMIT_MODE);
@@ -904,8 +927,14 @@ test("remote wheel installation resolves the Runner workspace key instead of a c
   const dataDir = await mkdtemp(resolve(process.cwd(), ".tmp", "remote-wheel-"));
   context.after(() => rm(dataDir, { recursive: true, force: true }));
   let installedRoot: string | undefined;
+  let proxyScopes = 0;
   const store = {
     list: () => [],
+    withNetworkProxy<T>(proxy: Parameters<EnvironmentStore["withNetworkProxy"]>[0], action: () => T): T {
+      assert.deepEqual(proxy, { mode: "direct" });
+      proxyScopes++;
+      return action();
+    },
     install: async (_id: string, packages: string[], _channels: string[], _manager: string, workspaceRoot: string) => {
       installedRoot = workspaceRoot;
       assert.equal(await readFile(resolve(workspaceRoot, packages[0]!), "utf8"), "explicitly transferred");
@@ -924,11 +953,13 @@ test("remote wheel installation resolves the Runner workspace key instead of a c
   const installed = await fetch(`${origin}/environments/task-test/install`, {
     method: "POST", headers, body: JSON.stringify({
       runnerWorkspaceKey: "project/session/agents/child", workspaceRoot: "/control/host/path",
+      networkProxy: { mode: "direct" },
       manager: "pip", packages: ["wheels/pkg.whl"],
     }),
   });
   assert.equal(installed.status, 201, await installed.text());
   assert.equal(installedRoot, resolve(dataDir, "remote-workspaces", "project/session/agents/child"));
+  assert.equal(proxyScopes, 1, "installation must run inside the requested proxy scope");
   const escaped = await fetch(`${origin}/environments/task-test/install`, {
     method: "POST", headers, body: JSON.stringify({ runnerWorkspaceKey: "../escape", packages: ["pkg.whl"], manager: "pip" }),
   });
@@ -1151,7 +1182,7 @@ test("runner NPU Broker ignores a corrupt persisted catalog during startup", asy
   context.after(() => new Promise<void>((resolveClose) => server.close(() => resolveClose())));
   const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 
-  const health = await (await fetch(`${origin}/health`)).json() as RunnerHealth;
+  const health = await (await fetch(`${origin}/health`, { headers: { authorization: "Bearer runner-test-token" } })).json() as RunnerHealth;
   assert.equal(health.status, "ok");
   assert.equal(health.npuBroker.enabled, true);
   const jobs = await (await fetch(`${origin}/npu/jobs?session_id=session-test`, {
@@ -2172,7 +2203,7 @@ test("a runner started for an SSH tunnel listens on a private socket and opens n
   assert.equal(server.address(), socketPath);
   assert.equal((await stat(socketPath)).mode & 0o777, 0o600);
   const health = await new Promise<RunnerHealth>((resolveBody, reject) => {
-    const request = httpRequest({ path: "/health", socketPath }, (response) => {
+    const request = httpRequest({ path: "/health", socketPath, headers: { authorization: "Bearer runner-test-token" } }, (response) => {
       let body = "";
       response.on("data", (chunk: Buffer) => { body += chunk.toString("utf8"); });
       response.once("end", () => resolveBody(JSON.parse(body) as RunnerHealth));
@@ -2197,7 +2228,7 @@ test("a runner started with a deep data directory still offers network access", 
   context.after(() => rm(dirname(socketPath), { force: true, recursive: true }));
 
   const health = await new Promise<RunnerHealth>((resolveBody, reject) => {
-    const request = httpRequest({ path: "/health", socketPath }, (response) => {
+    const request = httpRequest({ path: "/health", socketPath, headers: { authorization: "Bearer runner-test-token" } }, (response) => {
       let body = "";
       response.on("data", (chunk: Buffer) => { body += chunk.toString("utf8"); });
       response.once("end", () => resolveBody(JSON.parse(body) as RunnerHealth));
@@ -2249,7 +2280,8 @@ test("managed recovery HTTP contract returns original receipts, scoped conflicts
   await new Promise<void>(done => server.listen(0, "127.0.0.1", done));
   context.after(() => new Promise<void>(done => server.close(() => done())));
   const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-  const health = await fetch(`${origin}/health`).then(response => response.json()) as RunnerHealth;
+  const health = await fetch(`${origin}/health`, { headers: { authorization: "Bearer runner-test-token" } })
+    .then(response => response.json()) as RunnerHealth;
   assert.equal(health.capabilities?.executionRecoveryVersion, 1);
   assert.ok(health.runnerInstanceId);
   assert.ok(health.runnerBootId);
@@ -2287,7 +2319,8 @@ test("managed recovery HTTP contract returns original receipts, scoped conflicts
   await new Promise<void>(done => restarted.listen(0, "127.0.0.1", done));
   context.after(() => new Promise<void>(done => restarted.close(() => done())));
   const secondOrigin = `http://127.0.0.1:${(restarted.address() as AddressInfo).port}`;
-  const restartedHealth = await fetch(`${secondOrigin}/health`).then(response => response.json()) as RunnerHealth;
+  const restartedHealth = await fetch(`${secondOrigin}/health`, { headers: { authorization: "Bearer runner-test-token" } })
+    .then(response => response.json()) as RunnerHealth;
   assert.equal(restartedHealth.runnerInstanceId, health.runnerInstanceId);
   assert.notEqual(restartedHealth.runnerBootId, health.runnerBootId);
   const replay = await fetch(`${secondOrigin}/shell-executions`, signedExecutionInit("runner-test-token", input));
@@ -2306,7 +2339,7 @@ test("health marks egress unavailable when the fallback socket directory cannot 
   await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
   context.after(() => new Promise<void>((done) => server.close(() => done())));
   const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-  const health = await (await fetch(`${origin}/health`)).json() as RunnerHealth;
+  const health = await (await fetch(`${origin}/health`, { headers: { authorization: "Bearer runner-test-token" } })).json() as RunnerHealth;
 
   assert.equal(health.sandboxNetwork.available, false);
   assert.deepEqual(health.sandboxNetwork.modes, ["none"]);
@@ -2329,7 +2362,7 @@ test("health keeps egress available for a deep data directory when the socket di
     await rm(socketRoot, { force: true, recursive: true });
   });
   const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-  const health = await (await fetch(`${origin}/health`)).json() as RunnerHealth;
+  const health = await (await fetch(`${origin}/health`, { headers: { authorization: "Bearer runner-test-token" } })).json() as RunnerHealth;
 
   assert.equal(dirname(gateways.socketPath("capability")), socketRoot);
   assert.ok(Buffer.byteLength(gateways.socketPath("capability")) <= MAX_UNIX_SOCKET_PATH_BYTES);

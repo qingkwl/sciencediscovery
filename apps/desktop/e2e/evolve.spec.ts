@@ -91,7 +91,21 @@ function liveRun(): EvolveFixture {
 }
 
 /** 会话设置's first row is the way into a search: the header no longer
- *  carries an evolve capsule of its own. */
+ *  carries an evolve capsule of its own. The dialog it opens collects the
+ *  task, so a test that has one to give fills it there. */
+async function startDesign(page: Page, options: { unisolated?: boolean } = {}): Promise<void> {
+  const dialog = page.getByRole("dialog", { name: "新建程序演进实验" });
+  await dialog.getByRole("button", { name: "开始设计" }).click();
+  // On a host with no sandbox the command leaves only after the consent is
+  // answered, and that answer is a second surface over the same dialog.
+  if (options.unisolated) {
+    await page.getByRole("alertdialog").getByRole("button", { name: "仍然继续" }).click();
+  }
+  await expect(dialog).toBeHidden();
+  // The dialog places the command in the composer; sending is the user's.
+  await page.getByRole("button", { name: "发送", exact: true }).click();
+}
+
 async function openEvolve(page: Page): Promise<void> {
   await page.getByRole("button", { name: "会话设置" }).click();
   await page.getByRole("button", { name: "程序演进实验" }).click();
@@ -206,6 +220,7 @@ test("a search started in this window opens its task tab by itself", async ({ pa
   started = true;
   await page.locator("#composer-textarea").fill("/evolve-design 让压缩比更高");
   await page.locator("#composer-textarea").press("Enter");
+  await startDesign(page);
 
   await expect(page.locator(".evolve-detail")).toBeVisible({ timeout: 10_000 });
   await expect(
@@ -214,36 +229,92 @@ test("a search started in this window opens its task tab by itself", async ({ pa
   await expect(page.locator("#evolve-panel-title")).toHaveText("让压缩比更高");
 });
 
-test("the create dialog hands the goal to the conversation as the command", async ({ page }) => {
+test("the create dialog collects the task and hands the whole command to the composer", async ({ page }) => {
   const mock = await installMockApi(page, { sessions: [makeSession()] });
   await page.goto("/");
 
   await openEvolve(page);
-  const dialog = page.getByRole("dialog");
+  const dialog = page.getByRole("dialog", { name: "新建程序演进实验" });
   await expect(dialog).toBeVisible();
-  await expect(dialog).toContainText("新建程序演进实验");
+  // The panel scales in; a box measured mid-animation is fractionally smaller,
+  // which would read as the card moving the form later.
+  await dialog.evaluate((node) =>
+    Promise.all(
+      node.getAnimations({ subtree: true }).map((animation) => animation.finished.catch(() => undefined)),
+    ));
+  // One form, not two dialogs in a row: the task, the search and the pace are
+  // answered here before the composer sees anything.
+  await expect(dialog.getByLabel("任务描述")).toBeVisible();
+  // A chip raises the illustrated card over the form; the task stays exactly
+  // where it was, so reading a description never moves the field being typed.
+  const taskBefore = await dialog.getByLabel("任务描述").boundingBox();
+  await dialog.getByRole("radio", { name: /PUCT/ }).hover();
+  const algorithmCard = dialog.locator(".evolve-algorithm-detail.is-open");
+  await expect(algorithmCard).toContainText("基于PUCT策略");
+  expect(await dialog.getByLabel("任务描述").boundingBox()).toEqual(taskBefore);
+  await page.mouse.move(0, 0);
+  await expect(dialog.locator(".evolve-algorithm-detail.is-open")).toHaveCount(0);
+  await expect(dialog.getByRole("switch", { name: "自定义演进参数" })).not.toBeChecked();
+  // Nothing to design yet: the task is required.
+  await expect(dialog.getByRole("button", { name: "开始设计" })).toBeDisabled();
+  await dialog.getByLabel("任务描述").fill("让压缩比更高，且完全无损");
+
+  const pause = dialog.getByRole("switch", { name: /检查点需要人工确认/ });
+  await expect(pause).toBeChecked();
+  await pause.uncheck();
+  await dialog.getByRole("radio", { name: /OpenEvolve/ }).click();
+  await expect(dialog.getByLabel("上传 JSON")).toBeHidden();
+  await dialog.getByRole("switch", { name: "自定义演进参数" }).check();
+  await expect(dialog.getByRole("button", { name: "开始设计" })).toBeDisabled();
+  await dialog.getByLabel("上传 JSON").setInputFiles({
+    name: "compression.json",
+    mimeType: "application/json",
+    buffer: Buffer.from('{"window":8,"capacity":32}'),
+  });
+  await dialog.getByRole("checkbox", { name: "参与搜索 window" }).check();
+  expect(posts(mock)).toHaveLength(0);
 
   await dialog.getByRole("button", { name: "开始设计" }).click();
 
-  // The command is placed in the composer as a token, and nothing is sent yet:
-  // the goal is the sentence the user writes after it.
+  // The command is placed in the composer as a token with the task after it,
+  // and nothing is sent yet: the composer keeps the last word.
   await expect(dialog).toBeHidden();
-  await expect(page.locator(".composer-command")).toHaveText("/evolve-design --algorithm puct");
-  await expect(page.locator("#composer-textarea")).toHaveValue("");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(page.locator(".composer-command")).toHaveText("/evolve-design --algorithm openevolve --no-confirm");
+  await expect(page.locator("#composer-textarea")).toHaveValue("让压缩比更高，且完全无损");
   expect(posts(mock)).toHaveLength(0);
 
-  await page.locator("#composer-textarea").fill("让压缩比更高，且完全无损");
   await page.getByRole("button", { name: "发送", exact: true }).click();
   await expect.poll(() =>
     mock.calls.some(
       (call) =>
         call.method === "POST" &&
         call.path === "/api/sessions/session-1/messages" &&
-        call.body?.includes("/evolve-design --algorithm puct 让压缩比更高，且完全无损") === true,
+        call.body?.includes("/evolve-design --algorithm openevolve --no-confirm 让压缩比更高，且完全无损") === true
+        && call.body?.includes("evolve-input") === true
+        && call.body?.includes("window") === true,
     ),
   ).toBe(true);
   // The token belonged to that message, not to the composer.
   await expect(page.locator(".composer-command")).toHaveCount(0);
+});
+
+test("a short window scrolls the fields and keeps the start reachable", async ({ page }) => {
+  await installMockApi(page, { sessions: [makeSession()] });
+  await page.setViewportSize({ width: 1280, height: 560 });
+  await page.goto("/");
+
+  await openEvolve(page);
+  const dialog = page.getByRole("dialog", { name: "新建程序演进实验" });
+  await dialog.getByLabel("任务描述").fill("让压缩比更高");
+
+  // The fields are taller than the window; the actions are not part of them,
+  // so the one button the form exists for never sits below the fold.
+  const scroll = dialog.locator(".evolve-create-scroll");
+  expect(await scroll.evaluate((element) => element.scrollHeight > element.clientHeight)).toBe(true);
+  const start = await dialog.getByRole("button", { name: "开始设计" }).boundingBox();
+  expect(start).not.toBeNull();
+  expect(start!.y + start!.height).toBeLessThanOrEqual(560);
 });
 
 test("the create dialog can send a design that does not pause at checkpoints", async ({ page }) => {
@@ -260,12 +331,12 @@ test("the create dialog can send a design that does not pause at checkpoints", a
   await pause.click();
   await expect(pause).not.toBeChecked();
 
+  await dialog.getByLabel("任务描述").fill("让压缩比更高，并且要快");
   await dialog.getByRole("button", { name: "开始设计" }).click();
   await expect(page.locator(".composer-command")).toHaveText("/evolve-design --algorithm puct --no-confirm");
-  await expect(page.locator("#composer-textarea")).toHaveValue("");
+  await expect(page.locator("#composer-textarea")).toHaveValue("让压缩比更高，并且要快");
   // The token survives being completed, and it is joined to the sentence on
   // the way out — the pace the switch chose is still the command's flag.
-  await page.locator("#composer-textarea").fill("让压缩比更高，并且要快");
   await page.getByRole("button", { name: "发送", exact: true }).click();
   await expect.poll(() =>
     mock.calls.some(
@@ -290,6 +361,7 @@ test("a host with no sandbox asks for the no-isolation confirmation before sendi
   // The risk is stated before anything is chosen, not hidden behind a switch.
   await expect(dialog.getByRole("note")).toContainText("没有沙箱的情况下运行候选代码");
 
+  await dialog.getByLabel("任务描述").fill("让压缩比更高");
   // Starting asks first, and a dismissed alert sends nothing.
   await dialog.getByRole("button", { name: "开始设计" }).click();
   const alert = page.getByRole("alertdialog");
@@ -305,10 +377,9 @@ test("a host with no sandbox asks for the no-isolation confirmation before sendi
   // The answer became the command's flag, and the token carries it into the
   // message the user finally sends.
   await expect(page.locator(".composer-command")).toHaveText("/evolve-design --algorithm puct --allow-direct");
-  await expect(page.locator("#composer-textarea")).toHaveValue("");
+  await expect(page.locator("#composer-textarea")).toHaveValue("让压缩比更高");
   expect(posts(mock)).toHaveLength(0);
 
-  await page.locator("#composer-textarea").fill("让压缩比更高");
   await page.getByRole("button", { name: "发送", exact: true }).click();
   await expect.poll(() =>
     mock.calls.some(
@@ -337,11 +408,11 @@ test("a typed design command on a host with no sandbox detours through the confi
   await page.locator("#composer-textarea").fill("/evolve-design --algorithm openevolve 让压缩比更高");
   await page.locator("#composer-textarea").press("Enter");
 
-  const dialog = page.getByRole("dialog");
+  const dialog = page.getByRole("dialog", { name: "新建程序演进实验" });
   await expect(dialog).toBeVisible();
-  // The goal is not collected a second time: it travels back to the composer
-  // with the token when the dialog closes.
-  await expect(dialog.getByLabel("优化目标")).toHaveCount(0);
+  // The sentence is not asked for a second time: it was carried into the task
+  // field, and it travels back to the composer with the token.
+  await expect(dialog.getByLabel("任务描述")).toHaveValue("让压缩比更高");
   // The search the command named is selected, not the dialog's own default.
   await expect(dialog.getByRole("radio", { name: /OpenEvolve/ })).toHaveAttribute("aria-checked", "true");
   await expect(dialog.getByRole("note")).toContainText("没有沙箱的情况下运行候选代码");
@@ -379,9 +450,9 @@ test("a pasted --allow-direct does not answer the warning in the user's place", 
   await page.locator("#composer-textarea").fill("/evolve-design --allow-direct 让压缩比更高");
   await page.locator("#composer-textarea").press("Enter");
 
-  const dialog = page.getByRole("dialog");
+  const dialog = page.getByRole("dialog", { name: "新建程序演进实验" });
   await expect(dialog).toBeVisible();
-  await expect(dialog.getByLabel("优化目标")).toHaveCount(0);
+  await expect(dialog.getByLabel("任务描述")).toHaveValue("让压缩比更高");
   expect(posts(mock)).toHaveLength(0);
 
   await dialog.getByRole("button", { name: "开始设计" }).click();
@@ -390,6 +461,7 @@ test("a pasted --allow-direct does not answer the warning in the user's place", 
 
   await page.getByRole("alertdialog").getByRole("button", { name: "仍然继续" }).click();
   await expect(page.locator(".composer-command")).toHaveText("/evolve-design --algorithm puct --allow-direct");
+  await expect(page.locator("#composer-textarea")).toHaveValue("让压缩比更高");
   expect(posts(mock)).toHaveLength(0);
   await page.getByRole("button", { name: "发送", exact: true }).click();
   await expect.poll(() =>
@@ -438,8 +510,17 @@ test("picking the evolve skill from the slash palette opens the setup dialog", a
   await expect(dialog.getByRole("radio", { name: /PUCT算法/ })).toHaveAttribute("aria-checked", "true");
   await expect(dialog.getByRole("switch", { name: /检查点需要人工确认/ })).toBeChecked();
   // The command was not merely written into the draft: the composer is empty
-  // and the slash was never sent.
+  // and the slash was never sent. The pick carries no task with it, so the
+  // dialog asks for one before it can hand anything back.
   await expect(page.locator("#composer-textarea")).toHaveValue("");
+  await expect(dialog.getByLabel("任务描述")).toHaveValue("");
+  await expect(dialog.getByRole("button", { name: "开始设计" })).toBeDisabled();
+  expect(posts(mock)).toHaveLength(0);
+
+  await dialog.getByLabel("任务描述").fill("让压缩比更高");
+  await dialog.getByRole("button", { name: "开始设计" }).click();
+  await expect(page.locator(".composer-command")).toHaveText("/evolve-design --algorithm puct");
+  await expect(page.locator("#composer-textarea")).toHaveValue("让压缩比更高");
   expect(posts(mock)).toHaveLength(0);
 });
 
@@ -458,6 +539,7 @@ test("a missing runtime greys out the start and is installed from the details", 
   // place and only the button that cannot work is disabled.
   await expect(dialog.getByRole("radiogroup", { name: "选择搜索算法" })).toBeVisible();
   await expect(dialog.getByRole("note").filter({ hasText: "优化进程不可用" })).toBeVisible();
+  await dialog.getByLabel("任务描述").fill("让压缩比更高");
   await expect(dialog.getByRole("button", { name: "开始设计" })).toBeDisabled();
 
   // 查看详情 explains where to look on this machine and offers the install.
@@ -511,6 +593,7 @@ test("a checkpoint arrives as a card and its confirmation is sent as the reply",
   await page.waitForLoadState("networkidle");
   await page.locator("#composer-textarea").fill("/evolve-design 让压缩比更高");
   await page.locator("#composer-textarea").press("Enter");
+  await startDesign(page);
 
   const card = page.locator(".evolve-checkpoint");
   await expect(card).toBeVisible();
@@ -531,8 +614,10 @@ test("a checkpoint arrives as a card and its confirmation is sent as the reply",
         call.method === "POST" &&
         call.path === "/api/sessions/session-1/messages" &&
         // The reply names the step: six identical "继续" left the model unable
-        // to tell which checkpoint it was answering.
-        call.body?.includes("确认检查点 1/4，继续。") === true,
+        // to tell which checkpoint it was answering. It counts the checkpoints
+        // the reader answers, not the steps: this card has four steps and its
+        // last one is the record, so the band above says 1/3 and so does this.
+        call.body?.includes("确认检查点 1/3，继续。") === true,
     ),
   ).toBe(true);
 });
@@ -547,6 +632,7 @@ test("an automatic checkpoint is shown but asks for nothing, and the flow carrie
   await page.waitForLoadState("networkidle");
   await page.locator("#composer-textarea").fill("/evolve-design --no-confirm 让压缩比更高");
   await page.locator("#composer-textarea").press("Enter");
+  await startDesign(page);
 
   const card = page.locator(".evolve-checkpoint").first();
   await expect(card).toBeVisible();
@@ -573,6 +659,59 @@ test("an automatic checkpoint is shown but asks for nothing, and the flow carrie
   ).toHaveLength(1);
 });
 
+test("a second no-confirm design is pushed although the first one started a search", async ({ page }) => {
+  // The run list is per Session, so the first design's search is still in it,
+  // created after that design's own command. The second design's command is
+  // still only pending when its first turn ends — the transcript is written
+  // when the turn settles — so "does this design have a search" has to answer
+  // for the design being sent, not the one already in the transcript.
+  const first = liveRun();
+  const mock = await installMockApi(page, {
+    assistantAnswer: "我又核对了一遍评测器。",
+    evolveRunsBySession: {
+      "session-1": [{ ...first, run: { ...first.run, createdAt: "2026-10-01T07:30:00.000Z" } }],
+    },
+    sessions: [makeSession({
+      messages: [
+        {
+          content: "/evolve-design --no-confirm 第一个目标",
+          createdAt: "2026-10-01T07:00:00.000Z",
+          id: "message-design-1",
+          role: "user",
+        },
+        {
+          content: "第一个设计已经启动搜索。",
+          createdAt: "2026-10-01T07:05:00.000Z",
+          id: "message-assistant-1",
+          role: "assistant",
+        },
+      ],
+    })],
+  });
+  await page.goto("/");
+  await page.locator(".side-session-name", { hasText: "晶体结构分析" }).click();
+
+  await page.locator("#composer-textarea").fill("/evolve-design --no-confirm 第二个目标");
+  await page.locator("#composer-textarea").press("Enter");
+  await startDesign(page);
+
+  // The turn ended with prose, no card and no search: the client sends the one
+  // sentence that names what the turn owed.
+  await expect.poll(() =>
+    mock.calls.filter(
+      (call) => call.method === "POST" && call.body?.includes("create_evolve_run") === true,
+    ).length,
+  ).toBe(1);
+  // Once. The mock answers the push with the same prose, and a second carry
+  // forward would be a paid turn that changes nothing.
+  await page.waitForTimeout(500);
+  expect(
+    mock.calls.filter(
+      (call) => call.method === "POST" && call.body?.includes("create_evolve_run") === true,
+    ),
+  ).toHaveLength(1);
+});
+
 test("a checkpoint's change button writes the note in the card and sends it from there", async ({ page }) => {
   const mock = await installMockApi(page, {
     assistantAnswer: checkpointAnswer({ step: 2 }),
@@ -583,6 +722,7 @@ test("a checkpoint's change button writes the note in the card and sends it from
   await page.waitForLoadState("networkidle");
   await page.locator("#composer-textarea").fill("/evolve-design 让压缩比更高");
   await page.locator("#composer-textarea").press("Enter");
+  await startDesign(page);
 
   const card = page.locator(".evolve-checkpoint");
   await expect(card).toBeVisible();

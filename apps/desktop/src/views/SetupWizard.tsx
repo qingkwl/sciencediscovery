@@ -110,12 +110,20 @@ function bootHeading(boot: BootView): { title: string; sub: string } {
   }
 }
 
-/** The shell prints the same sizes; keeping the rounding here avoids a second
- *  formatting convention on one screen. */
-function formatBytes(bytes: number): string {
-  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)}GB`;
-  if (bytes >= 1024 ** 2) return `${Math.round(bytes / 1024 ** 2)}MB`;
-  return `${Math.max(0, Math.round(bytes / 1024))}KB`;
+/** The shell's own convention, kept: whole KB and MB, one decimal GB, no space and
+ *  no byte level. The unit follows the number each level prints, so a free-space
+ *  line one byte under a GiB reads "1.0GB", never "1024MB". */
+export function formatFreeSpace(bytes: number): string {
+  // The ladder starts at KB, so the value starts there too, and its GB level is the
+  // only one that prints a decimal.
+  const print = (value: number, unit: number): number => unit === 2 ? Number(value.toFixed(1)) : Math.round(value);
+  let value = Math.max(0, bytes) / 1024;
+  let unit = 0;
+  while (unit < 2 && print(value, unit) >= 1024) {
+    value /= 1024;
+    unit += 1;
+  }
+  return unit === 2 ? `${value.toFixed(1)}GB` : `${Math.round(value)}${unit === 0 ? "KB" : "MB"}`;
 }
 
 type CheckTone = "ok" | "warn" | "err";
@@ -136,6 +144,9 @@ interface BootView {
   model: ItemState;
   waited: number;
   message?: string;
+  /** True only when the browser health probe saw no `runner` field (public
+   *  liveness body). Other skip reasons keep the neutral "not checked" tip. */
+  runnerNeedsToken?: boolean;
 }
 const INITIAL_BOOT: BootView = {
   phase: "starting",
@@ -155,6 +166,9 @@ interface ProbeResult {
   /** `null` means the item was not checked at all (no runner base, or no
    *  bridge in a plain browser), which the list shows as "–", never "✗". */
   runner: boolean | null;
+  /** Browser path only: public health omitted `runner`, so the tip should say
+   *  a token is required rather than the neutral "not checked". */
+  runnerNeedsToken?: boolean;
   model: boolean;
   ok: boolean;
 }
@@ -165,6 +179,19 @@ function dotClass(state: ItemState): string {
 }
 function dotGlyph(state: ItemState): string {
   return state === "ok" ? "✓" : state === "fail" ? "✗" : state === "pending" ? "…" : "–";
+}
+
+/**
+ * Tooltip for one self-check row.
+ *
+ * A skipped row has two different stories: the component was not checked at all,
+ * or the caller is not allowed to read its detail. Only the second is worth
+ * explaining, and today only the Runner reaches it — the browser path reads the
+ * public health body, which carries liveness but no Runner detail.
+ */
+export function selfCheckTip(key: "api" | "runner" | "model", state: ItemState, runnerNeedsToken: boolean): string | undefined {
+  if (state !== "skip") return undefined;
+  return key === "runner" && runnerNeedsToken ? TEXT.wizard.boot.runnerNeedsToken : TEXT.wizard.boot.notChecked;
 }
 
 /**
@@ -270,12 +297,12 @@ export function SetupWizard({
           } else if (result.freeOk === false) {
             lines.push({
               tone: "err",
-              text: TEXT.wizard.workspace.check.freeLow(formatBytes(result.freeBytes)),
+              text: TEXT.wizard.workspace.check.freeLow(formatFreeSpace(result.freeBytes)),
             });
           } else {
             lines.push({
               tone: "ok",
-              text: TEXT.wizard.workspace.check.free(formatBytes(result.freeBytes)),
+              text: TEXT.wizard.workspace.check.free(formatFreeSpace(result.freeBytes)),
             });
           }
           for (const warning of result.warnings ?? []) {
@@ -327,9 +354,13 @@ export function SetupWizard({
           getHealth(client),
           getSettings(client).catch(() => undefined),
         ]);
+        // Public health has no `runner`; treat that as unchecked (needs token),
+        // not failed. With a token the client already sends, map readiness.
+        const runnerMissing = health.runner === undefined;
         return {
           api: true,
-          runner: health.runner?.execution?.ready === true ? true : null,
+          runner: runnerMissing ? null : health.runner?.execution?.ready === true,
+          runnerNeedsToken: runnerMissing,
           model: Boolean(settings?.effective?.modelId),
           ok: true,
         };
@@ -351,7 +382,11 @@ export function SetupWizard({
             kind: undefined,
             message: undefined,
             api: "ok",
-            runner: result.runner === null ? "skip" : "ok",
+            // `false` is a state only the browser branch can hold (it has no
+            // `ok` rollup), and it must not paint green: an answer carrying a
+            // Runner that is starting or wedged is not a ready Runner.
+            runner: result.runner === null ? "skip" : result.runner ? "ok" : "fail",
+            runnerNeedsToken: Boolean(result.runnerNeedsToken),
             model: result.model ? "ok" : "skip",
           }));
           return;
@@ -364,6 +399,7 @@ export function SetupWizard({
             message: TEXT.wizard.boot.timeoutSub,
             api: result.api ? "ok" : "fail",
             runner: result.runner === null ? "skip" : result.runner ? "ok" : "fail",
+            runnerNeedsToken: Boolean(result.runnerNeedsToken),
             model: result.model ? "ok" : "skip",
           }));
           return;
@@ -373,6 +409,7 @@ export function SetupWizard({
         emit({
           api: result.api ? "ok" : "pending",
           runner: result.runner === null ? "skip" : result.runner ? "ok" : "pending",
+          runnerNeedsToken: Boolean(result.runnerNeedsToken),
           model: result.model ? "ok" : "skip",
         });
         timer = setTimeout(() => void iterate(), SELF_CHECK_POLL_MS);
@@ -566,7 +603,7 @@ export function SetupWizard({
                         <li key={key}>
                           <span
                             className={["boot-dot", dotClass(state)].filter(Boolean).join(" ")}
-                            title={state === "skip" ? TEXT.wizard.boot.notChecked : undefined}
+                            title={selfCheckTip(key, state, Boolean(boot.runnerNeedsToken))}
                           >
                             {dotGlyph(state)}
                           </span>

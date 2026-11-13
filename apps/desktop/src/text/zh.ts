@@ -20,13 +20,24 @@
  * saying so. Wording is reviewable here without reading any JSX.
  */
 export const ZH = {
+  configurationLegacy: {
+    title: "启用连接器", awaiting: "等待确认", change: "修改", scope: "范围", session: "仅当前会话",
+    continuation: "原任务", noTask: "没有已提交的任务", recorded: "服务器已记录任务续跑", serverOwned: "由服务器管理原任务续跑",
+    enable: (name: string) => `启用 ${name}`, userReason: (name: string) => `你请求启用 ${name}。`, taskReason: (name: string) => `原任务需要使用 ${name}。`,
+    confirm: "确认并启用", decline: "暂不配置", saving: "正在保存…", saved: "已保存", dismissed: "未配置", stale: "请求已过时",
+    dismissedDetail: "本次请求没有启用此连接器。", staleDetail: "设置或原任务已发生变化，不能再应用此请求。",
+    countdown: (seconds: number) => `此前已授权的自动配置将在 ${seconds} 秒后由服务器复核。`, due: "正在等待服务器复核此前已授权的自动配置。",
+    waitRun: "请等待当前任务到达安全暂停点后再决定。", failed: "未能确认本次操作的结果。请刷新状态后再试。", refresh: "刷新状态",
+  },
   researchPackage: {
     continueUnavailable: "此导入记录尚未完整恢复，暂不能继续聊天。请查看导入省略项并恢复缺失服务后重新导入。", sourceUnavailable: "会话或所属项目已不存在。请刷新会话列表后重试。",
     projectDestination: "项目归属", noProject: "无项目", projectDestinationHint: "默认放入「会话」，也可以选择一个已有项目。", necessaryContents: "会话记录 · 当前文件与产物 · 依赖证据", completeContents: "会话记录 · 文件与产物版本 · 已有研究历史",
     newOptions: "新建会话选项", projectImport: (name: string) => `在「${name}」中导入会话`, messageMenu: "回复菜单", sessionScope: "导出整个会话及其研究材料，不只是页面上的聊天文字。", packageContents: "包含会话、工作区文件、产物及相关研究证据。",
     title: "科研证据包", import: "导入会话", export: "导出会话", continue: "继续聊天", branch: "创建新分支聊天", source: "返回来源会话",
-    readOnly: "导入证据快照 · 只读。创建独立副本后，可使用已有材料继续研究。", copying: "正在复制研究记录，可切换会话…", ready: "研究副本已准备好", failed: "操作失败", open: "打开会话", download: "下载", preparing: "正在后台准备证据包…", close: "关闭", copyMissing: "复制任务对应的会话或操作记录已不存在，已停止等待。请重新创建续聊。", copyPollingFailed: "暂时无法读取复制进度，已停止重试。请稍后刷新或重新操作。", legacyUnavailable: "本地服务暂时不可用，正在重试…", exportPollingFailed: "暂时无法读取导出进度，已停止重试。请稍后重新导出。", exportMissing: "导出任务已不存在，请重新导出。",
-    necessary: "必要导出", complete: "完整导出", necessaryHint: "保留当前结果、输入依赖与相关证据，精简可选历史。", completeHint: "保留所选范围内的已有历史和版本。", trajectory: "包含完整轨迹详情", graph: "包含完整科学记忆图谱", estimate: "预计大小（未压缩）", calculating: "正在计算范围与大小…", files: "工作区文件", omissions: "范围与省略说明", evidenceOnly: "证据包用于检查和继续研究；导入不会执行代码或恢复历史授权。", choose: "选择 .sdresearch 研究包", objects: "个内容对象", importHint: "恢复会话、文件和研究证据为只读快照。继续研究将创建独立的新会话。原始记录保留不变。", branchHint: "新分支保留所选回复及之前的对话与可恢复研究证据，不包含之后的内容；原会话保持不变。", reply: "分支起点", working: "正在处理…", startExport: "开始后台导出", confirmImport: "确认导入", exportSaving: "正在保存证据包…", exportSaved: "证据包已保存", exportSaveFailed: "保存证据包失败", exportCanceled: "已取消导出", openLocation: "打开文件位置", exportsInProgress: (count: number) => `${count} 个导出进行中`, retrySave: "重新保存", savedExports: "已保存的会话包",
+    readOnly: "导入证据快照 · 只读。创建独立副本后，可使用已有材料继续研究。", copying: "正在复制研究记录，可切换会话…", failed: "操作失败",
+    recalculating: "正在重算…",
+    omissionsSummary: (count: number) => `未包含 ${count} 个工作区文件`, download: "下载", preparing: "正在后台准备证据包…", close: "关闭", copyMissing: "复制任务对应的会话或操作记录已不存在，已停止等待。请重新创建续聊。", copyPollingFailed: "暂时无法读取复制进度，已停止重试。请稍后刷新或重新操作。", legacyUnavailable: "本地服务暂时不可用，正在重试…", exportPollingFailed: "暂时无法读取导出进度，已停止重试。请稍后重新导出。", exportMissing: "导出任务已不存在，请重新导出。",
+    necessary: "必要导出", complete: "完整导出", necessaryHint: "保留当前结果、输入依赖与相关证据，精简可选历史。", completeHint: "保留所选范围内的已有历史和版本。", graph: "包含完整科学记忆图谱", estimate: "预计大小（未压缩）", calculating: "正在计算范围与大小…", files: "工作区文件", omissions: "范围与省略说明", evidenceOnly: "证据包用于检查和继续研究；导入不会执行代码或恢复历史授权。", choose: "选择 .sdresearch 研究包", objects: "个内容对象", importHint: "恢复会话、文件和研究证据为只读快照。继续研究将创建独立的新会话。原始记录保留不变。", branchHint: "新分支保留所选回复及之前的对话与可恢复研究证据，不包含之后的内容；原会话保持不变。", reply: "分支起点", working: "正在处理…", startExport: "开始后台导出", confirmImport: "确认导入", exportSaving: "正在保存证据包…", exportSaved: "证据包已保存", exportSaveFailed: "保存证据包失败", exportCanceled: "已取消导出", openLocation: "打开文件位置", exportsInProgress: (count: number) => `${count} 个导出进行中`, retrySave: "重新保存", savedExports: "已保存的会话包",
   },
   appName: "ScienceDiscovery",
   /** The BCP 47 tag the language calls itself, for `Intl` and `<html lang>`. */
@@ -175,11 +186,14 @@ export const ZH = {
   },
 
   conversation: {
+    configurationRefreshFailed: "配置请求未能刷新。已显示的状态可能已过时，请重试后再确认。",
+    retryConfiguration: "重试",
     copyAnswer: "复制回答",
     copied: "已复制",
     /** The system-notice kinds the transcript can carry. */
     notices: {
       timeout_notice: "超时",
+      configuration_notice: "配置更新",
     } as Record<string, string>,
     /** Fills in a cancellation whose reason the stream did not carry. */
     cancelledReason: "运行已取消",
@@ -515,6 +529,7 @@ export const ZH = {
         model: "默认任务模型（可选，可稍后在设置中配置）",
       },
       notChecked: "未检查",
+      runnerNeedsToken: "未检查（需要令牌）",
       retry: "重新检查",
       retryBoot: "重试",
       logs: "打开日志文件夹",
@@ -550,7 +565,9 @@ export const ZH = {
     retest: "重新测试",
     finish: "开始使用",
     testing: "正在测试…",
-    testOk: (latency: number) => `✓ 连接成功（${latency} ms）`,
+    testOk: (latency: number) => `✓ 基础检查通过（${latency} ms）`,
+    // 通过仅证明服务商应答了一次最小请求——不代表完整会话执行路径、思考或工具调用可用（issue #824）。
+    basicCheckNotice: "仅基础检查：不验证完整会话执行路径、思考或工具调用。",
     missingKey: "请先填写 API key。",
     missingModel: "请先选择或填写模型名。",
     /** Fallbacks for a connectivity failure whose message came back empty. */
@@ -606,7 +623,8 @@ export const ZH = {
       defaultFailed: "没能把这个模型设为默认，请重试。",
       test: "测试连接",
       testFailed: (message: string) => `✕ ${message}`,
-      testOk: (latency: number) => `✓ 可用（${latency} ms）`,
+      testOk: (latency: number) => `✓ 基础检查通过（${latency} ms）`,
+      testOkNotice: "仅基础检查：不验证完整会话执行路径、思考或工具调用。",
       delete: "删除",
       deleteConfirm: (name: string) => `删除模型「${name}」？`,
       deleteBody: "删除后，明确指定此模型的会话需要重新选择模型。历史运行记录保留。",
@@ -1296,6 +1314,15 @@ export const ZH = {
          一次确认。 */
       autoContinue: (step: number, total?: number) =>
         total === undefined ? `继续步骤 ${step}。` : `继续步骤 ${step}/${total}。`,
+      /* 没有卡片可续、回合却直接结束时（既没写检查点，也没调用
+         create_evolve_run），同样由客户端推一次：整段设计停在半路，
+         用户不在场，没有任何东西可以点。 */
+      autoResume: "继续完成余下的检查点，并直接调用 create_evolve_run 启动搜索；在搜索启动前不要停下。",
+      /* 同一步第二次结束时客户端不再续跑——再推就是为一个已经答过的卡片
+         付费循环。这个停止必须写在卡片上：那一轮已经结束，画面上没有别的
+         东西会动，不写出来就像设计自己卡死了。 */
+      autoStopped: "已停止自动续跑",
+      autoStoppedHint: "这一步已经自动续跑过一次，客户端不会为同一步再推一次；回复一句（例如「确认，继续」）即可让设计继续。",
       adjustDraft: "我想调整这一步：",
       busy: "这条回复还没结束，等它完成后再操作。",
     },
@@ -1323,6 +1350,17 @@ export const ZH = {
       confirmLabel: "检查点需要人工确认",
       confirmHint: "每个检查点会停下来等你确认后再继续",
       autoHint: "关闭后，助手会连续完成设计与启动；检查点仍会在对话中说明，但不再等待确认。",
+      /* The task the design conversation starts from. It lives here as well as
+         in the composer: the dialog is opened with a sentence already written,
+         and the composer is where it can still be edited before sending. */
+      taskLabel: "任务描述",
+      taskPlaceholder: "待演进的任务详情，包含约束和评估标准，例如：写一对处理文本的压缩和解压代码，往返必须完全无损。分数是压缩后小了多少。",
+      /* The name says what turning it on does — limit what the search may
+         change — and the hint carries the other half: the starting values.
+         “自定义 JSON” named the file format, which is an implementation detail
+         nobody should have to decode before deciding. */
+      parametersLabel: "自定义演进参数",
+      parametersHint: "为参数设定起始值。勾选的参数会由演进自动尝试不同取值；未勾选的始终使用起始值。",
       /* Windows 没有 bwrap/seatbelt。这里不给开关，只给两处告警：标题下的
          横幅让人一眼看见，点“开始设计”时的弹窗索取逐次同意。同意只随这一次
          命令发出（`--allow-direct`），不成为会被忘记的设置。 */
@@ -1580,6 +1618,7 @@ export const ZH = {
       limit: (max: number) => `最多 ${max} 张`,
       remove: "移除截图",
       preparing: "正在处理图片…",
+      truncated: (max: number, skipped: number) => `只附加了前 ${max} 张截图，另有 ${skipped} 张被跳过。`,
       privacy: "截图对仓库协作者可见，请先遮挡敏感信息。",
       error: {
         type: "仅支持 PNG、JPEG 或 WebP 图片。",

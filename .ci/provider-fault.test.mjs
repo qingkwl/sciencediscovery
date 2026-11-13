@@ -99,10 +99,102 @@ test('an unauthorized, rate-limited or semantic failure is never a transient gat
   assert.equal(detectProviderFault('Test timeout of 240000ms exceeded.'), null);
 });
 
-test('one unrelated line cannot turn a product failure into an outage', () => {
-  assert.equal(detectProviderFaultFromErrors([GATEWAY_500, 'Expected: "passed", Received: "failed"']), null);
+test('an assertion beside a gateway outage does not hide the outage', () => {
+  // Playwright appends the failed expect() to the error it saw, so the case
+  // records the gateway's 503 and `Expected:/Received:` together. The
+  // assertion line must not veto the fault (#813).
+  const mixed = detectProviderFaultFromErrors([GATEWAY_503, 'Expected: "completed", Received: "failed"']);
+  assert.equal(mixed.code, 'provider-server-error');
+  assert.equal(mixed.status, 503);
   assert.equal(detectProviderFaultFromErrors([GATEWAY_500]).code, 'provider-server-error');
+  // A delivery miss is the product's own verdict and still outranks the
+  // gateway text recorded beside it.
+  assert.equal(detectProviderFaultFromErrors([GATEWAY_500, DELIVERY_MISS]), null);
   assert.equal(detectProviderFaultFromErrors([]), null);
+});
+
+test('a stream that broke after a 200 classifies at case level too', () => {
+  // The product's report wraps the transport break in `delivery_status=failed`,
+  // and Nightly recorded exactly that on DRB-58. The wrapper restates a run that
+  // died on the transport after the provider answered whole, so it is not a
+  // verdict of its own and must not keep the case out of the classification.
+  const streamDied = 'Error: Main run must complete with readable, nonempty declared final artifacts; '
+    + 'delivery_status=failed; run_status=failed; delivered_artifacts=0; '
+    + 'run_error=[181001] model call failed, reason: openAI API async stream error: APIError: read ECONNRESET';
+  assert.deepEqual(detectProviderFaultFromErrors([streamDied]), { code: 'provider-transport', status: null });
+  // An assertion wrapper beside it records nothing either.
+  assert.deepEqual(
+    detectProviderFaultFromErrors([streamDied, 'Expected: "completed", Received: "failed"']),
+    { code: 'provider-transport', status: null },
+  );
+  // A delivery miss the case recorded in another text is still its own verdict.
+  assert.equal(detectProviderFaultFromErrors([streamDied, DELIVERY_MISS]), null);
+});
+
+test('a decision or a stall beside a gateway outage still vetoes the case', () => {
+  // A case records one text per failed expect() or hook, so the provider's
+  // 401/429 answer or the product's stalled-run wording can sit beside a
+  // sibling 503. Those texts are verdicts of their own, not assertion
+  // wrappers, so they keep the case out of the soft classification.
+  assert.equal(detectProviderFaultFromErrors([UNAUTHORIZED, GATEWAY_503]), null);
+  assert.equal(detectProviderFaultFromErrors([RATE_LIMITED, GATEWAY_503]), null);
+  assert.equal(detectProviderFaultFromErrors(['Agent run stalled: no assistant progress for 600000 ms', GATEWAY_503]), null);
+  assert.equal(detectProviderFaultFromErrors(['Test timeout of 240000ms exceeded.', GATEWAY_500]), null);
+  // One aggregated retry log can hold a decision and a break in the same text.
+  // The decision still vetoes the case: the per-text rule answers `null` for it,
+  // so the case veto must not read the break first and let a sibling 503 carry
+  // an authentication or quota answer.
+  const unauthorizedRetry = '[181001] model call failed after 2 attempts: attempt 1: openAI API answered Error code: 401 - unauthorized; attempt 2: read ECONNRESET';
+  assert.equal(detectProviderFault(unauthorizedRetry), null);
+  assert.equal(detectProviderFaultFromErrors([unauthorizedRetry, GATEWAY_503]), null);
+  const rateLimitedRetry = '[181001] model call failed after 2 attempts: attempt 1: openAI API answered Error code: 429 - rate limit; attempt 2: socket hang up';
+  assert.equal(detectProviderFault(rateLimitedRetry), null);
+  assert.equal(detectProviderFaultFromErrors([rateLimitedRetry, GATEWAY_503]), null);
+  // A timeout that names the gateway's own routing failure is the exception:
+  // the per-text rule never masks a routing failure behind that wording.
+  assert.equal(detectProviderFaultFromErrors(['No available channel for model deepseek-v4-flash; timed out', GATEWAY_503]).code,
+    'provider-unavailable');
+});
+
+test('a gateway 504 whose wording says timeout is still the outage', () => {
+  // The gateway names its own 504 in words a timeout also uses. The status and
+  // its context outrank that wording, on its own and beside an assertion block.
+  const gateway504 = "[181001] model call failed, reason: openAI API async stream error: GatewayTimeout: Error code: 504 - Gateway Timeout";
+  assert.equal(detectProviderFault(gateway504).code, 'provider-server-error');
+  assert.equal(detectProviderFault(gateway504).status, 504);
+  const withAssertion = `${gateway504}\nExpected: "completed"\nReceived: "failed"`;
+  assert.equal(detectProviderFault(withAssertion).status, 504);
+  // The 504 text must not veto the case either, with or without a sibling 503,
+  // and the order of the texts must not decide it.
+  assert.equal(detectProviderFaultFromErrors([withAssertion]).status, 504);
+  assert.equal(detectProviderFaultFromErrors([withAssertion, GATEWAY_503]).status, 504);
+  assert.equal(detectProviderFaultFromErrors([GATEWAY_503, withAssertion]).status, 503);
+  // A bare proxy-shaped 504 names no gateway context: it is a status the text
+  // quotes, so it stays the product's and vetoes the case like the stalled-run
+  // wording does.
+  assert.equal(detectProviderFault('504 Gateway Timeout'), null);
+  assert.equal(detectProviderFaultFromErrors(['504 Gateway Timeout', GATEWAY_503]), null);
+  // A stalled-run text that embeds the gateway's own 5xx is the outage, because
+  // the status and its context outrank the timeout wording in the same text.
+  const stalledOnGateway = 'Agent run stalled: no assistant progress for 600000 ms; run_error=[181001] model call failed, Error code: 503';
+  assert.equal(detectProviderFault(stalledOnGateway).status, 503);
+  assert.equal(detectProviderFaultFromErrors([stalledOnGateway]).status, 503);
+});
+
+test('a text that records what one step printed is outvoted by a sibling outage', () => {
+  // Pinned as documented: the four verdicts above are the only texts that keep
+  // a case out, so a product-side message beside a gateway 5xx still lets the
+  // outage carry the case.
+  assert.equal(detectProviderFault('/api/sessions/abc -> 500: {"error":"Internal Server Error"}'), null);
+  assert.equal(detectProviderFaultFromErrors(['/api/sessions/abc -> 500: {"error":"Internal Server Error"}', GATEWAY_503]).status, 503);
+  assert.equal(detectProviderFault('No final report identified; declared intermediate files are insufficient'), null);
+  assert.equal(detectProviderFaultFromErrors(['No final report identified; declared intermediate files are insufficient', GATEWAY_503]).status, 503);
+});
+
+test('one text holding the gateway error and the assertion block is still the outage', () => {
+  const mixed = `${GATEWAY_503}\nexpect(received).toBe(expected) // Object.is equality\nExpected: "completed"\nReceived: "failed"`;
+  assert.equal(detectProviderFault(mixed).status, 503);
+  assert.equal(detectProviderFault(mixed).code, 'provider-server-error');
 });
 
 test('a product failure that quotes a provider status is never soft-classified', () => {
@@ -137,6 +229,19 @@ test('the reporter records a live-model gateway fault apart from a product failu
   assert.equal(verdict.failed, 0);
   assert.equal(verdict.passed, 0);
   assert.equal(verdict.providerFaults, 1);
+});
+
+test('a live-model case that carries the assertion block with the 503 counts as a fault', t => {
+  const mixed = `${GATEWAY_503}\nexpect(received).toBe(expected) // Object.is equality\nExpected: "completed"\nReceived: "failed"`;
+  const { plan, written } = report(t, {
+    title: 'L3-cancel', tags: realCaseTags, status: 'failed', errors: [mixed], duration: 14_400,
+  });
+  assert.equal(written.results[0].outcome, PROVIDER_FAULT);
+  assert.deepEqual(written.results[0].providerFault, { code: 'provider-server-error', status: 503 });
+  const verdict = verifyResults(plan, written.results);
+  assert.equal(verdict.providerFaults, 1);
+  assert.equal(verdict.failed, 0);
+  assert.ok(!verdict.problems.some(problem => problem.startsWith('FAIL:')));
 });
 
 test('a product failure stays a hard failure with no provider class', t => {
@@ -343,6 +448,15 @@ test('only an early gateway fault is worth repeating', () => {
   assert.deepEqual(retryableProviderFaults([late]), []);
   assert.deepEqual(retryableProviderFaults([product]), []);
   assert.deepEqual(retryableProviderFaults([early, late, product]), [early]);
+});
+
+test('a status-less transport break is not re-run by the harness repeat', () => {
+  // A break after a 200 is a provider fault for the accounting, but the early
+  // repeat must not deliver the retry the issue's in-client change will own.
+  const transport = { outcome: PROVIDER_FAULT, providerFault: { code: 'provider-transport', status: null }, durationMs: 9_300 };
+  const serverError = { outcome: PROVIDER_FAULT, providerFault: { code: 'provider-server-error', status: 503 }, durationMs: 9_300 };
+  assert.deepEqual(retryableProviderFaults([transport]), []);
+  assert.deepEqual(retryableProviderFaults([serverError]), [serverError]);
 });
 
 test('a failed repeat is audited and stays a provider fault, not a product failure', () => {

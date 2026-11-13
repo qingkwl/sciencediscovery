@@ -4,12 +4,12 @@ import { createTest } from "../../../test/support/tagged/compat.mjs";
 const { test } = createTest(import.meta.url, { tags: ["category:ut", "os:linux", "arch:amd64", "arch:arm64"] });
 import assert from "node:assert/strict";
 import { EventEmitter, once } from "node:events";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import type { AddressInfo } from "node:net";
 import type { TestContext } from "node:test";
-import { createResearchPackage, importResearchPackage, sha256, type ResearchPackageExportProfile } from "@sciencediscovery/research-package";
+import { createResearchPackage, importResearchPackage, estimateResearchPackageBytes, sha256, type ResearchPackageExportProfile } from "@sciencediscovery/research-package";
 import { createApiServer, closeApiServer } from "./http/index.js";
 import { ApiStatusError } from "./http/api-status-error.js";
 import { ResearchExportPreviews } from "./research-export-previews.js";
@@ -83,6 +83,24 @@ async function fixture(context: TestContext, graphAvailable = false, sampleSessi
 
 const date = "2026-10-20T10:00:00.000Z";
 
+test("incremental previews match exported evidence and profile sizes", async (context) => {
+  const { request, project } = await fixture(context, true);
+  const target = await project();
+  const historical = researchTrajectoryFixture();
+  await request(`/api/projects/${target.id}/research-package/import?sessionId=${target.firstSession.id}`, { method: "POST", body: Buffer.from(historical.bytes) });
+  for (const level of ["necessary", "complete"]) for (const trajectory of [false, true]) for (const memory of [false, true]) {
+    const query = `sessionId=${target.firstSession.id}&level=${level}&includeFullTrajectory=${Number(trajectory)}&includeFullMemoryGraph=${Number(memory)}`;
+    const base = `/api/projects/${target.id}/research-package`;
+    const preview = await (await request(`${base}/preview?${query}`)).json() as { estimatedBytes: number };
+    const exported = importResearchPackage(new Uint8Array(await (await request(`${base}?${query}`)).arrayBuffer()));
+    assert.equal(preview.estimatedBytes, estimateResearchPackageBytes({
+      source: exported.manifest.source, records: exported.records, readme: Buffer.from(exported.readme).toString(),
+      omissions: exported.manifest.omissions, exportProfile: exported.manifest.exportProfile,
+      objects: [...exported.objects].map(([path, bytes]) => ({ path, bytes })),
+    }), query);
+  }
+});
+
 test("pending export previews return HTTP 409 for single and default profiles", async (context) => {
   const { rawRequest, project } = await fixture(context);
   const target = await project();
@@ -95,6 +113,27 @@ test("pending export previews return HTTP 409 for single and default profiles", 
     assert.equal(response.status, 409);
     assert.equal((await response.json() as { code: string }).code, "EXPORT_PREVIEW_PENDING");
   }
+});
+
+test("a preview poll of a deleted project ends as gone instead of a 404", async (context) => {
+  const { rawRequest, request, project } = await fixture(context);
+  const target = await project();
+  const endpoint = `/api/projects/${target.id}/research-package/preview?sessionId=${target.firstSession.id}`;
+  assert.equal((await rawRequest(`${endpoint}&defaults=1`)).status, 200);
+  await request(`/api/projects/${target.id}`, {
+    method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ confirmationId: target.id }),
+  });
+  // The panel still has the Session on screen; its poll must end quietly, not
+  // raise a browser resource error the mocked journey records (#1072).
+  const gone = await rawRequest(`${endpoint}&defaults=1`);
+  assert.equal(gone.status, 200);
+  assert.deepEqual(await gone.json(), { state: "deleted" });
+  // A one-shot preview read keeps reporting that its scope is gone.
+  const single = await rawRequest(`${endpoint}&level=complete`);
+  assert.equal(single.status, 404);
+  // A download of a package that is gone is still a mistake worth reporting.
+  const missingPackage = await rawRequest(`/api/projects/${target.id}/research-package?sessionId=${target.firstSession.id}`);
+  assert.equal(missingPackage.status, 404);
 });
 
 test("async preview clients receive accepted pending state and recover for single and default profiles", async (context) => {
@@ -126,6 +165,30 @@ test("async preview clients receive accepted pending state and recover for singl
   assert.equal((await failed.json() as { code: string }).code, "EXPORT_STORAGE_UNAVAILABLE");
 });
 
+test("preview deletion ends the poll quietly while shutdown and the one-shot read keep their status", async (context) => {
+  const { rawRequest, project } = await fixture(context);
+  const target = await project();
+  let failure: ApiStatusError;
+  context.mock.method(ResearchExportPreviews.prototype, "get", async () => { throw failure; });
+  const endpoint = `/api/projects/${target.id}/research-package/preview?sessionId=${target.firstSession.id}`;
+  for (const [status, code] of [[404, "EXPORT_PREVIEW_RESOURCE_DELETED"], [503, "EXPORT_PREVIEW_SERVICE_CLOSED"]] as const) {
+    failure = new ApiStatusError(status, "Preview intentionally stopped", code);
+    // The one-shot read keeps its status; the polling shape ends as `gone`
+    // because that is what a mounted panel asks and repeats (#1072).
+    const single = await rawRequest(`${endpoint}&level=complete`, { headers: { Prefer: "respond-async" } });
+    assert.equal(single.status, status);
+    assert.equal((await single.json() as { code: string }).code, code);
+    const polled = await rawRequest(`${endpoint}&defaults=1`, { headers: { Prefer: "respond-async" } });
+    if (code === "EXPORT_PREVIEW_RESOURCE_DELETED") {
+      assert.equal(polled.status, 200);
+      assert.deepEqual(await polled.json(), { state: "deleted" });
+    } else {
+      assert.equal(polled.status, status);
+      assert.equal((await polled.json() as { code: string }).code, code);
+    }
+  }
+});
+
 test("the first-install sample supports all five preview profiles without unshipped state objects", async (context) => {
   const f = await fixture(context, false, true);
   const projects = await (await f.request("/api/projects")).json() as { id: string }[];
@@ -139,17 +202,17 @@ test("the first-install sample supports all five preview profiles without unship
   assert.ok(previews.completeWithTrajectory.estimatedBytes > previews.complete.estimatedBytes, "the recorded trajectory remains in the complete preview");
 });
 
-test("viewing a conversation prewarms default sizes and workspace changes invalidate the cached evidence revision", async (context) => {
+test("viewing a conversation does not warm previews; the export dialog computes the five profiles on demand", async (context) => {
   const f = await fixture(context, true);
   const target = await f.project();
   const sessionId = target.firstSession.id;
   await f.request(`/api/sessions/${sessionId}`);
-  await f.waitForGraphExports(5);
-  assert.ok(f.graphExports() >= 5, "session viewing computes all five profiles before any export request");
+  assert.equal(f.graphExports(), 0, "viewing a session must not start any export build");
   const endpoint = `/api/projects/${target.id}/research-package/preview?sessionId=${sessionId}`;
   const defaults = async () => await (await f.request(`${endpoint}&defaults=1`)).json() as { revision: string; complete: { estimatedBytes: number; files: { path: string; selected: boolean }[] } };
   const warmed = await defaults();
   const exports = f.graphExports();
+  assert.ok(exports >= 5, "the export dialog computes the profiles it shows");
   await f.request(`${endpoint}&level=necessary&includeFullTrajectory=0`);
   await f.request(`${endpoint}&level=complete&includeFullTrajectory=0`);
   await f.request(`${endpoint}&level=complete&includeFullTrajectory=1`);
@@ -196,11 +259,12 @@ test("complete preview and download avoid aggregate record strings and retain im
   }
 });
 
-function evidencePackage(legacy = false, withEvolve = false) {
+function evidencePackage(legacy = false, withEvolve = false, withEvolveRuns = false, withEvolveCandidateSource = false) {
   const first = Buffer.from("value\n1\n");
   const latest = Buffer.from("value\n2\n");
   const notebook = Buffer.from('{"cells":[],"metadata":{},"nbformat":4,"nbformat_minor":5}');
   const evolveSource = Buffer.from("print(1)\n");
+  const evolveCandidateSource = Buffer.from("print('candidate source')\n");
   const version = (id: string, index: number, object: Buffer) => ({
     id, artifactId: "artifact-source", sessionId: "source-one", projectId: "source-project", version: index,
     createdAt: date, content: { hash: sha256(object), size: object.length }, mediaType: "text/csv", sourcePath: "results/result.csv",
@@ -213,6 +277,27 @@ function evidencePackage(legacy = false, withEvolve = false) {
       workspace: [{ path: "results/result.csv", objectPath: sha256(latest), size: latest.length, modifiedAt: date }, { path: "analysis.ipynb", objectPath: sha256(notebook), size: notebook.length, modifiedAt: date }],
       validations: { reviews: [{ id: "review-source", sessionId: "source-one", kind: "integrity", status: "passed", turnId: "run-source", createdAt: date, finishedAt: date, findings: [] }], artifactReviews: [{ id: "artifact-review-source", sessionId: "source-one", artifactId: "artifact-source", artifactVersionId: "version-two", artifactContentHash: sha256(latest), artifactLogicalName: "results/result.csv", checkpointId: "checkpoint-source", decision: "ACCEPT_AND_PROCEED", createdAt: date, finishedAt: date, findings: [], reviewerSpecialistVersion: "1", status: "completed" }] },
     }, { session: { id: "source-two", title: "分支会话", specialistId: "unavailable-specialist" }, messages: [{ id: "branch-prompt", role: "user", content: "分支研究", createdAt: date }], workspace: [] }],
+    // A package that really ran a search carries both the `evolve/<run>/` artifact
+    // and the run records with their event log; only then is the "searches were not
+    // carried" loss absent from the receipt.
+    ...(withEvolveRuns ? { evolve: { runs: [{
+      run: {
+        id: "evolve-run-source", sessionId: "source-one", algorithm: "puct",
+        goal: {
+          algorithm: "puct",
+          baselineProgramCas: "sha256:baseline",
+          budget: { candidateTimeoutSeconds: 60, expansions: 6, maxCostCents: 500, maxSeconds: 1_800, maxTokens: 200_000, maxTokensPerCall: 16_000, workers: 1 },
+          frozen: ["score.py"],
+          modelId: "model-1",
+          scorecard: { aggregate: "weighted_sum", confirmedAt: date, confirmedBy: "tester", constraints: [], criteria: [], derivedFrom: { draftRunId: "draft-1", statement: "Search for candidate genes" }, hash: "sha256:card", schemaVersion: 1, solvedThreshold: 0.999 },
+          schemaVersion: 2,
+          statement: "Search for candidate genes",
+          target: { entrypoint: "classify.py", kind: "program", programId: "p1" },
+        },
+        status: "succeeded", startedAt: date, finishedAt: date, candidates: 2, costCents: 0, tokens: 0, createdAt: date,
+      },
+      events: [{ sequence: 1, createdAt: date, event: { type: "log", level: "info", message: "started" } }],
+    }], ...(withEvolveCandidateSource ? { candidates: [{ runId: "evolve-run-source", hash: sha256(evolveCandidateSource), objectPath: sha256(evolveCandidateSource) }] } : {}) } } : {}),
     artifacts: [
       { id: "artifact-source", projectId: "source-project", createdInSessionId: "source-one", createdInSessionTitle: "原始研究", sessionId: "source-one", name: "results/result.csv", logicalName: "results/result.csv", kind: "dataset", origin: "user_upload", currentVersion: 2, createdAt: date, updatedAt: date, versions: [version("version-one", 1, first), version("version-two", 2, latest)] },
       // A run's result is published as `evolve/<run>/<entrypoint>` with
@@ -234,7 +319,7 @@ function evidencePackage(legacy = false, withEvolve = false) {
         }],
       }] : []),
     ],
-  }, objects: [first, latest, notebook, ...(withEvolve ? [evolveSource] : [])].map((bytes) => ({ path: sha256(bytes), bytes })) }).bytes;
+  }, objects: [first, latest, notebook, ...(withEvolve ? [evolveSource] : []), ...(withEvolveCandidateSource ? [evolveCandidateSource] : [])].map((bytes) => ({ path: sha256(bytes), bytes })) }).bytes;
 }
 
 test("complete package restores conversations, files, versions and reviews across projects without leaking into sibling sessions", async (context) => {
@@ -307,6 +392,46 @@ test("a package carrying an evolve result reports that the searches themselves w
   assert.equal(receipt.artifactCount, 2);
   assert.ok(receipt.omissions.some((item) => item.includes("does not carry evolution (evolve) search runs")),
     "the receipt names the searches it could not carry");
+});
+
+test("a package carrying the evolve runs and their artifact reports no search loss", async (context) => {
+  // The import layer must agree with the predicate: a package that ran a search
+  // AND carries the run records is restored, so the "searches were not carried"
+  // omission is absent — this is the path #1019 review F1 found was never tested
+  // at the import boundary.
+  const { request, project, root } = await fixture(context);
+  const target = await project();
+  const receipt = await (await request(`/api/projects/${target.id}/research-package/import?sessionId=${target.firstSession.id}`, {
+    method: "POST", body: Buffer.from(evidencePackage(false, true, true)),
+  })).json() as { artifactCount: number; omissions: string[] };
+  assert.equal(receipt.artifactCount, 2);
+  assert.equal(receipt.omissions.some((item) => item.includes("does not carry evolution (evolve) search runs")), false,
+    "the carried run records make the search loss untrue");
+  // The runs travel, but their candidate *sources* (`evolve-candidates/<run>/
+  // <sha256>.py`) never enter the package, so a run that has candidates must
+  // still be told it came back without their code.
+  assert.ok(receipt.omissions.some((item) => item.includes("candidate source")),
+    "the receipt names the candidate sources it could not carry");
+  // The /api/evolve/runs route is gated on the external evolve service being
+  // ready, which this fixture never provisions, so the restoration is read back
+  // from the local EvolutionStore the import wrote it into.
+  const restoredRun = JSON.parse(await readFile(resolve(root, "evolution", "runs", "evolve-run-source", "run.json"), "utf8")) as { sessionId: string };
+  assert.equal(restoredRun.sessionId, target.firstSession.id, "the carried run is restored under the imported session");
+});
+
+test("a package carrying evolve candidate source restores it beside the imported run", async (context) => {
+  const { request, project, root } = await fixture(context);
+  const target = await project();
+  const receipt = await (await request(`/api/projects/${target.id}/research-package/import?sessionId=${target.firstSession.id}`, {
+    method: "POST", body: Buffer.from(evidencePackage(false, true, true, true)),
+  })).json() as { omissions: string[] };
+  assert.equal(receipt.omissions.some((item) => item.includes("candidate source files are not carried")), false);
+  const digest = sha256(Buffer.from("print('candidate source')\n")).replace(/^sha256:/, "");
+  assert.equal(await readFile(resolve(root, "evolve-candidates", "evolve-run-source", `${digest}.py`), "utf8"), "print('candidate source')\n");
+  const exported = importResearchPackage(new Uint8Array(await (await request(`/api/projects/${target.id}/research-package?sessionId=${target.firstSession.id}&level=complete`)).arrayBuffer()));
+  const evolve = (exported.records as { evolve?: { candidates?: Array<{ hash: string; objectPath: string; runId: string }> } }).evolve;
+  assert.deepEqual(evolve?.candidates, [{ hash: `sha256:${digest}`, objectPath: digest, runId: "evolve-run-source" }]);
+  assert.equal(Buffer.from(exported.objects.get(digest)!).toString("utf8"), "print('candidate source')\n");
 });
 
 test("a package without an evolve artifact reports no such loss", async (context) => {

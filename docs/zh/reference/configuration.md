@@ -60,7 +60,7 @@ set -a && source .env && set +a
 | `SCIENCE_AGENT_PROVISIONER_PATH` | — | 可选管理员提供的 provisioner 覆盖；正常 setup 安装应用自有固定二进制 |
 | `SCIENCE_AGENT_MICROMAMBA_BASE_URL` | — | 可选镜像目录 URL，托管 micromamba 固定版本的同名发布件；留空使用上游发布地址。无论从哪里下载，固定的 SHA-256 校验都不放宽 |
 | `SCIENCE_AGENT_NPU_PYTHON_PATH` | 自动探测 | 读取 NPU 状态时调用驱动 DCMI 接口所用的宿主 Python；留空按 `/usr/bin/python3`、`/usr/local/bin/python3` 顺序探测，都没有则回退到 `npu-smi` |
-| `SCIENCE_AGENT_PACKAGE_CACHE_DIR` | — | 可选预置缓存；设置后 provision 离线运行，不再拉取允许渠道。pip `indexUrl` 与 conda channel 仍执行安全校验，但安装时不访问这些网络源（见 [sandbox-execution.md](../developer-docs/sandbox-execution.md) §6 受控软件源） |
+| `SCIENCE_AGENT_PACKAGE_CACHE_DIR` | — | 可选预置缓存；设置后 provision 离线运行，不再拉取允许渠道。pip `indexUrl` 与 conda channel 仍执行安全校验，但安装时不访问这些网络源（见 [sandbox-execution.md](../developer-docs/sandbox-execution.md) §6 受控软件源）；同时是唯一能改变包缓存位置的设置：Windows 上缓存不跟随数据目录，因为包内成员路径必须留在 259 个字符以内 |
 | `SCIENCE_AGENT_SCIENTIFIC_CHANNELS` | `conda-forge` | 逗号分隔的包渠道白名单；内置镜像预设（TUNA/USTC）对应的频道 URL 始终被 Runner 接受，自定义频道仍须显式列入 |
 | `SCIENCE_AGENT_KERNEL_IDLE_MS` | `0` | 初始持久内核空闲超时（`0` = 无限） |
 | `SCIENCE_AGENT_WEB_DIR` | `apps/web/dist` | 静态 UI 资源 |
@@ -122,7 +122,7 @@ Compose 读取仓库根目录 `.env`（模板为 `.env.docker.example`），把�
 | `SCIENCE_AGENT_KERNEL_IDLE_MS` | `1800000` | 持久内核空闲超时（最小 1000 ms） |
 | `SCIENCE_AGENT_SCIENTIFIC_CHANNELS` | `conda-forge` | 逗号分隔的包渠道白名单 |
 | `SCIENCE_AGENT_PROVISIONER_PATH` | — | 可选管理员 micromamba 路径；留空使用镜像内已校验、并播种到数据目录的副本 |
-| `SCIENCE_AGENT_PACKAGE_CACHE_DIR` | — | 可选预置缓存路径；离线 provision 前需填充内容 |
+| `SCIENCE_AGENT_PACKAGE_CACHE_DIR` | — | 可选预置缓存路径；离线 provision 前需填充内容。升级前请先用当前初始包集合（含 `pysocks`）重新种入缓存：无法从缓存提供的初始包升级会被跳过并在 setup 消息中说明，存量任务环境走 SOCKS 路由的 pip 安装也依赖缓存中的该包 |
 | `SCIENCE_AGENT_BWRAP_PATH` | `/usr/bin/bwrap` | 镜像内 bubblewrap 可执行文件 |
 | `SCIENCE_AGENT_SSH_CONFIG_PATH` | — | 远程 runner 的 SSH 配置文件（容器内路径）；放在宿主 `./data/ssh` 下即已在 `/app/data/ssh` 可见 |
 | `SCIENCE_AGENT_USAGE_EXCHANGE_RATES_ENABLED` | `true` | 用量看板展示币种换算开关；关闭后费用只显示各模型原始币种 |
@@ -154,6 +154,8 @@ Compose 读取仓库根目录 `.env`（模板为 `.env.docker.example`），把�
 | `.sciencediscovery-data/envs/{paper,gateway,adapter,memory-graph,evolve}/` | 源码模式下可重建的 uv 服务环境；Docker 镜像将这些环境放在 `/opt/sciencediscovery/envs/` |
 | `.sciencediscovery-data/logs/{api,run,gateway,runner,memory-graph}.log` | 分级、按类别和大小滚动的运行日志；memory-graph 文件仅在功能启用时使用 |
 | 浏览器 local storage | 仅本地服务访问令牌——模型凭证从不离开后端 |
+
+运行调度器无法读取或保存状态时，API 会记录 `run_scheduler_failed`，从 500 毫秒开始重试恢复，间隔逐次翻倍，最长为 30 秒。已选中且受故障影响的运行会通过事件流收到中断诊断；存储故障期间，重连同一 API 进程也能收到该诊断。存储恢复后，调度器先持久化中断状态，再继续队列，不会自动重放中断轮次的工具调用。请检查磁盘空间和数据目录权限，再重试运行。恢复成功之前，运行列表仍反映磁盘上最后保存的状态；实时诊断暂存在内存中，不会跨 API 重启保留。已持久化的终态会保留。
 
 数据目录是唯一运行时根：通过设置 `SCIENCE_DISCOVERY_DATA_DIR` 可同时迁移状态与服务环境（例如 `SCIENCE_DISCOVERY_DATA_DIR=/srv/science-discovery ./scripts/run-local.sh`）。原 `SCIENCE_AGENT_DATA_DIR` 仍作为兼容回退读取并打印日志；新旧同时设置时 `SCIENCE_DISCOVERY_DATA_DIR` 优先，且会记录该选择。对于仓库启动器，已有默认 `data` 目录会一次性移动到 `.sciencediscovery-data`。对于单文件 launcher，已有默认 `./science-discovery-data` 或更早的 `./science-agent-data` 会按由新到旧的顺序一次性导入 `./.sciencediscovery-data`；目标已存在时绝不覆盖并打印跳过原因。删除当前生效的数据目录会清除所有项目、会话、凭证与审计记录。在 Docker 部署中，同一目录就是宿主上的 bind mount `./data`，区别只在于 `envs/` 位于镜像内。`services/paper/.venv` 与 `services/gateway/.venv` 仅在独立开发或 smoke 命令中出现；应用本身使用 `.sciencediscovery-data/envs/` 下的环境。
 

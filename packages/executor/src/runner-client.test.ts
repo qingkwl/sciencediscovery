@@ -16,9 +16,32 @@ import { createTest } from "../../../test/support/tagged/compat.mjs";
 const { test } = createTest(import.meta.url, { tags: ["category:ut", "os:linux", "arch:amd64", "arch:arm64"] });
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 
 import { executionDigestVectors } from "../../../test/support/execution-digest-vectors.js";
 import { RunnerClient } from "./runner-client.js";
+
+
+test("RunnerClient resolves environment proxy for each setup and install operation", async (context) => {
+  const bodies: Record<string, unknown>[] = [];
+  const server = createServer(async (request, response) => {
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    bodies.push(JSON.parse(body));
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end("{}");
+  });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  context.after(() => { server.closeAllConnections(); server.close(); });
+  let policy: import("@sciencediscovery/schema").ResolvedProxy = { mode: "environment", noProxy: "internal.test" };
+  const serverAddress = server.address();
+  const serverPort = typeof serverAddress === "object" && serverAddress !== null ? serverAddress.port : 0;
+  const client = new RunnerClient(`http://127.0.0.1:${serverPort}`, "test-token", () => policy);
+  await client.setupScientificEnvironments();
+  policy = { mode: "direct" };
+  await client.installEnvironment("env", { packages: ["numpy"] } as Parameters<RunnerClient["installEnvironment"]>[1]);
+  assert.deepEqual(bodies.map(body => body.networkProxy), [{ mode: "environment", noProxy: "internal.test" }, { mode: "direct" }]);
+});
 
 test("RunnerClient retains an HTTP failure status but never copies the remote error text", async (context) => {
   const server = createServer((_request, response) => {
@@ -110,6 +133,26 @@ test("direct capability probes preserve target workspace scope and caller cancel
   const controller = new AbortController(); controller.abort();
   await assert.rejects(client.directExecutionCapability(controller.signal, remote), /abort/i);
   assert.equal(requests.length, 3, "an aborted probe must not reach the target");
+});
+
+test("RunnerClient authenticates health and learns the clock before later requests", async (context) => {
+  const remoteNow = Date.now() + 120_000;
+  const server = createServer((request, response) => {
+    assert.equal(request.headers.authorization, "Bearer test-token");
+    assert.equal(request.url, "/health");
+    response.writeHead(200, { "content-type": "application/json", date: new Date(remoteNow).toUTCString() });
+    response.end(JSON.stringify({ status: "ok", platform: "linux", runnerVersion: "fixture" }));
+  });
+  await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+  context.after(() => new Promise<void>((done) => {
+    server.close(() => done());
+    server.closeAllConnections();
+  }));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const client = new RunnerClient(`http://127.0.0.1:${address.port}`, "test-token");
+  assert.equal((await client.health()).runnerVersion, "fixture");
+  assert.ok(Math.abs(client.clockOffsetMs - 120_000) < 5_000);
 });
 
 test("managed result integrity is checked before clock conversion and structured conflicts survive HTTP", async t => {

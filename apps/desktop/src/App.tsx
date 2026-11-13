@@ -21,10 +21,10 @@ import {
   type ComponentProps,
   type CSSProperties,
 } from "react";
-import { isEvidenceSessionReadOnly, isEvolveRunActive, type EvolveAlgorithm } from "@sciencediscovery/schema";
+import { appendEvolveDirection, isEvidenceSessionReadOnly, isEvolveRunActive, type EvolveAlgorithm, type EvolveDirectionInput } from "@sciencediscovery/schema";
 
 import { ApiClient } from "./api/client.js";
-import { getSubagent } from "./api/sessions.js";
+import { cancelRun, getSubagent } from "./api/sessions.js";
 import type {
   ComposerReference,
   PermissionDecision,
@@ -43,13 +43,17 @@ import { useFileDrop } from "./app/use-file-drop.js";
 import { useLanguage } from "./app/use-language.js";
 import { usePanelWidth } from "./app/use-panel-width.js";
 import { useWorkspace } from "./app/use-workspace.js";
+import { useConfigurationRequests } from "./app/use-configuration-requests.js";
 import { formatByteLimit } from "./app/upload.js";
 import {
   composeEvolveMessage,
+  designHasSearch,
   evolveCommandAlgorithm,
   evolveCommandCheckpointMode,
   evolveCommandGoal,
+  evolveDraftTask,
   isEvolveSkill,
+  latestEvolveCheckpointMode,
   splitEvolveCommand,
 } from "./evolve/command.js";
 import { designAnchor, useAutoContinue } from "./evolve/use-auto-continue.js";
@@ -67,10 +71,11 @@ import { applyDocumentLanguage, TEXT } from "./text.js";
 import { FeedbackDialog } from "./feedback/FeedbackDialog.js";
 import { ArtifactDialog } from "./views/ArtifactDialog.js";
 import { AuthScreen } from "./views/AuthScreen.js";
-import { CheckpointReplyProvider, type CheckpointReply } from "./views/CheckpointCard.js";
+import { CheckpointRefusedProvider, CheckpointReplyProvider, type CheckpointReply } from "./views/CheckpointCard.js";
 import { Composer, type SeededCommand } from "./views/Composer.js";
 import { ConfirmDialog } from "./views/ConfirmDialog.js";
 import { Conversation } from "./views/Conversation.js";
+import { draftEvolveDirection } from "./api/evolve.js";
 import { EvolveCreateDialog } from "./views/evolve/EvolveCreateDialog.js";
 import { EvolveDetail } from "./views/evolve/EvolveDetail.js";
 import { EvolveRuns } from "./views/evolve/EvolveRuns.js";
@@ -590,7 +595,15 @@ export function App({ initialToken }: Props) {
    *  empty transcript: the composer sits centred with the wordmark, rather
    *  than pinned to the bottom of a page with nothing above it. A run that is
    *  still going keeps the transcript, even before its first event lands. */
-  const landing = !state.loadingSession && !state.running && isEmptyTranscript(state);
+  // Poll the selected Session even while it still has no messages: an API-
+  // created configuration request must not disappear behind the welcome page.
+  const configuration = useConfigurationRequests({
+    client, sessionId: state.detail?.id, active: state.running,
+    refreshKey: `${state.detail?.updatedAt ?? ""}:${state.detail?.messages.map(message => message.id).join(",") ?? ""}:${state.run.status ?? ""}:${state.run.turns.flatMap(turn => turn.tools.map(tool => `${tool.id}:${tool.trace.status}`)).join(",")}`,
+    onChange: actions.refreshConfiguration,
+  });
+  const landing = !state.loadingSession && !state.running && isEmptyTranscript(state)
+    && !configuration.requests.length && !configuration.legacyRequests.length && !configuration.loading && !configuration.error;
 
   useEffect(() => {
     pageRef.current = { landing, running: state.running };
@@ -618,20 +631,23 @@ export function App({ initialToken }: Props) {
     actions.retryBoot();
   };
 
-  /** The command is a way into the surface, not only a message. While the
-   *  runtime is not ready the goal typed after it is carried into the setup
-   *  dialog instead of being sent to a server that cannot run it; a bare
-   *  command opens the dialog that asks for one. On a host with no sandbox
-   *  every command detours there, including one that already carries
-   *  `--allow-direct`: a pasted flag is a word the user typed without the
-   *  warning on screen, and the dialog is where that warning is read and
-   *  answered. So the dialog is the only writer of the flag — a command that
-   *  reaches the server with it is one the user confirmed here.
+  /** The command is a way into the surface, not only a message.
+   *
+   *  A command typed as text — pasted, or written without picking the skill
+   *  from the palette — always opens the setup dialog rather than being sent.
+   *  The dialog is the one place the task, the search, the pace and the
+   *  parameters are visible together, and on a host with no sandbox it is the
+   *  only writer of `--allow-direct`: a pasted flag is a word typed without
+   *  the warning on screen, and the dialog is where that warning is read and
+   *  answered. The sentence typed after the command rides along, so it is not
+   *  written twice. A token the dialog already placed in the composer takes
+   *  the branch above instead — sending it is the user's final word, and it
+   *  must not reopen the dialog.
    *
    *  Defined above the boot screens' early returns because the checkpoint
    *  provider below reads it in an effect: a `const` declared after an early
    *  `return` is still in its temporal dead zone when that effect commits. */
-  const sendMessage = (content: string, command?: string) => {
+  const sendMessage = (content: string, command?: string, direction?: EvolveDirectionInput) => {
     if (isEvidenceSessionReadOnly(state.detail)) { actions.toast(TEXT.researchPackage.readOnly, "error"); return; }
     // The token came from the design dialog, which collected the goal, the
     // search and the no-sandbox consent before placing it. Sending it is a
@@ -641,23 +657,18 @@ export function App({ initialToken }: Props) {
       setSeededCommand(undefined);
       awaitingSince.current = Date.now();
       setAwaitingRun(true);
-      void actions.send(composeEvolveMessage(command, content));
+      const message = composeEvolveMessage(command, content);
+      void actions.send(direction ? appendEvolveDirection(message, direction) : message);
       return;
     }
     const goal = evolveCommandGoal(content);
-    if (goal !== undefined
-        && (goal === "" || evolve.status.state !== "ready"
-            || evolve.status.sandbox === "direct")) {
+    if (goal !== undefined) {
       setEvolveCreate({
         algorithm: evolveCommandAlgorithm(content),
         checkpointMode: evolveCommandCheckpointMode(content),
         goal: goal === "" ? undefined : goal,
       });
       return;
-    }
-    if (goal !== undefined) {
-      awaitingSince.current = Date.now();
-      setAwaitingRun(true);
     }
     void actions.send(content);
   };
@@ -691,13 +702,36 @@ export function App({ initialToken }: Props) {
     [state.detail?.messages, state.pendingMessage?.content],
   );
 
+  /** The pace that design was started with, from the same transcript. Only a
+   *  design nobody is waiting on may be carried forward. */
+  const designPace = useMemo(
+    () => latestEvolveCheckpointMode(state.detail?.messages ?? [], state.pendingMessage?.content),
+    [state.detail?.messages, state.pendingMessage?.content],
+  );
+
+  /** Whether *this design* already has a search. The Session's whole run list
+   *  would answer for designs that are long finished, and a second no-confirm
+   *  design in the same conversation would never be carried. The command `now`
+   *  being sent counts: a design whose `/evolve-design` is still pending owns
+   *  no run, whatever the previous design in the transcript started. */
+  const searchStarted = useMemo(
+    () => designHasSearch(
+      evolve.runs,
+      state.detail?.messages ?? [],
+      state.pendingMessage?.content,
+    ),
+    [evolve.runs, state.detail?.messages, state.pendingMessage?.content],
+  );
+
   // A no-confirm design that ends its turn on an auto card is carried forward
   // here — the model cannot start the next turn by itself, and the card offers
   // nothing to press. See the hook for what it refuses to act on.
-  useAutoContinue({
+  const autoContinue = useAutoContinue({
+    checkpointMode: designPace,
     design,
     running: state.running,
     run: state.run,
+    searchStarted,
     send: (text) => latestSend.current(text),
     sessionId: state.sessionId,
   });
@@ -815,10 +849,12 @@ export function App({ initialToken }: Props) {
   };
 
   /** 会话设置's row goes to the search that wants attention — a running one,
-   *  else the newest — and starts one only when the session has none. */
-  const openEvolve = () => {
+   *  else the newest — and starts one only when the session has none. The
+   *  composer's draft rides into the new design's task field: a sentence
+   *  already written is the one the design would start from. */
+  const openEvolve = (draft?: string) => {
     const target = evolve.runs.find((run) => isEvolveRunActive(run.status)) ?? evolve.runs[0];
-    if (target === undefined) setEvolveCreate({});
+    if (target === undefined) setEvolveCreate({ goal: evolveDraftTask(draft ?? "") });
     else showEvolveRun(target.id);
   };
 
@@ -891,9 +927,10 @@ export function App({ initialToken }: Props) {
     onOpenSettings: () => openSettings("models"),
     // A skill that has a setup surface opens it instead of dropping its
     // command into the draft — the same dialog 会话设置's evolve row opens.
-    onPickSkill: (skill) => {
+    // The draft is the task it was going to replace.
+    onPickSkill: (skill, draft) => {
       if (!isEvolveSkill(skill)) return false;
-      setEvolveCreate({});
+      setEvolveCreate({ goal: evolveDraftTask(draft) });
       return true;
     },
     onRemoveAttachment: actions.removeAttachment,
@@ -914,7 +951,7 @@ export function App({ initialToken }: Props) {
     running: state.running,
     seededCommand,
     selectedModelId: state.selectedModelId,
-    unavailableModel: Boolean(state.detail?.settingsOverrides.modelId && !state.models.some(model => model.id === state.detail?.settingsOverrides.modelId)),
+    unavailableModel: Boolean(state.detail?.settingsOverrides?.modelId && !state.models.some(model => model.id === state.detail?.settingsOverrides.modelId)),
     selectedSpecialistId: state.detail?.specialistId,
     uploading: state.uploading,
   };
@@ -984,24 +1021,36 @@ export function App({ initialToken }: Props) {
             <Landing composer={composerProps} key={landingKey(state)} />
           ) : (
             <>
-              <Conversation
-                client={client}
-                detail={state.detail}
-                // A search keeps running after the turn that started it, so its
-                // card is the last thing the conversation produced. It draws
-                // nothing at all for a session that has no searches.
-                evolve={<EvolveRuns onOpen={showEvolveRun} runs={evolve.runs} />}
-                loading={state.loadingSession}
-                onDecidePermission={decidePermission}
-                onOpenSubagent={openSubagentDetails}
-                onOpenTool={openToolDetails}
-                onBranch={isEvidenceSessionReadOnly(state.detail) || state.running ? undefined : messageId => setPackageRequest({ kind: "branch", sessionId: state.detail?.id, projectId: state.detail?.projectId, messageId })}
-                onReferenceClick={openReference}
-                pending={state.pendingMessage}
-                replays={state.replays}
-                run={state.run}
-                workspaceFiles={state.panelFiles}
-              />
+              {/* A design the client stopped carrying says so on the card it
+                  stopped at; the value is the step, and every other card
+                  ignores it. Hidden while a turn runs: the refusal describes
+                  the ending that already happened, and a new answer that
+                  happens to stream a card of the same step must not wear that
+                  ending's badge for a frame. */}
+              <CheckpointRefusedProvider value={state.running ? undefined : autoContinue.refusedStep}>
+                <Conversation
+                  onOpenConfigurationSettings={openSettings}
+                  client={client}
+                  detail={state.detail}
+                  configuration={configuration}
+                  onConfigurationChange={actions.refreshConfiguration}
+                  configurationReadOnly={isEvidenceSessionReadOnly(state.detail) || state.detail?.archivedAt !== undefined}
+                  // A search keeps running after the turn that started it, so its
+                  // card is the last thing the conversation produced. It draws
+                  // nothing at all for a session that has no searches.
+                  evolve={<EvolveRuns onOpen={showEvolveRun} runs={evolve.runs} />}
+                  loading={state.loadingSession}
+                  onDecidePermission={decidePermission}
+                  onOpenSubagent={openSubagentDetails}
+                  onOpenTool={openToolDetails}
+                  onBranch={isEvidenceSessionReadOnly(state.detail) || state.running ? undefined : messageId => setPackageRequest({ kind: "branch", sessionId: state.detail?.id, projectId: state.detail?.projectId, messageId })}
+                  onReferenceClick={openReference}
+                  pending={state.pendingMessage}
+                  replays={state.replays}
+                  run={state.run}
+                  workspaceFiles={state.panelFiles}
+                />
+              </CheckpointRefusedProvider>
               {isEvidenceSessionReadOnly(state.detail) ? null : <Composer {...composerProps} />}
             </>
           )}
@@ -1093,15 +1142,19 @@ export function App({ initialToken }: Props) {
           initialGoal={evolveCreate.goal}
           initializing={evolve.initializing}
           onClose={closeEvolveCreate}
+          onGenerateDirection={state.detail
+            ? (task, signal) => draftEvolveDirection(client, state.detail!.id, task, signal)
+            : undefined}
           onInitialize={() => void evolve.initialize()}
-          onSend={(command) => {
+          onSend={(command, direction) => {
             closeEvolveCreate();
-            // The flags become a token in the composer and the goal becomes
-            // the sentence after it. The message leaves when the user says so,
-            // not when the dialog closes: the design usually needs a sentence
-            // of its own added after the goal.
+            // The flags become a token in the composer, the task the sentence
+            // after it, and the confirmed parameters ride with the token until
+            // the user sends. The message leaves when the user says so, not
+            // when the dialog closes: the design usually needs a sentence of
+            // its own added after the task.
             const draft = splitEvolveCommand(command);
-            setSeededCommand({ command: draft.command, nonce: Date.now(), text: draft.goal });
+            setSeededCommand({ command: draft.command, direction, nonce: Date.now(), text: draft.goal });
           }}
           running={state.running}
           status={evolve.status}

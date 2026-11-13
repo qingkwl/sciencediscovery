@@ -5,12 +5,13 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "dev": "tsx watch src/server.ts",
-    "start": "node dist/server.js",
+    "dev": "node --import tsx --watch --max-old-space-size=3072 src/server.ts",
+    "start": "node --max-old-space-size=3072 dist/server.js",
     "test": "node --import tsx --test \"src/**/*.test.ts\"",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@sciencediscovery/network": "workspace:*",
     "@sciencediscovery/trajectory": "workspace:*",
     "@sciencediscovery/plugin-sdk": "workspace:*",
     "@sciencediscovery/research-package": "workspace:*",
@@ -41,7 +42,7 @@
     "ajv": "8.18.0",
     "fflate": "0.8.3",
     "typebox": "1.1.38",
-    "undici": "8.12.2",
+    "undici": "8.12.4",
     "yaml": "2.9.0",
     "@sciencediscovery/skill": "workspace:*",
     "@sciencediscovery/mcp": "workspace:*",

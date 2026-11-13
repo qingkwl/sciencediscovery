@@ -23,13 +23,24 @@
 import type { Text } from "./zh.js";
 
 export const EN: Text = {
+  configurationLegacy: {
+    title: "Enable connector", awaiting: "Awaiting confirmation", change: "Change", scope: "Scope", session: "This session only",
+    continuation: "Original task", noTask: "No task was submitted", recorded: "Continuation recorded by the server", serverOwned: "Continuation is managed by the server",
+    enable: (name: string) => `Enable ${name}`, userReason: (name: string) => `You requested access to ${name}.`, taskReason: (name: string) => `The original task requested ${name}.`,
+    confirm: "Confirm and enable", decline: "Not now", saving: "Saving…", saved: "Saved", dismissed: "Not configured", stale: "Request out of date",
+    dismissedDetail: "This connector was not enabled by this request.", staleDetail: "The settings or original task changed. This request cannot be applied.",
+    countdown: (seconds: number) => `Previously authorized automatic configuration is due in ${seconds}s.`, due: "Waiting for the server to review the previously authorized automatic change.",
+    waitRun: "Wait for the current task to reach a safe pause before deciding.", failed: "The decision could not be confirmed. Refresh its status before trying again.", refresh: "Refresh status",
+  },
   researchPackage: {
     continueUnavailable: "This imported record is not fully restored and cannot be continued. Check the import omissions, restore missing services and import again.", sourceUnavailable: "The conversation or its project no longer exists. Refresh the session list and try again.",
     projectDestination: "Project", noProject: "No project", projectDestinationHint: "Added to Sessions by default. You may choose an existing project.", necessaryContents: "Conversation · Current files and artifacts · Dependencies", completeContents: "Conversation · File and artifact versions · Research history",
     newOptions: "New conversation options", projectImport: (name: string) => `Import conversation into ${name}`, messageMenu: "Reply menu", sessionScope: "Export the whole conversation and its research materials, beyond the visible chat text.", packageContents: "Conversation, workspace files, artifacts and related research evidence.",
     title: "Research package", import: "Import conversation", export: "Export conversation", continue: "Continue chatting", branch: "Create branch chat", source: "Return to source",
-    readOnly: "Imported evidence · Read-only. Create an independent copy to continue with the retained materials.", copying: "Copying research in the background…", ready: "Research copy ready", failed: "Operation failed", open: "Open conversation", download: "Download", preparing: "Preparing the package in the background…", close: "Close", copyMissing: "The conversation or operation record for this copy no longer exists; waiting has stopped. Create a new continuation.", copyPollingFailed: "Unable to read copy progress; retries have stopped. Refresh or try again later.", legacyUnavailable: "The local service is temporarily unavailable, retrying…", exportPollingFailed: "Unable to read export progress; retries have stopped. Export again later.", exportMissing: "The export task no longer exists. Export again.",
-    necessary: "Necessary", complete: "Complete", necessaryHint: "Current results, input dependencies and related evidence, with optional history omitted.", completeHint: "Available history and versions within the selected scope.", trajectory: "Include full trajectory details", graph: "Include full scientific-memory graph", estimate: "Uncompressed estimate", calculating: "Calculating scope and size…", files: "Workspace files", omissions: "Scope and omissions", evidenceOnly: "Packages support inspection and continuation. Import does not execute code or restore permission grants.", choose: "Select a .sdresearch package", objects: "content objects", importHint: "Restore conversation, files and evidence as a read-only snapshot. Continuing research creates an independent new session. The original record is preserved.", branchHint: "Choose a completed reply. The branch inherits the prefix and recoverable evidence, excluding later research.", reply: "Branch starting point", working: "Working…", startExport: "Start background export", confirmImport: "Confirm import", exportSaving: "Saving package…", exportSaved: "Package saved", exportSaveFailed: "Failed to save the package", exportCanceled: "Export canceled", openLocation: "Open file location", exportsInProgress: (count: number) => `${count} export${count === 1 ? "" : "s"} in progress`, retrySave: "Retry save", savedExports: "Saved packages",
+    readOnly: "Imported evidence · Read-only. Create an independent copy to continue with the retained materials.", copying: "Copying research in the background…", failed: "Operation failed",
+    recalculating: "Recalculating…",
+    omissionsSummary: (count: number) => `Not included: ${count} workspace file${count === 1 ? "" : "s"}`, download: "Download", preparing: "Preparing the package in the background…", close: "Close", copyMissing: "The conversation or operation record for this copy no longer exists; waiting has stopped. Create a new continuation.", copyPollingFailed: "Unable to read copy progress; retries have stopped. Refresh or try again later.", legacyUnavailable: "The local service is temporarily unavailable, retrying…", exportPollingFailed: "Unable to read export progress; retries have stopped. Export again later.", exportMissing: "The export task no longer exists. Export again.",
+    necessary: "Necessary", complete: "Complete", necessaryHint: "Current results, input dependencies and related evidence, with optional history omitted.", completeHint: "Available history and versions within the selected scope.", graph: "Include full scientific-memory graph", estimate: "Uncompressed estimate", calculating: "Calculating scope and size…", files: "Workspace files", omissions: "Scope and omissions", evidenceOnly: "Packages support inspection and continuation. Import does not execute code or restore permission grants.", choose: "Select a .sdresearch package", objects: "content objects", importHint: "Restore conversation, files and evidence as a read-only snapshot. Continuing research creates an independent new session. The original record is preserved.", branchHint: "Choose a completed reply. The branch inherits the prefix and recoverable evidence, excluding later research.", reply: "Branch starting point", working: "Working…", startExport: "Start background export", confirmImport: "Confirm import", exportSaving: "Saving package…", exportSaved: "Package saved", exportSaveFailed: "Failed to save the package", exportCanceled: "Export canceled", openLocation: "Open file location", exportsInProgress: (count: number) => `${count} export${count === 1 ? "" : "s"} in progress`, retrySave: "Retry save", savedExports: "Saved packages",
   },
   appName: "ScienceDiscovery",
   languageTag: "en-US",
@@ -172,10 +183,13 @@ export const EN: Text = {
   },
 
   conversation: {
+    configurationRefreshFailed: "Configuration requests could not refresh. The displayed state may be out of date; retry before confirming.",
+    retryConfiguration: "Retry",
     copyAnswer: "Copy answer",
     copied: "Copied",
     notices: {
       timeout_notice: "Timeout",
+      configuration_notice: "Configuration update",
     },
     cancelledReason: "The run was cancelled",
     thinking: "Reasoning",
@@ -491,6 +505,7 @@ export const EN: Text = {
         model: "Default task model (optional; can be configured later in settings)",
       },
       notChecked: "Not checked",
+      runnerNeedsToken: "Not checked (token required)",
       retry: "Check again",
       retryBoot: "Try again",
       logs: "Open the logs folder",
@@ -526,7 +541,10 @@ export const EN: Text = {
     retest: "Test again",
     finish: "Start using",
     testing: "Testing…",
-    testOk: (latency: number) => `✓ Connected (${latency} ms)`,
+    testOk: (latency: number) => `✓ Basic check passed (${latency} ms)`,
+    // A pass proves the provider answers one minimal request — nothing about
+    // the session run path, thinking, or tool use (issue #824).
+    basicCheckNotice: "Basic check only: it does not verify the full session run path, thinking, or tool use.",
     missingKey: "Enter an API key first.",
     missingModel: "Choose or enter a model name first.",
     testCategories: {
@@ -580,7 +598,8 @@ export const EN: Text = {
       defaultFailed: "Could not make this the default model. Try again.",
       test: "Test connection",
       testFailed: (message: string) => `✕ ${message}`,
-      testOk: (latency: number) => `✓ Available (${latency} ms)`,
+      testOk: (latency: number) => `✓ Basic check passed (${latency} ms)`,
+      testOkNotice: "Basic check only: it does not verify the full session run path, thinking, or tool use.",
       delete: "Delete",
       deleteConfirm: (name: string) => `Delete the model "${name}"?`,
       deleteBody: "Sessions explicitly using this model will need a new selection. Historical runs are preserved.",
@@ -1249,6 +1268,14 @@ export const EN: Text = {
         total === undefined ? `Confirm checkpoint ${step}, continue.` : `Confirm checkpoint ${step}/${total}, continue.`,
       autoContinue: (step: number, total?: number) =>
         total === undefined ? `Continue with step ${step}.` : `Continue with step ${step}/${total}.`,
+      /* The other shape of the same stall: no card to continue from, and the
+         turn simply ended before the search existed. */
+      autoResume: "Finish the remaining checkpoints and call create_evolve_run to start the search. Do not stop before the search starts.",
+      /* The same step ending twice is where the client stops carrying: one
+         more push would be a paid turn answering a card that was already
+         answered. The card says so — nothing else on screen moves. */
+      autoStopped: "Auto-continue stopped",
+      autoStoppedHint: "This step was already carried forward once, so the client will not push it again. Reply to carry the design on.",
       adjustDraft: "I'd like to change this step: ",
       busy: "This reply is still running; wait for it to finish.",
     },
@@ -1256,7 +1283,7 @@ export const EN: Text = {
     create: {
       title: "New evolution run",
       algorithmLabel: "Choose a search algorithm",
-      puctName: "PUCT algorithm",
+      puctName: "PUCT",
       puctTags: ["Refines step by step", "Narrow search space"],
       puctPoints: [
         "PUCT expands the nodes most likely to pay off first",
@@ -1264,7 +1291,7 @@ export const EN: Text = {
         "Visit counts and rank steer where the search goes next",
         "A single tree keeps refining the candidates it holds",
       ],
-      openEvolveName: "OpenEvolve algorithm",
+      openEvolveName: "OpenEvolve",
       openEvolveTags: ["Wide search space", "Avoids early convergence"],
       openEvolvePoints: [
         "A MAP-Elites grid keeps a diverse set of good candidates",
@@ -1276,6 +1303,10 @@ export const EN: Text = {
       confirmLabel: "Pause at each checkpoint",
       confirmHint: "Each checkpoint stops and waits for your confirmation before continuing.",
       autoHint: "Off: the assistant designs and starts the search in one pass. Checkpoints are still shown, but it does not wait for you.",
+      taskLabel: "Task",
+      taskPlaceholder: "The task to evolve, with its constraints and how it is scored. For example: write a compressor and decompressor for text whose round trip is exactly lossless; the score is how much smaller the output gets.",
+      parametersLabel: "Custom evolution parameters",
+      parametersHint: "Set a starting value for each parameter. The search tries different values for ticked ones; unticked ones always keep their starting value.",
       /* Windows has no bwrap/seatbelt. There is no switch here, only two
          warnings: a banner under the title so the risk is seen at a glance,
          and an alert that asks again when the search is started. The answer
@@ -1534,6 +1565,7 @@ export const EN: Text = {
       limit: (max: number) => `Up to ${max} images`,
       remove: "Remove screenshot",
       preparing: "Processing images…",
+      truncated: (max: number, skipped: number) => `Only the first ${max} screenshots were attached; ${skipped} skipped.`,
       privacy: "Screenshots are visible to anyone with repository access; hide sensitive information first.",
       error: {
         type: "Only PNG, JPEG or WebP images are supported.",

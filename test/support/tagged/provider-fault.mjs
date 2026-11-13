@@ -24,12 +24,25 @@
  * anything the provider said.
  *
  * The rules stay narrow on purpose. A fault must carry a server status *and*
- * a provider context, or name one of the gateway's own routing failures
- * outright. An authentication or rate-limit answer is a decision, not an
- * outage, and a failure with no provider context is the product's own. The
- * provider's context has to name the gateway itself: a product delivery
- * failure that merely quotes a provider status is the product's failure, and
- * stays one.
+ * a provider context, name one of the gateway's own routing failures
+ * outright, or be a transport break with no status at all — `read
+ * ECONNRESET`, `other side closed`, `socket hang up`, `UND_ERR_SOCKET` —
+ * beside the gateway naming itself. An authentication or rate-limit answer
+ * is a decision, not an outage, and a failure with no provider context is the
+ * product's own. The provider's context has to name the gateway itself: a
+ * product delivery failure that merely quotes a provider status is the
+ * product's failure, and stays one.
+ *
+ * A transport break is checked before the product-report rule on purpose: the
+ * failed case text wraps the provider's words in `delivery_status=failed`,
+ * which is the product restating a run that died on the wire, not evidence it
+ * mishandled a complete answer.
+ *
+ * An assertion diff is not that product verdict. Playwright appends the failed
+ * `expect()` to the error it saw, so the gateway's `181001 … 503` arrives in
+ * the same message as `Expected: "completed" / Received: "failed"`. The
+ * gateway's own vocabulary outranks the assertion wrapper; only a delivery miss
+ * outranks the gateway.
  *
  * Naming a fault is not a pass. The accounting keeps the two apart and
  * reports the fault as such, but a planned case that only faulted is an
@@ -92,10 +105,31 @@ const ROUTING_FAILURE = /\bno available channel\b|\bmodel_not_found\b|\bnew_api_
 const GATEWAY_CONTEXT = /\b181001\b|\bmodel call failed\b|\bopenai api\b|\bchat\/completions\b/i;
 
 /**
+ * A transport break the provider caused after it had already answered. There is
+ * no HTTP status to read: the gateway said `200`, streamed for a while and then
+ * the connection died. The words are the only evidence, so they must be exact.
+ */
+const TRANSPORT_BREAK = /\bread\s+econnreset\b|\beconnreset\b|\bother side closed\b|\bsocket hang up\b|\bund_err_socket\b/i;
+
+/**
+ * The product's delivery verdict, which outranks the gateway.
+ *
+ * This is the report that the product ran and did not deliver — the one the
+ * gate must keep as `FAIL` even when the same text also carries the gateway's
+ * error, which is how a delivery miss on top of an outage is recorded.
+ */
+const DELIVERY_MISS = /\bdelivery[ _-]?(?:status|failed|missed)\b|\bdelivered[ _-]?artifacts\b|\bmain run must (?:complete|reference)\b/i;
+
+/**
  * The product's own report: a delivery miss or an assertion diff. Such a
  * text says what the product did with the answer, not what the provider
  * answered, so a provider status quoted inside it is the product's failure
- * to keep. It never soft-classifies.
+ * to keep.
+ *
+ * An assertion alone is the weaker half: a Playwright failure message carries
+ * the gateway's error *and* the `Expected:` / `Received:` block it produced,
+ * so the assertion wording must not swallow the gateway's own 181001/5xx.
+ * Only the delivery half (`DELIVERY_MISS`) wins over the gateway's words.
  */
 const PRODUCT_REPORT = /\bdelivery[ _-]?(?:status|failed|missed)\b|\bdelivered[ _-]?artifacts\b|\bmain run must (?:complete|reference)\b|\bexpected\s*:|\breceived\s*:|\bassertion\b/i;
 
@@ -127,18 +161,36 @@ export function detectProviderFault(text) {
   if (typeof text !== 'string' || !text.trim()) return null;
   // An authentication or rate-limit answer is a decision, not an outage.
   if (UNAUTHORIZED.test(text) || RATE_LIMITED.test(text)) return null;
-  // A delivery miss or an assertion diff is the product's own report, even
-  // when it quotes a provider status: the product ran and did not deliver.
-  if (PRODUCT_REPORT.test(text)) return null;
+  // A stream that broke after the provider had already answered carries no
+  // status at all: the gateway returned 200, sent records, then the connection
+  // died (`read ECONNRESET`, `other side closed`). It is checked before the
+  // product-report rule on purpose — the run's own failure text wraps the
+  // provider's words in `delivery_status=failed`, and that wrapper is the
+  // product restating a run that died on the transport, not evidence that the
+  // product mis-handled an answer it received whole.
+  if (TRANSPORT_BREAK.test(text) && GATEWAY_CONTEXT.test(text)) return { code: 'provider-transport', status: null };
+  // A delivery miss is the product's own verdict, even when the provider's
+  // words were recorded beside it: the product ran and did not deliver.
+  if (DELIVERY_MISS.test(text)) return null;
   const routing = ROUTING_FAILURE.test(text);
   const status = serverStatus(text);
+  const gatewayStatus = status !== null && GATEWAY_CONTEXT.test(text);
+  // The gateway naming its own server status outranks the assertion wrapper
+  // that carries it: `[181001] model call failed … 503` followed by
+  // `Expected: "completed" / Received: "failed"` is the outage, not the
+  // assertion. A text that only quotes a status still belongs to the product.
+  if (PRODUCT_REPORT.test(text) && !gatewayStatus) return null;
   // A status alone belongs to the product until something places it at the
   // gateway: the local API answering 500 is a product failure, not an outage.
   if (!routing && !status) return null;
   if (!routing && !GATEWAY_CONTEXT.test(text)) return null;
-  // A timeout that only mentions a server status is the product's stalled run.
-  // The gateway's own routing failures are never masked by that wording.
-  if (!routing && TIMED_OUT.test(text)) return null;
+  // A timeout is the product's stalled run, unless the same text names the
+  // gateway's own status and context: `Error code: 504 - Gateway Timeout` from
+  // a text carrying `181001`/`model call failed`/`openai api`/`chat/completions`
+  // is the outage, not the stalled run it reads like. A bare `504 Gateway
+  // Timeout` names no gateway context and stays the product's. The gateway's
+  // routing failures are never masked by that wording either.
+  if (!routing && !gatewayStatus && TIMED_OUT.test(text)) return null;
   return {
     code: status ? 'provider-server-error' : 'provider-unavailable',
     status: status ?? null,
@@ -146,15 +198,58 @@ export function detectProviderFault(text) {
 }
 
 /**
- * Classify a failed case from the text its errors carry. A case is a provider
- * fault only when every text that names a fault agrees; one unrelated line
- * cannot make a product failure look like an outage.
+ * Whether one text vetoes the whole case.
+ *
+ * `detectProviderFault` answers `null` both for a text that only records what
+ * one step printed — an assertion wrapper, a thrown API error, a semantic
+ * verdict — and for a verdict on the run itself: a delivery miss, a 401/403 or
+ * 429 answer, or the product's stalled-run wording. Only the first kind may be
+ * outvoted by a sibling text that names the gateway; the four verdicts may not.
+ * A status-less transport break is not a verdict either: the text carries the
+ * product's report wrapper, but that wrapper restates a run that died on the
+ * transport after the provider had answered whole, so the break still
+ * classifies at case level.
+ * A timeout whose own text names the gateway's status and context, or its
+ * routing failure, is not the product's stalled run, so it is not one of the
+ * four either; a bare status the text only quotes is.
+ */
+function vetoesCase(text) {
+  // An authentication or rate-limit answer stays a decision even when the same
+  // message also records a break, because a retrying gateway client aggregates
+  // its attempts: `attempt 1: … 401` beside `attempt 2: read ECONNRESET`. This
+  // is the order `detectProviderFault` keeps, so the two rules cannot disagree.
+  if (UNAUTHORIZED.test(text) || RATE_LIMITED.test(text)) return true;
+  // A status-less transport break outranks the product's report wrapper for the
+  // same reason `detectProviderFault` checks it first: the wrapper restates a run
+  // that died on the transport after the provider had answered whole. The text
+  // that carries it therefore records no verdict of its own, and an assertion
+  // wrapper beside it neither.
+  if (TRANSPORT_BREAK.test(text) && GATEWAY_CONTEXT.test(text)) return false;
+  if (DELIVERY_MISS.test(text)) return true;
+  if (!TIMED_OUT.test(text)) return false;
+  const status = serverStatus(text);
+  const gatewayStatus = status !== null && GATEWAY_CONTEXT.test(text);
+  return !ROUTING_FAILURE.test(text) && !gatewayStatus;
+}
+
+/**
+ * Classify a failed case from the text its errors carry.
+ *
+ * A case is a provider fault when at least one recorded text names one and no
+ * text records a verdict of its own. A Playwright case appends its assertion to
+ * the gateway's error, so requiring every text to classify let that assertion
+ * line veto the outage and turn a whole queue red as a product regression;
+ * requiring only one text to classify must not go the other way and let an
+ * outage outrank a decision the case recorded beside it.
  */
 export function detectProviderFaultFromErrors(errors = []) {
   const texts = (Array.isArray(errors) ? errors : [errors]).filter(text => typeof text === 'string');
   if (!texts.length) return null;
+  // A delivery miss, a provider decision or a stalled run anywhere in the case
+  // is the case's own verdict.
+  if (texts.some(vetoesCase)) return null;
   const detected = texts.map(text => detectProviderFault(text)).filter(Boolean);
-  return detected.length === texts.length ? detected[0] : null;
+  return detected.length ? detected[0] : null;
 }
 
 /**
@@ -164,8 +259,15 @@ export function detectProviderFaultFromErrors(errors = []) {
  */
 export const PROVIDER_FAULT_RETRY_BUDGET_MS = 300_000;
 
-/** The cases a first attempt may repeat: an early transient gateway fault. */
+/** The cases a first attempt may repeat: an early transient gateway fault
+ *  that is not a status-less transport break. A break after a 200 (`read
+ *  ECONNRESET`) is a provider fault for the accounting, but it must not earn
+ *  the harness's early repeat: that repeat re-runs a whole journey, while the
+ *  bounded restream the issue asks for has not landed yet, so repeating here
+ *  would deliver the retry this PR says it does not contain. */
 export function retryableProviderFaults(results = [], budgetMs = PROVIDER_FAULT_RETRY_BUDGET_MS) {
   return (Array.isArray(results) ? results : []).filter(result =>
-    result?.outcome === PROVIDER_FAULT && typeof result.durationMs === 'number' && result.durationMs <= budgetMs);
+    result?.outcome === PROVIDER_FAULT
+    && result?.providerFault?.code !== 'provider-transport'
+    && typeof result.durationMs === 'number' && result.durationMs <= budgetMs);
 }

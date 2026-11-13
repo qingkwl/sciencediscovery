@@ -155,6 +155,29 @@ runner_command=()
 api_command=()
 api_foreground=0
 
+# The API's old-space budget. V8's default is what the run in #1011 died of
+# with nothing in the log beforehand, so every mode passes an explicit limit;
+# the API reports the flag it received and warns before it reaches it. Same
+# default and variable name as scripts/lib/stack-platform.mjs and
+# services/api/src/heap-budget.ts (scripts/api-heap-budget.test.mjs guards it).
+#
+# Resolved by a function rather than once at load: `prepare_local` sources .env
+# afterwards, so a value that lives only there would otherwise be read as unset
+# and the launch would silently run with the default (#1105 F2). Every mode
+# calls this after it has finished reading configuration.
+api_heap_budget_mb=3072
+resolve_api_heap_budget() {
+  api_heap_budget_mb="${SCIENCE_AGENT_API_MAX_OLD_SPACE_MB:-3072}"
+  case "$api_heap_budget_mb" in
+    ''|*[!0-9]*) echo "SCIENCE_AGENT_API_MAX_OLD_SPACE_MB must be an integer number of MiB, got '$api_heap_budget_mb'." >&2; exit 2 ;;
+  esac
+  if (( api_heap_budget_mb < 256 || api_heap_budget_mb > 32768 )); then
+    echo "SCIENCE_AGENT_API_MAX_OLD_SPACE_MB must be between 256 and 32768, got $api_heap_budget_mb." >&2
+    exit 2
+  fi
+}
+resolve_api_heap_budget
+
 cleanup() {
   trap - EXIT INT TERM
   for pid in "${pids[@]:-}"; do kill "$pid" 2>/dev/null || true; done
@@ -340,6 +363,9 @@ prepare_local() {
     source .env
     set +a
   fi
+  # .env is the documented place for operator settings, so the budget is resolved
+  # after it is read rather than at script load (#1105 F2).
+  resolve_api_heap_budget
 
   configure_backend
 
@@ -520,23 +546,28 @@ prepare_local() {
       runner_environment+=("$passthrough=$value")
     fi
   done
-  # `pnpm api` runs the API with its own package directory as the working
-  # directory, so the two settings the API otherwise resolves relative to the
-  # process cwd would miss: the repository-root MCP registry, and the
-  # interpreter for the bundled stdio MCP servers (biomed, UniProt), whose
-  # fallback probes `data/envs/gateway/bin/python` and would degrade to a bare
-  # `python` from PATH. Name both explicitly; an operator value still wins.
+  # The API is launched directly rather than through `pnpm api`, so that one
+  # explicit heap budget applies in every mode (docker, locked, local). Two
+  # settings the API resolves relative to the process cwd are named explicitly:
+  # the repository-root MCP registry, and the interpreter for the bundled stdio
+  # MCP servers (biomed, UniProt), whose fallback probes
+  # `data/envs/gateway/bin/python` and would degrade to a bare `python` from
+  # PATH. An operator value still wins.
   export SCIENCE_AGENT_EXTENSIONS_CONFIG_PATH="$(absolute_from_repository "${SCIENCE_AGENT_EXTENSIONS_CONFIG_PATH:-extensions_config.json}")"
   export SCIENCE_AGENT_GATEWAY_PYTHON_PATH="${SCIENCE_AGENT_GATEWAY_PYTHON_PATH:-$gateway_python}"
 
   runner_command=(env "${runner_environment[@]}" node services/runner/dist/server.js)
-  api_command=(pnpm api)
+  api_command=(node --max-old-space-size="$api_heap_budget_mb" services/api/dist/server.js)
   api_foreground=1
   health_attempts=50
 }
 
 prepare_docker() {
   configure_backend
+  # The container gets its settings from the environment/compose file, not from a
+  # `.env` this script sources, so resolving here is the same point as in
+  # prepare_local: once configuration is final (#1105 F2).
+  resolve_api_heap_budget
   local envs_root="${SCIENCE_AGENT_ENVS_ROOT:-/opt/sciencediscovery/envs}"
   gateway_python="${SCIENCE_AGENT_GATEWAY_PYTHON_PATH:-$envs_root/gateway/bin/python}"
   memory_graph_python="${SCIENCE_AGENT_MEMORY_GRAPH_PYTHON_PATH:-$envs_root/memory-graph/bin/python}"
@@ -658,7 +689,7 @@ run_shell will fail; the API and UI are unaffected. Check, in this order:
 EOF
   fi
   runner_command=(node services/runner/dist/server.js)
-  api_command=(node services/api/dist/server.js)
+  api_command=(node --max-old-space-size="${api_heap_budget_mb}" services/api/dist/server.js)
   api_foreground=0
   health_attempts=300
 }
@@ -671,7 +702,7 @@ start_stack() {
     [[ "$mode" == "local" && -f "$SCIENCE_AGENT_API_ENTRYPOINT" ]] || {
       echo "SCIENCE_AGENT_API_ENTRYPOINT requires a local existing module" >&2; exit 2;
     }
-    api_command=(node "$SCIENCE_AGENT_API_ENTRYPOINT")
+    api_command=(node --max-old-space-size="$api_heap_budget_mb" "$SCIENCE_AGENT_API_ENTRYPOINT")
   fi
   trap cleanup EXIT INT TERM
 

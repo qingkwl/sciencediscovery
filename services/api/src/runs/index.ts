@@ -1,5 +1,6 @@
 // Copyright (C) 2026-2026 Huawei Technologies Co., Ltd
 //
+import { settingsConfirmationInstruction } from "../configuration/settings-confirmation.js";
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -198,6 +199,7 @@ import {
 import { MAX_PAPER_PDF_BYTES, PaperService } from "../papers.js";
 import { closedModelContext } from "./model-context.js";
 import { RemoteComputeClient } from "@sciencediscovery/executor";
+import { effectiveModelTurns } from "@sciencediscovery/runtime-core";
 import { classifySubagentFailure } from "@sciencediscovery/specialist";
 import { jiuwenSwarmConfigFromEnv } from "../agent-run/jiuwenswarm-agent.js";
 import { createConfigurationAgentTools } from "../configuration/agent-tools.js";
@@ -246,7 +248,9 @@ import {
   searchWorkbench,
 } from "../workbench/index.js";
 import {
+  appendDelegatedModelUsage,
   appendModelUsageForManifest,
+  addCapturedModelUsage,
   capturedModelUsage,
   unreportedModelUsage,
 } from "../model-usage/index.js";
@@ -272,6 +276,23 @@ function formatSubagentToolInput(args: Record<string, unknown>): string {
     return rest ? `${args[primary] as string}\n${rest}` : args[primary] as string;
   }
   return JSON.stringify(args);
+}
+
+/** Record the turn bound the executor actually enforced.
+ *
+ * Only a native loop can name one: JiuwenSwarm and a specialist's external
+ * runtime enforce the configured value through the `turn_start` observer, and the
+ * fallback native loop that replaces an unavailable external runtime reports its
+ * own clamped bound — which is why this reads the handle the run used instead of
+ * predicting the executor when the record is created (#1113 review).
+ */
+function stampEnforcedBound(
+  subagent: Subagent,
+  handle: { enforcedMaxModelTurns?: number } | undefined,
+): void {
+  const enforced = handle?.enforcedMaxModelTurns;
+  if (enforced === undefined) delete subagent.effectiveMaxTurns;
+  else subagent.effectiveMaxTurns = enforced;
 }
 
 export function cloneRunEventDetails(details: unknown): unknown | undefined {
@@ -363,7 +384,10 @@ const SUBAGENT_PROGRESS_FLUSH_MS = 250;
  *  the snapshots in between are transient and never reach the run stream. */
 const SUBAGENT_STREAM_EMIT_MS = 250;
 const activeSessions = new Map<string, RuntimeSessionRun>();
-const scheduledSessions = new Set<string>();
+const scheduledSessions = new Map<string, symbol>();
+// Live diagnostics survive reconnects while their durable write is unavailable.
+// They never claim that a terminal state has already reached disk.
+const pendingRunInterruptions = new WeakMap<SessionStore, Map<string, SessionRun>>();
 const activeRunAbortControllers = new Map<string, AbortController>();
 const activeSubagentAbortControllers = new Map<string, AbortController>();
 const cancelledRuns = new Set<string>();
@@ -589,13 +613,17 @@ export function skillAuthoringCommandPrompt(content: string): string | undefined
   ].join("\n\n");
 }
 
-function nativeConfigurationDecisionPrompt(store: SessionStore, sessionId: string, run: SessionRun): string {
+export function nativeConfigurationDecisionPrompt(store: SessionStore, sessionId: string, run: SessionRun): string {
   const resume = run.configurationResume!;
   const record = nativeConfigurationChoiceRecord(store, sessionId, resume.requestId);
+  if (record?.view.settingsConfirmation) return settingsConfirmationInstruction(record.view.settingsConfirmation);
   const choice = record?.view.choiceReceipt;
   if (record && record.view.capabilityId !== "connector.enable") {
+    const savedEffect = record.plan.activationMode === "next_connection"
+      ? "the saved route is used by later connections of this task as well"
+      : `the saved change applies to future tasks${record.plan.activationMode === "requires_restart" ? " after the required restart" : ""}`;
     const outcome = resume.decision === "dismiss" ? "The user declined the configuration; no change was saved."
-      : `The user approved and saved ${record.view.capabilityId}. Activation mode: ${record.plan.activationMode}. This task keeps its original frozen settings; the saved change applies to future tasks${record.plan.activationMode === "requires_restart" ? " after the required restart" : ""}.`;
+      : `The user approved and saved ${record.view.capabilityId}. Activation mode: ${record.plan.activationMode}. This task keeps its original frozen settings; ${savedEffect}.`;
     return `${outcome} The pending configuration interaction is resolved. Continue the original task from this committed checkpoint, or finish reporting the configuration result if that was the original task. Do not repeat completed actions or request this same decision again (needKey=${record.view.needKey ?? resume.requestId}). Earlier pending tool results are historical. This is not a new user request.`;
   }
   const result = choice?.kind === "alternative"
@@ -1059,6 +1087,8 @@ async function executeAgentRun(
   const taskInvocationId = randomUUID();
   let taskInvocationAttempted = false;
   let lastAgentUsage = unreportedModelUsage();
+  // Model turns whose figures the run row sums; the engine reports usage per turn.
+  let modelTurnsRecorded = 0;
   let assistantModelContext: AgentHistoryMessage[] = [];
   let turnNumber = 0;
   const plansByAgent = new Map<string, PlanSnapshot>();
@@ -1681,10 +1711,18 @@ async function executeAgentRun(
         const releaseParentWait = continuation ? undefined : mainExecution?.beginExternalWait();
         let assistantOutput = "";
         let activeMessageStep: { id: string; kind: Extract<SubagentStep["kind"], "assistant" | "thinking"> } | undefined;
+        /** Turns the child actually reported a figure for, which is what its
+         *  ledger row sums — `turnCount` also counts a turn that started and
+         *  was aborted before its model call (#1109 review). */
+        let subagentReportedTurns = 0;
         let progressFlushFailure: unknown;
         let progressFlushTimer: ReturnType<typeof setTimeout> | undefined;
         let progressFlushQueue = Promise.resolve();
         let maxTurnsExceeded = false;
+        /** The handle whose loop actually ran. Kept in this scope so the failure
+         *  path can ask it for the bound it enforced, after `execute()` has
+         *  chosen between an external runtime and its native fallback (#1113). */
+        let subagentBoundHandle: ReturnType<typeof runSubagentTask> | undefined;
         const enqueueProgressFlush = () => {
           const snapshot = structuredClone({ ...subagent, steps });
           progressFlushQueue = progressFlushQueue.then(async () => {
@@ -2098,11 +2136,35 @@ async function executeAgentRun(
             const runningStep = steps.find((step) => step.id === event.toolCallId && step.kind === "tool");
             publishStep(buildSubagentToolStep(event, runningStep), event.evidence);
           }
+          if (event.type === "model_usage" && event.usageReported) subagentReportedTurns += 1;
           if (event.type === "usage") {
             subagent.usage = event.usage;
             finalizeMessageStep();
             void emit({ subagentId: subagent.id, type: "subagent.usage", usage: event.usage });
             scheduleProgressFlush();
+            // Delegated spend is spend of this run, so it gets its own ledger
+            // row instead of vanishing (#1109). `delegation-track` was declared
+            // for exactly this and had no writer. The row cannot wait for the
+            // parent's prompt manifest: that is created only after the main loop
+            // returns, while this event fires during it. It names the child's
+            // own model and window, because a specialist may run a runtime
+            // model that differs from the parent's profile, and its
+            // `invocationId` names one execution so a resumed child appends its
+            // own row instead of a second one under the same id (#1109 review).
+            void appendDelegatedModelUsage(store, {
+              finishedAt: new Date().toISOString(),
+              invocationId: `subagent:${subagent.id}:${runId}`,
+              model: subagent.model?.model ?? selectedModel.model,
+              modelProfileId: subagent.model?.id ?? selectedModel.id,
+              modelProfileName: subagent.model?.name ?? selectedModel.name,
+              parentRunId: runId,
+              sessionId,
+              startedAt: subagent.createdAt,
+              turnsRecorded: Math.max(1, subagentReportedTurns),
+              usage: capturedModelUsage({ usage: event.usage, usageReported: true }),
+            }).catch((error: unknown) => {
+              runLog.warn("subagent_usage_persist_failed", { errorMessage: shortErrorMessage(error), subagentId: subagent.id });
+            });
           }
         };
         const subagentExecutionPrompt = formatSubagentExecutionPrompt(subagent.input, handoff);
@@ -2191,12 +2253,14 @@ async function executeAgentRun(
           requestExecutionId: childExecution.identity.executionId,
           runContract: subagentExecutionPrompt,
         });
+        subagentBoundHandle = subagentRunHandle;
         externalWaitByExecution.set(
           childExecution.identity.executionId,
           () => subagentRunHandle!.beginExternalWait(),
         );
         if (notificationDelivery && !store.notifications.deliveryAllowed(notificationDelivery)) throw new Error("Agent stopped before notification delivery");
         const result = await subagentRunHandle.execute();
+        stampEnforcedBound(subagent, subagentBoundHandle);
         const contextRef = await versions.putRecord("SubagentContext", { history: closedModelContext(result.finalMessages) });
         const contextRefs = await RefStore.open(versions);
         try {
@@ -2233,13 +2297,20 @@ async function executeAgentRun(
           };
         }
         } catch (error) {
+          // The handle knows which loop ran, so record the bound it enforced even
+          // when the child stopped by exhausting it (#1113 review).
+          stampEnforcedBound(subagent, subagentBoundHandle);
           const failureError = wallClockTimeoutSignal.aborted
             ? new Error(`Subagent wall-clock timeout after ${subagentConfig.timeoutSeconds} seconds`)
             : error;
           // Keep child failures in their own record, not the lead assistant stream.
+          // The engine reports its own exhaustion as `Agent exceeded maxTurns=N`;
+          // the observer below only fires for budgets inside the ceiling, so the
+          // two paths have to agree on what counts as a budget stop (#1106).
+          const ceilingStop = /maxTurns=\d+/i.test(failureError instanceof Error ? failureError.message : String(failureError));
           const failure = classifySubagentFailure(failureError, {
-            maxTurns: subagent.maxTurns,
-            maxTurnsExceeded,
+            maxTurns: subagent.effectiveMaxTurns ?? subagent.maxTurns,
+            maxTurnsExceeded: maxTurnsExceeded || ceilingStop,
             parentAborted: parentSignal.aborted || childController.signal.aborted,
           });
           subagent = {
@@ -2377,7 +2448,17 @@ async function executeAgentRun(
     const active = activeSessions.get(sessionId);
     if (active) active.lastActivityAt = new Date().toISOString();
     if (event.type === "model_usage") {
-      lastAgentUsage = capturedModelUsage(event);
+      // One row per invocation now carries the invocation's totals (#1109), so
+      // the per-turn figures are added to that total *and* persisted: without
+      // them a stored figure could not be recomputed from the record directory.
+      const captured = capturedModelUsage(event);
+      lastAgentUsage = addCapturedModelUsage(lastAgentUsage, captured);
+      // A turn that reported nothing adds nothing and is not a recorded turn,
+      // and the persisted record keeps `usage` required by its schema, so only
+      // a reported turn is published.
+      if (captured.usageStatus !== "reported") return;
+      modelTurnsRecorded += 1;
+      void publish({ type: "model.usage", turn: turnNumber, usage: event.usage! });
       return;
     }
     if (event.type === "turn_start") {
@@ -2586,6 +2667,7 @@ async function executeAgentRun(
       manifest: promptManifest,
       outcome: "completed",
       runId,
+      turnsRecorded: modelTurnsRecorded,
       usage: taskUsage,
     });
     const message = await store.appendMessage(
@@ -2648,6 +2730,7 @@ async function executeAgentRun(
             manifest: promptManifest,
             outcome: "cancelled",
             runId,
+            turnsRecorded: modelTurnsRecorded,
             usage: lastAgentUsage,
           });
         } catch {
@@ -2695,6 +2778,7 @@ async function executeAgentRun(
           manifest: promptManifest,
           outcome: "failed",
           runId,
+          turnsRecorded: modelTurnsRecorded,
           usage: lastAgentUsage,
         });
       } catch {
@@ -3528,17 +3612,24 @@ export function scheduleSessionRuns(
   memoryGraphClient: MemoryGraphClient | null,
   evolve: EvolveRuntimeFactory | undefined,
   executionGovernance?: ExecutionGovernance,
-): void {
-  if (isEvidenceSessionReadOnly(store.getSession(sessionId)) || scheduledSessions.has(sessionId)) return;
-  scheduledSessions.add(sessionId);
-  void (async () => {
-    try {
+): Promise<void> {
+  if (isEvidenceSessionReadOnly(store.getSession(sessionId)) || scheduledSessions.has(sessionId)) return Promise.resolve();
+  const owner = Symbol(sessionId);
+  scheduledSessions.set(sessionId, owner);
+  // The caller starting a scheduler can await recovery and the final re-read.
+  // The rejection boundary below also protects callers that dispatch and return.
+  return (async () => {
+    let currentRun: SessionRun | undefined;
+    let recovery: { run: SessionRun; error: string; finishedAt: string } | undefined;
+    let failures = 0;
+    const drain = async (): Promise<void> => {
       while (true) {
         if (isEvidenceSessionReadOnly(store.getSession(sessionId))) return;
         const runs = await store.listSessionRuns(sessionId);
         if (runs.some((run) => run.status === "blocked" && run.configurationWait)) return;
         const next = runs.find((run) => run.status === "queued");
         if (!next) return;
+        currentRun = next;
         if (next.configurationContinuation) {
           const request = store.getConnectorConfigurationRequest(sessionId, next.configurationContinuation.requestId);
           const source = await store.getSessionRun(sessionId, next.configurationContinuation.sourceRunId);
@@ -3549,6 +3640,7 @@ export function scheduleSessionRuns(
             || !store.getSessionSettings(sessionId).effective.enabledConnectorIds.includes(request.connectorId)
             || (request.connectorId !== "web" && mcpCatalog.getStatus(request.connectorId).status !== "ready")) {
             await cancelQueuedRunBeforeExecution(store, sessionId, next.id);
+            currentRun = undefined;
             continue;
           }
         }
@@ -3574,16 +3666,19 @@ export function scheduleSessionRuns(
               runOverlay: Boolean(overlay), savedConnector: request ? store.getSessionSettings(sessionId).effective.enabledConnectorIds.includes(request.connectorId) : false,
               connectorReady: request ? request.connectorId === "web" || mcpCatalog.getStatus(request.connectorId).status === "ready" : false });
             await cancelQueuedRunBeforeExecution(store, sessionId, next.id);
+            currentRun = undefined;
             continue;
           }
         }
         if (next.automaticWake && (!next.notificationDelivery || !store.notifications.deliveryAllowed(next.notificationDelivery))) {
           await cancelQueuedRunBeforeExecution(store, sessionId, next.id);
+          currentRun = undefined;
           continue;
         }
         if (cancelledRuns.has(next.id)) {
           await cancelQueuedRunBeforeExecution(store, sessionId, next.id);
           cancelledRuns.delete(next.id);
+          currentRun = undefined;
           continue;
         }
         const startedAt = new Date().toISOString();
@@ -3592,8 +3687,10 @@ export function scheduleSessionRuns(
         const started = await store.updateSessionRunStatusIfCurrent(sessionId, next.id, "queued", "running", { startedAt });
         if (!started) {
           activeRunAbortControllers.delete(next.id);
+          currentRun = undefined;
           continue;
         }
+        currentRun = started;
         runLog.info("run_started", { runId: next.id, sessionId });
         let eventQueue = Promise.resolve();
         const publish: RunEventSink = (event, delivery) => {
@@ -3675,6 +3772,7 @@ export function scheduleSessionRuns(
             ...(error && status === "failed" ? { error } : {}),
             ...(status === "blocked" ? {} : { finishedAt: new Date().toISOString() }),
           });
+          currentRun = finished;
           await publishRunEvent(store, sessionId, next.id, { run: finished, status, type: "run.status" });
           const durationMs = Math.max(0, Date.now() - Date.parse(startedAt));
           if (status === "completed") {
@@ -3691,36 +3789,98 @@ export function scheduleSessionRuns(
               sessionId,
             });
           }
+          currentRun = undefined;
+          failures = 0;
+        }
+      }
+    };
+    try {
+      for (;;) {
+        try {
+          if (!store.getSession(sessionId) || isEvidenceSessionReadOnly(store.getSession(sessionId))) return;
+          if (recovery) {
+            // Persist the interruption before dispatching more work. Never replay
+            // a model/tool turn whose side effects may already have happened.
+            const persisted = await store.getSessionRun(sessionId, recovery.run.id);
+            if (!persisted) {
+              pendingRunInterruptions.get(store)?.delete(runSubscriberKey(sessionId, recovery.run.id));
+              recovery = undefined;
+              currentRun = undefined;
+              continue;
+            }
+            const interrupted = isTerminalRunStatus(persisted.status) ? persisted
+              : await store.updateSessionRunStatusIfCurrent(sessionId, recovery.run.id, persisted.status, "interrupted", {
+                error: recovery.error, finishedAt: recovery.finishedAt,
+              });
+            if (!interrupted) continue;
+            await publishRunEvent(store, sessionId, interrupted.id, {
+              run: interrupted, status: interrupted.status, type: "run.status",
+            });
+            pendingRunInterruptions.get(store)?.delete(runSubscriberKey(sessionId, recovery.run.id));
+            recovery = undefined;
+            currentRun = undefined;
+            failures = 0;
+          }
+          await drain();
+          // A run may have been queued while the final read was in flight.
+          // Release before re-reading so another HTTP wake can take ownership.
+          scheduledSessions.delete(sessionId);
+          const remaining = await store.listSessionRuns(sessionId);
+          if (scheduledSessions.has(sessionId)) return;
+          scheduledSessions.set(sessionId, owner);
+          if (!remaining.some((run) => run.status === "queued")
+            || remaining.some((run) => run.status === "blocked" && run.configurationWait)) return;
+        } catch (reason) {
+          // A new owner may have started during the final re-read. Its recovery
+          // is independent; this old task must not reschedule or clear its lock.
+          if (scheduledSessions.has(sessionId) && scheduledSessions.get(sessionId) !== owner) return;
+          scheduledSessions.set(sessionId, owner);
+          failures += 1;
+          const error = `Run interrupted because session state could not be saved or read: ${runFailureMessage(reason)}. Check available disk space and data-directory permissions, then retry the run after storage recovers.`;
+          const retryMs = Math.min(500 * 2 ** Math.min(failures - 1, 6), 30_000);
+          runLog.error("run_scheduler_failed", {
+            errorMessage: shortErrorMessage(runFailureMessage(reason)),
+            sessionId, runId: currentRun?.id, retryMs,
+          });
+          if (currentRun && !recovery) {
+            recovery = { run: currentRun, error, finishedAt: new Date().toISOString() };
+            const interruptions = pendingRunInterruptions.get(store) ?? new Map<string, SessionRun>();
+            const visible: SessionRun = isTerminalRunStatus(currentRun.status) ? currentRun : {
+              ...currentRun, status: "interrupted", error, finishedAt: recovery.finishedAt,
+            };
+            interruptions.set(runSubscriberKey(sessionId, currentRun.id), visible);
+            pendingRunInterruptions.set(store, interruptions);
+            activeRunAbortControllers.get(currentRun.id)?.abort();
+            activeRunAbortControllers.delete(currentRun.id);
+            cancelledRuns.delete(currentRun.id);
+            // Storage itself is unavailable: the live diagnostic must not depend
+            // on another durable write succeeding. Recovery persists it later.
+            try {
+              await publishRunEvent(store, sessionId, currentRun.id, {
+                type: "run.status", status: visible.status, reason: visible.error,
+                run: visible,
+              }, { transient: true });
+            } catch (notificationError) {
+              runLog.error("run_scheduler_notification_failed", {
+                sessionId, runId: currentRun.id, errorMessage: shortErrorMessage(runFailureMessage(notificationError)),
+              });
+            }
+          }
+          if (!store.getSession(sessionId)) return;
+          // Keep ownership during recovery so an HTTP wake cannot bypass the
+          // delay. Continue slowly on long outages instead of abandoning a queue.
+          await new Promise<void>((resolve) => { setTimeout(resolve, retryMs).unref(); });
         }
       }
     } finally {
-      scheduledSessions.delete(sessionId);
-      const remaining = await store.listSessionRuns(sessionId);
-      const stillQueued = remaining.some((run) => run.status === "queued")
-        && !remaining.some((run) => run.status === "blocked" && run.configurationWait);
-      if (stillQueued) scheduleSessionRuns(
-        store,
-        runnerClient,
-        provenanceRecorder,
-        mcpBroker,
-        webBroker,
-        mcpRegistry,
-        mcpCatalog,
-        artifactManager,
-        paperService,
-        remoteCompute,
-        skillCatalog,
-        skillLibraryCatalog,
-        ideaTreeAuthorities,
-        ideaTreeRepository,
-        memoryGraphSink,
-        sessionId,
-        serverConfig,
-        memoryGraphClient,
-        evolve,
-      );
+      if (recovery) pendingRunInterruptions.get(store)?.delete(runSubscriberKey(sessionId, recovery.run.id));
+      if (scheduledSessions.get(sessionId) === owner) scheduledSessions.delete(sessionId);
     }
-  })();
+  })().catch((reason: unknown) => {
+    runLog.error("run_scheduler_recovery_failed", {
+      sessionId, errorMessage: shortErrorMessage(runFailureMessage(reason)),
+    });
+  });
 }
 
 export async function recoverSessionRuns(store: SessionStore, memoryGraphClient: MemoryGraphClient | null = null): Promise<void> {
@@ -3809,7 +3969,8 @@ export async function streamStoredRunEvents(
   after: number,
   closeOnTerminal: boolean,
 ): Promise<void> {
-  const run = await store.getSessionRun(sessionId, runId);
+  const interruption = pendingRunInterruptions.get(store)?.get(runSubscriberKey(sessionId, runId));
+  const run = interruption ?? await store.getSessionRun(sessionId, runId);
   if (!run) {
     sendError(response, 404, "Run not found");
     return;
@@ -3830,9 +3991,10 @@ export async function streamStoredRunEvents(
   let sawTerminal = isTerminalRunStatus(run.status);
   const deliver = (record: SessionRunEvent) => {
     if (record.sequence <= 0) {
-      // Child-stream payloads fan out live without a main-stream cursor; a
-      // reconnecting client re-reads them from their own stream instead.
+      // Live payloads have no durable cursor. A scheduler interruption is
+      // replayed from memory until storage can persist its terminal status.
       writeSse(response, record.event);
+      if (isTerminalRunEvent(record.event)) sawTerminal = true;
       return;
     }
     if (record.sequence <= lastSequence) return;
@@ -3857,10 +4019,14 @@ export async function streamStoredRunEvents(
       runLog.info("run_stream_disconnected", { reason: "client_disconnect", runId, sessionId });
     }
   });
-  const replay = await store.listSessionRunEvents(sessionId, runId, after);
+  const replay = interruption ? [] : await store.listSessionRunEvents(sessionId, runId, after);
   for (const record of replay) deliver(record);
   buffering = false;
   for (const record of buffered.toSorted((left, right) => left.sequence - right.sequence)) deliver(record);
+  if (interruption) deliver({
+    createdAt: interruption.finishedAt ?? interruption.createdAt, sequence: 0, sessionId, runId,
+    event: { type: "run.status", status: interruption.status, run: interruption, reason: interruption.error },
+  });
   if (closeOnTerminal && sawTerminal) response.end();
 }
 

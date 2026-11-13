@@ -16,7 +16,8 @@ import { ErrorDiagnosticActions, ErrorDiagnosticClient } from "./ErrorDiagnostic
 import { FeedbackDialog } from "./FeedbackDialog.js";
 import { openFeedback } from "./feedback-open.js";
 import { commitsOnEnter } from "./ime-enter.js";
-import { isEvidenceSessionReadOnly } from "@sciencediscovery/schema";
+import { appendEvolveDirection, evolveCommandTask, isEvidenceSessionReadOnly, readEvolveAlgorithm, withEvolveAlgorithm, type EvolveAlgorithm, type EvolveDirectionInput } from "@sciencediscovery/schema";
+import { DirectionDialog } from "./evolve/DirectionDialog.js";
 import { ContinueResearchButton } from "./research-package/ContinueResearchButton.js";
 import { ResearchContinuationContext, ResearchContinuationStatus, useResearchContinuationTasks } from "./research-package/ResearchContinuationTasks.js";
 import { markResearchCopyCreated, ResearchCopyNotice } from "./research-package/ResearchCopyNotice.js";
@@ -199,7 +200,6 @@ import {
 import { globalSettingsDraft, ScopedSettingsEditor } from "./ScopedSettingsEditor.js";
 import { PluginWebHost } from "./plugins/host.js";
 import { ResearchPackageDialogs, type ResearchPackageDialogTarget } from "./research-package/ResearchPackageActions.js";
-import { ResearchPackagePreviewMonitor } from "./research-package/ResearchPackagePreviewMonitor.js";
 import { ResearchPackageExportMonitor } from "./research-package/ResearchPackageExportTasks.js";
 import type { PluginComposition } from "./api/plugins.js";
 import { duplicateModelProfileId } from "./modelLabels.js";
@@ -243,7 +243,7 @@ import {
   type WorkspaceFileTreeEntry,
 } from "./artifactTree.js";
 import { createWebSettingsDraft, WebSettingsEditor, webSettingsRequest, type WebSettingsDraft } from "./WebSettingsEditor.js";
-import { ProxyPolicySelect, ProxySettingsEditor } from "./ProxySettingsEditor.js";
+import { ProxyPolicySelect, ProxySettingsEditor, type ProxyFormDraft } from "./ProxySettingsEditor.js";
 import { McpServerSettings } from "./McpServerSettings.js";
 import { ProviderModelSettings, type ProviderModelSettingsHandle } from "./ProviderModelSettings.js";
 
@@ -401,6 +401,14 @@ export function canSummarizeRunAsSkill(run: SessionRun | undefined): run is Sess
   return (run.status === "completed" || run.status === "failed" || run.status === "interrupted")
     && !run.prompt.includes(SKILL_EVOLUTION_PROMPT_MARKER)
     && !isSkillAuthoringRun;
+}
+
+export function isSkillEvolutionRun(run: Pick<SessionRun, "prompt">): boolean {
+  return run.prompt.startsWith(SKILL_EVOLUTION_PROMPT_MARKER);
+}
+
+export function selectSessionMainReplayRun(runs: readonly SessionRun[]): SessionRun | undefined {
+  return selectSessionReplayRun(runs.filter((run) => !isSkillEvolutionRun(run)));
 }
 
 export function latestSkillSourceRun(runs: readonly SessionRun[], sessionId: string): SessionRun | undefined {
@@ -888,6 +896,95 @@ export function remoteCredentialDraftSaveError(editing: boolean): string | undef
     : undefined;
 }
 
+/**
+ * Stage one proxy entry update. Only custom_url entries carry a URL: a kind
+ * switch away from it must drop the stored value, because the server rejects
+ * a url on non-custom_url kinds and the edit form keeps the prefilled URL in
+ * a hidden input, so no UI path clears it. saveProxyDraft builds the PUT body
+ * from this record, so dropping the field here keeps the kind switch savable
+ * (it used to 500).
+ */
+export function stagedProxyServer<
+  Server extends { kind: string; url?: string },
+  Input extends { kind?: string; name?: string; url?: string },
+>(server: Server, input: Input): Server {
+  const merged = { ...server, ...input };
+  const kind = input.kind ?? server.kind;
+  return kind === "custom_url" ? merged : { ...merged, url: undefined };
+}
+
+/**
+ * Stage the deletion of a proxy entry by repointing every reference source the
+ * server checks (global default, MCP policies, the Web policy, the sandbox
+ * egress policy, and every model/provider proxy policy). saveProxyDraft
+ * persists the new entries, default policy, MCP and Web writes *before* the
+ * deletions, so leaving any reference aimed at the deleted entry would make
+ * the server reject the delete after those parts had already been committed.
+ * The Web draft is created from the persisted settings when the Web section
+ * was never opened in this dialog: the persisted policy is a reference too.
+ */
+export function stageProxyDeletion<
+  ProxySettingsDraft extends { defaultPolicy: string; servers: ReadonlyArray<{ id: string }> },
+  WebDraft extends { values: { proxyPolicy: string } },
+  SandboxSettings extends { egressProxyPolicy: string },
+>(removedPolicy: string, sources: {
+  proxyDraft: ProxySettingsDraft | undefined;
+  fallbackProxySettings: ProxySettingsDraft;
+  mcpPolicies: Record<string, string>;
+  webDraft: WebDraft | undefined;
+  persistedWebProxyPolicy: string | undefined;
+  createWebDraft: () => WebDraft;
+  sandboxSettings: SandboxSettings | undefined;
+  models: ReadonlyArray<{ proxyPolicy: string }>;
+  providers: ReadonlyArray<{ proxyPolicy: string }>;
+}): {
+  proxyDraft: ProxySettingsDraft;
+  mcpPolicies: Record<string, string>;
+  webDraft: WebDraft | undefined;
+  sandboxSettings: SandboxSettings | undefined;
+  models: ReadonlyArray<{ proxyPolicy: string }>;
+  providers: ReadonlyArray<{ proxyPolicy: string }>;
+  /** Snapshot of the model/provider entries whose policy pointed at the
+   * removed proxy before staging reset them. saveProxyDraft drives the
+   * server-side updateModel/updateProvider resets from this snapshot,
+   * because the already-rewritten state arrays can no longer match the
+   * removed policy id. */
+  repointedReferences: {
+    models: ReadonlyArray<{ proxyPolicy: string }>;
+    providers: ReadonlyArray<{ proxyPolicy: string }>;
+  };
+} {
+  const serverId = removedPolicy.slice("proxy:".length);
+  const currentDraft = sources.proxyDraft ?? sources.fallbackProxySettings;
+  const proxyDraft: ProxySettingsDraft = {
+    ...currentDraft,
+    defaultPolicy: currentDraft.defaultPolicy === removedPolicy ? "none" as never : currentDraft.defaultPolicy,
+    servers: currentDraft.servers.filter(item => item.id !== serverId),
+  };
+  const mcpPolicies: Record<string, string> = {};
+  for (const [id, policy] of Object.entries(sources.mcpPolicies)) if (policy !== removedPolicy) mcpPolicies[id] = policy;
+  const webBase = sources.webDraft
+    ?? (sources.persistedWebProxyPolicy === removedPolicy ? sources.createWebDraft() : undefined);
+  const webDraft = webBase && webBase.values.proxyPolicy === removedPolicy
+    ? { ...webBase, values: { ...webBase.values, proxyPolicy: "inherit" as never } }
+    : sources.webDraft;
+  const sandboxSettings = sources.sandboxSettings && sources.sandboxSettings.egressProxyPolicy === removedPolicy
+    ? { ...sources.sandboxSettings, egressProxyPolicy: "inherit" as never }
+    : sources.sandboxSettings;
+  return {
+    proxyDraft,
+    mcpPolicies,
+    webDraft,
+    sandboxSettings,
+    models: sources.models.map(model => model.proxyPolicy === removedPolicy ? { ...model, proxyPolicy: "inherit" as string } : model),
+    providers: sources.providers.map(provider => provider.proxyPolicy === removedPolicy ? { ...provider, proxyPolicy: "inherit" as string } : provider),
+    repointedReferences: {
+      models: sources.models.filter(model => model.proxyPolicy === removedPolicy),
+      providers: sources.providers.filter(provider => provider.proxyPolicy === removedPolicy),
+    },
+  };
+}
+
 function measureWorkspaceMaxWidth(): number {
   if (typeof window === "undefined") return DEFAULT_WORKSPACE_WIDTH;
   const sidebar = typeof document === "undefined"
@@ -1192,11 +1289,12 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
   const scheduledConfigurationSubmission = useRef<string | undefined>(undefined);
   const pendingConfigurationContinuation = useRef<{ sessionId: string; modelId: string; content: string } | undefined>(undefined);
   const [evolvePickerDismissed, setEvolvePickerDismissed] = useState(false);
-
+  const [evolveSubmission, setEvolveSubmission] = useState<{ sessionId: string; message: string }>();
+  const [evolveRetry, setEvolveRetry] = useState<{ sessionId: string; message: string; algorithm: EvolveAlgorithm; direction?: EvolveDirectionInput }>();
+  const evolveTask = evolveSubmission ? evolveCommandTask(evolveSubmission.message) : "";
 
   function selectEvolveAlgorithm(algorithm: "puct" | "openevolve"): void {
-    const afterCommand = message.replace(/^\/evolve-design\s*/, "");
-    setMessage(`/evolve-design --algorithm ${algorithm} ${afterCommand}`.trimEnd());
+    setMessage(withEvolveAlgorithm(message, algorithm));
     setEvolvePickerDismissed(false);
     requestAnimationFrame(() => composerTextarea.current?.focus());
   }
@@ -1218,6 +1316,18 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
   const [quotaSettings, setQuotaSettings] = useState<SystemQuotaSettings>();
   const [sandboxNetworkSettings, setSandboxNetworkSettings] = useState<SandboxNetworkSettings>();
   const [proxySettings, setProxySettings] = useState<ProxySettingsDetails>();
+  const [proxySettingsEdit, setProxySettingsEdit] = useState<ProxySettingsDetails>();
+  const [mcpProxyPoliciesEdit, setMcpProxyPoliciesEdit] = useState<McpProxyPolicies>();
+  const [proxyFormEdit, setProxyFormEdit] = useState<ProxyFormDraft>();
+  const [proxyEditorRevision, setProxyEditorRevision] = useState(0);
+  // Model/provider policies that pointed at a proxy entry staged for deletion
+  // (already reset to inherit in the models/providers state). Kept as the
+  // pre-rewrite snapshot so saveProxyDraft can drive the server-side
+  // updateModel/updateProvider resets before the delete call.
+  const [proxyDeletionReferences, setProxyDeletionReferences] = useState<{
+    models: ModelProfile[];
+    providers: ModelProvider[];
+  }>();
   const [mcpProxyPolicies, setMcpProxyPolicies] = useState<McpProxyPolicies>({});
   const [webSettings, setWebSettings] = useState<WebSettingsDetails>();
   const [memoryGraphSettings, setMemoryGraphSettings] = useState<MemoryGraphSettingsDetails>();
@@ -1293,6 +1403,7 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
   const [runningSessionIds, setRunningSessionIds] = useState<ReadonlySet<string>>(() => new Set());
   const [stoppingSessionIds, setStoppingSessionIds] = useState<ReadonlySet<string>>(() => new Set());
   const runAbortControllers = useRef(new Map<string, AbortController>());
+  const skillEvolutionRunAbortControllers = useRef(new Map<string, AbortController>());
   const providerSettingsRef = useRef<ProviderModelSettingsHandle>(null);
   const thinkingNormalizationInFlight = useRef<string | undefined>(undefined);
   const [error, setErrorState] = useState<string>();
@@ -1557,8 +1668,10 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
 
   useEffect(() => {
     const controllers = runAbortControllers.current;
+    const skillControllers = skillEvolutionRunAbortControllers.current;
     return () => {
       for (const controller of controllers.values()) controller.abort();
+      for (const controller of skillControllers.values()) controller.abort();
     };
   }, []);
 
@@ -2078,7 +2191,8 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
       return [request, ...items.filter((item) => item.id !== request.id)];
     });
     if (request.state === "applied" || request.state === "dismissed") void refreshSession(request.sessionId).catch(() => undefined);
-    if (request.state === "applied" && request.capabilityId.startsWith("model.")) {
+    if (request.state === "applied" && ["mcp.metadata", "mcp.timeout", "mcp.remove_header", "mcp.remove_env", "mcp.header_credential", "mcp.availability", "mcp.delete"].includes(request.capabilityId)) void client.listConnectors().then(setConnectors).catch(() => undefined);
+    if (request.state === "applied" && (request.capabilityId.startsWith("model.") || ["provider.connection", "provider.credential", "provider.remove_credential"].includes(request.capabilityId))) {
       void Promise.all([client.listModels(), client.listProviders(), client.getGlobalSettings()]).then(([modelItems, registry, settings]) => {
         setModels(modelItems);
         setModelProviders(registry.providers);
@@ -2168,7 +2282,7 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
       client.canImportResearchPackage(sessionId).catch(() => ({ canImport: false })),
       client.listArtifacts(sessionId),
     ]);
-    const activeRun = selectSessionReplayRun(sessionRunItems.filter((run) => isActiveRunStatus(run.status)));
+    const activeRun = selectSessionMainReplayRun(sessionRunItems.filter((run) => isActiveRunStatus(run.status)));
     const replayEvents = activeRun ? await client.listRunEvents(sessionId, activeRun.id) : [];
     const terminalRuns = sessionRunItems.filter((run) => isTerminalRunStatus(run.status));
     const terminalEvents = await Promise.all(terminalRuns.map(async (run) => {
@@ -2653,66 +2767,160 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
   }
 
   async function createProxyServer(input: CreateProxyServerRequest): Promise<void> {
-    try {
-      await client.createProxyServer(input);
-      setProxySettings(await client.getProxySettings());
-      setError(undefined);
-      pushToast("success", t("app.proxyServerAdded"), input.name.trim());
-    } catch (reason) {
-      setError(reason instanceof Error ? reason : t("error.addProxyServer"));
-      throw reason;
-    }
+    const now = new Date().toISOString();
+    setProxySettingsEdit(current => {
+      const base = current ?? proxySettings!;
+      const server = { ...input, id: `draft-${crypto.randomUUID()}`, createdAt: now, updatedAt: now, hasUrl: Boolean(input.url) };
+      return { ...base, defaultPolicy: `proxy:${server.id}`, servers: [...base.servers, server] };
+    });
   }
 
   async function updateProxyServer(serverId: string, input: UpdateProxyServerRequest): Promise<void> {
-    try {
-      const saved = await client.updateProxyServer(serverId, input);
-      // Reload the display projection because environment runtime details are
-      // intentionally computed on GET and are not part of mutation responses.
-      setProxySettings(await client.getProxySettings());
-      setError(undefined);
-      pushToast("success", t("app.proxyServerUpdated"), saved.name);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason : t("error.updateProxyServer"));
-      throw reason;
-    }
+    setProxySettingsEdit(current => {
+      const base = current ?? proxySettings!;
+      return { ...base, servers: base.servers.map(server => server.id === serverId ? stagedProxyServer(server, input) : server) };
+    });
   }
 
   async function deleteProxyServer(server: ProxyServer): Promise<void> {
     if (!window.confirm(t("proxy.server.deleteConfirm", { name: server.name }))) return;
-    try {
-      await client.deleteProxyServer(server.id);
-      setProxySettings((current) => current ? {
-        ...current,
-        servers: current.servers.filter((item) => item.id !== server.id),
-      } : current);
-      setError(undefined);
-      pushToast("success", t("app.proxyServerDeleted"), server.name);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason : t("error.deleteProxyServer"));
+    // Repoint every reference while staging the deletion (see
+    // stageProxyDeletion): the server rejects deleting a referenced entry,
+    // and saveProxyDraft commits the default policy, new entries and the
+    // Web/MCP writes before deleting removed ones.
+    const staged = stageProxyDeletion(`proxy:${server.id}`, {
+      proxyDraft: proxySettingsEdit,
+      fallbackProxySettings: proxySettings!,
+      mcpPolicies: mcpProxyPoliciesEdit ?? mcpProxyPolicies,
+      webDraft: webSettingsEdit,
+      persistedWebProxyPolicy: webSettings?.proxyPolicy,
+      createWebDraft: () => createWebSettingsDraft(webSettings!),
+      sandboxSettings: sandboxNetworkSettings,
+      models,
+      providers: modelProviders,
+    });
+    setProxySettingsEdit(staged.proxyDraft);
+    setMcpProxyPoliciesEdit(staged.mcpPolicies as McpProxyPolicies);
+    setWebSettingsEdit(staged.webDraft);
+    if (staged.sandboxSettings !== undefined && staged.sandboxSettings !== sandboxNetworkSettings) {
+      setSandboxNetworkSettingsEdit(staged.sandboxSettings);
     }
+    setModels(staged.models as ModelProfile[]);
+    setModelProviders(staged.providers as ModelProvider[]);
+    setProxyDeletionReferences(current => ({
+      models: [...(current?.models ?? []), ...(staged.repointedReferences.models as ModelProfile[])],
+      providers: [...(current?.providers ?? []), ...(staged.repointedReferences.providers as ModelProvider[])],
+    }));
   }
 
   async function updateDefaultProxyPolicy(defaultPolicy: Exclude<ProxyPolicy, "inherit">): Promise<void> {
-    try {
-      setProxySettings(await client.updateProxySettings({ defaultPolicy }));
-      setError(undefined);
-      pushToast("success", t("app.proxyDefaultUpdated"));
-    } catch (reason) {
-      setError(reason instanceof Error ? reason : t("error.updateProxyDefault"));
-    }
+    setProxySettingsEdit(current => ({ ...(current ?? proxySettings!), defaultPolicy }));
   }
 
   async function updateMcpProxyPolicy(serverId: string, policy: ProxyPolicy): Promise<void> {
-    const policies = { ...mcpProxyPolicies, [serverId]: policy };
+    const policies = { ...(mcpProxyPoliciesEdit ?? mcpProxyPolicies), [serverId]: policy };
     if (policy === "inherit") delete policies[serverId];
+    setMcpProxyPoliciesEdit(policies);
+  }
+
+  async function saveProxyDraft(): Promise<WebSettingsDraft | undefined> {
+    let draft = proxySettingsEdit;
+    let webDraft = webSettingsEdit;
+    let policies = mcpProxyPoliciesEdit ?? mcpProxyPolicies;
     try {
-      const saved = await client.updateMcpProxyPolicies({ policies });
-      setMcpProxyPolicies(saved.policies);
-      setError(undefined);
-      pushToast("success", t("app.mcpProxyPolicyUpdated"), serverId);
+      if (proxyFormEdit) {
+        const { editingId, draft: form } = proxyFormEdit;
+        if (!form.name.trim() || (form.kind === "custom_url" && !form.url.trim())) throw new Error(t("proxy.form.required"));
+        const base = draft ?? proxySettings!;
+        if (editingId) draft = { ...base, servers: base.servers.map(server => server.id === editingId ? stagedProxyServer(server, form) : server) };
+        else {
+          const id = `draft-${crypto.randomUUID()}`, now = new Date().toISOString();
+          // Same kind gate as the submit path: a draft that moved away from
+          // custom_url must not stage (and later POST) the typed URL.
+          const staged = form.kind === "custom_url" ? { ...form } : { ...form, url: undefined };
+          draft = { ...base, defaultPolicy: `proxy:${id}`, servers: [...base.servers, { ...staged, id, createdAt: now, updatedAt: now, hasUrl: form.kind === "custom_url" && Boolean(form.url) }] };
+        }
+        setProxySettingsEdit(draft); setProxyFormEdit(undefined); setProxyEditorRevision(value => value + 1);
+      }
+      if (draft) {
+        for (const server of draft.servers) {
+          if (!server.name.trim()) throw new Error(t("proxy.form.required"));
+          if (server.kind === "custom_url") {
+            let url: URL;
+            try { url = new URL(server.url ?? ""); } catch { throw new Error(t("proxy.form.invalid")); }
+            if (!["http:", "https:", "socks5:"].includes(url.protocol) || url.search || url.hash) throw new Error(t("proxy.form.invalid"));
+          }
+        }
+        for (const server of [...draft.servers]) {
+          if (server.id.startsWith("draft-")) {
+            const saved = await client.createProxyServer(server);
+            const remap = (policy: ProxyPolicy) => policy === `proxy:${server.id}` ? `proxy:${saved.id}` as const : policy;
+            draft = { ...draft, defaultPolicy: remap(draft.defaultPolicy) as ProxySettingsDetails["defaultPolicy"], servers: draft.servers.map(item => item.id === server.id ? saved : item) };
+            policies = Object.fromEntries(Object.entries(policies).map(([id, policy]) => [id, remap(policy)]));
+            setProxySettingsEdit(draft); setMcpProxyPoliciesEdit(policies);
+            if (webDraft) {
+              webDraft = { ...webDraft, values: { ...webDraft.values, proxyPolicy: remap(webDraft.values.proxyPolicy) } };
+              setWebSettingsEdit(webDraft);
+            }
+          } else {
+            const previous = proxySettings?.servers.find(item => item.id === server.id);
+            if (previous && (previous.name !== server.name || previous.kind !== server.kind || previous.url !== server.url)) {
+              await client.updateProxyServer(server.id, { name: server.name, kind: server.kind, ...(server.url !== undefined ? { url: server.url } : {}) });
+            }
+          }
+        }
+        await client.updateProxySettings({ defaultPolicy: draft.defaultPolicy, ...(draft.noProxy !== undefined ? { noProxy: draft.noProxy } : {}) });
+      }
+      if (mcpProxyPoliciesEdit || draft) {
+        setMcpProxyPolicies((await client.updateMcpProxyPolicies({ policies })).policies);
+      }
+      if (draft) {
+        // Update Web references before deleting their former proxy entries.
+        if (webDraft) {
+          await saveWebSettings(webSettingsRequest(webDraft));
+          webDraft = undefined;
+          setWebSettingsEdit(undefined);
+        }
+        // Same ordering for the sandbox egress policy and any model/provider
+        // proxy policy aimed at a deleted entry: resetting them only after the
+        // deletions would leave the server rejecting the delete (partial save).
+        if (sandboxNetworkSettingsEdit) await saveSandboxNetworkSettings(sandboxNetworkSettingsEdit);
+        const survivingIds = new Set(draft.servers.map(item => item.id));
+        const removedIds = new Set((proxySettings?.servers ?? [])
+          .filter(server => !survivingIds.has(server.id))
+          .map(server => `proxy:${server.id}`));
+        if (removedIds.size || proxyDeletionReferences) {
+          // updateModel requires the full live-model fields (the server validates
+          // the whole profile), so the reset carries the model's stored values.
+          // The reset list comes from the staging snapshot: the models/providers
+          // state was already rewritten to inherit, so it can no longer match.
+          for (const model of proxyDeletionReferences?.models ?? []) if (removedIds.has(model.proxyPolicy)) {
+            await client.updateModel(model.id, {
+              apiProtocol: model.apiProtocol,
+              apiVariant: model.apiVariant,
+              baseUrl: model.baseUrl,
+              facts: model.facts ?? null,
+              model: model.model,
+              name: model.name,
+              proxyPolicy: "inherit",
+              thinkingEffort: model.thinkingEffort,
+              thinkingMode: model.thinkingMode,
+              vision: model.vision,
+            });
+          }
+          for (const provider of proxyDeletionReferences?.providers ?? []) if (removedIds.has(provider.proxyPolicy)) {
+            await client.updateProvider(provider.id, { proxyPolicy: "inherit" });
+          }
+        }
+        // References are checked by the server; an in-use registry entry cannot be deleted.
+        for (const server of proxySettings?.servers ?? []) if (!survivingIds.has(server.id)) await client.deleteProxyServer(server.id);
+        setProxySettings(await client.getProxySettings());
+      }
+      setProxySettingsEdit(undefined); setMcpProxyPoliciesEdit(undefined); setProxyDeletionReferences(undefined);
+      return webDraft;
     } catch (reason) {
-      setError(reason instanceof Error ? reason : t("error.updateMcpProxyPolicy"));
+      reportSystemSettingsError(reason instanceof Error ? reason : t("error.updateProxyDefault"));
+      throw reason;
     }
   }
 
@@ -2762,6 +2970,10 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
   }
 
   function clearSystemSettingsDrafts(): void {
+    setProxySettingsEdit(undefined);
+    setMcpProxyPoliciesEdit(undefined);
+    setProxyFormEdit(undefined); setProxyEditorRevision(value => value + 1);
+    setProxyDeletionReferences(undefined);
     setGlobalSettingsEdit(undefined);
     setTimeoutSettingsEdit(undefined);
     setQuotaSettingsEdit(undefined);
@@ -2797,6 +3009,18 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
   function cancelSystemSettings(): void {
     if (!confirmModelRegistryDraftDiscard()) return;
     clearSystemSettingsDrafts();
+    // A staged proxy deletion rewrote model/provider policies to inherit in
+    // state; canceling must put the untouched server values back.
+    if (proxyDeletionReferences) {
+      setModels(items => items.map(model => {
+        const original = proxyDeletionReferences.models.find(entry => entry.id === model.id);
+        return original ? { ...model, proxyPolicy: original.proxyPolicy } : model;
+      }));
+      setModelProviders(items => items.map(provider => {
+        const original = proxyDeletionReferences.providers.find(entry => entry.id === provider.id);
+        return original ? { ...provider, proxyPolicy: original.proxyPolicy } : provider;
+      }));
+    }
     reportSystemSettingsError();
     setSkillWorkspaceLaunch(undefined);
     setModelWizardRequested(false);
@@ -2858,11 +3082,12 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
       // Persist every edited section, including drafts retained while the user
       // navigated elsewhere in the dialog. A failed request keeps the dialog
       // and remaining drafts open so the user can retry.
+      const webDraft = proxySettingsEdit || mcpProxyPoliciesEdit || proxyFormEdit ? await saveProxyDraft() : webSettingsEdit;
       if (globalSettingsEdit) await saveGlobalSettings(globalSettingsEdit);
       if (timeoutSettingsEdit) await saveTimeoutSettings(timeoutSettingsEdit);
       if (quotaSettingsEdit) await saveQuotaSettings(quotaSettingsEdit);
       if (sandboxNetworkSettingsEdit) await saveSandboxNetworkSettings(sandboxNetworkSettingsEdit);
-      if (webSettingsEdit) await saveWebSettings(webSettingsRequest(webSettingsEdit));
+      if (webDraft) await saveWebSettings(webSettingsRequest(webDraft));
       if (memoryGraphSettingsEdit) await saveMemoryGraphSettings(memoryGraphSettingsRequest(memoryGraphSettingsEdit));
       if (ideaTreeSettingsEdit) await saveIdeaTreeSettings(ideaTreeSettingsRequest(ideaTreeSettingsEdit));
       if (providerSettingsRef.current?.hasUnsavedDraft()) {
@@ -3765,18 +3990,32 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
   }
 
   async function submitMessage(event: FormEvent): Promise<void> {
+    event.preventDefault();
+    if (evolveCommandBlocked || configurationPreflightPendingRef.current) return;
+    if (activeSessionId && session && !session.archivedAt && !isEvidenceSessionReadOnly(session)
+        && /^\/evolve-design(?:\s|$)/u.test(message.trimStart())) {
+      if (!evolveCommandTask(message)) {
+        setError(locale === "zh-CN" ? "请先输入要演进的任务。" : "Enter the task you want to evolve.");
+        return;
+      }
+      setEvolveSubmission({ sessionId: activeSessionId, message: message.trim() });
+      return;
+    }
+    await sendComposerMessage();
+  }
+
+  async function sendComposerMessage(evolve?: { algorithm: EvolveAlgorithm; direction?: EvolveDirectionInput }): Promise<void> {
     scheduledConfigurationSubmission.current = undefined;
-    if (configurationPreflightPendingRef.current) { event.preventDefault(); return; }
+    if (configurationPreflightPendingRef.current) return;
     const targetSession = activeSessionId;
-    try { await submitMessageWithConfigurationReceipt(event); }
+    try { await submitMessageWithConfigurationReceipt(evolve); }
     finally {
       setConfigurationReceipt(current => current && current.sessionId === targetSession && current.continuation === "submitting"
         ? { ...current, continuation: "failed" } : current);
     }
   }
 
-  async function submitMessageWithConfigurationReceipt(event: FormEvent): Promise<void> {
-    event.preventDefault();
+  async function submitMessageWithConfigurationReceipt(evolve?: { algorithm: EvolveAlgorithm; direction?: EvolveDirectionInput }): Promise<void> {
     if (evolveCommandBlocked) return;
     if (!activeSessionId || !session || !message.trim() || session.archivedAt || isEvidenceSessionReadOnly(session)) return;
     if (configurationPreflightPendingRef.current) return;
@@ -3845,12 +4084,13 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
       configurationPreflightPendingRef.current = false;
     }
     if (latestMessageRef.current.trim() !== requestedContent) return;
-    const content = message.trim();
+    const taskCommand = evolve ? withEvolveAlgorithm(requestedContent, evolve.algorithm) : requestedContent;
+    const content = evolve?.direction ? appendEvolveDirection(taskCommand, evolve.direction) : taskCommand;
     const autoNameFirstMessage = session.title === UNTITLED_SESSION_TITLE
       && !session.messages.some((item) => item.role === "user");
     const titleRefinementStartedAt = Date.now();
     const provisionalTitle = autoNameFirstMessage
-      ? createLocalSessionTitle(messageForSessionTitle(content), session.createdAt)
+      ? createLocalSessionTitle(messageForSessionTitle(evolve ? evolveCommandTask(taskCommand) : taskCommand), session.createdAt)
       : session.title;
     const runSessionTitle = provisionalTitle;
     const references = composerReferences.filter((reference) => content.includes(composerReferenceToken(reference)));
@@ -3863,11 +4103,12 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
     );
     if (!queuedBehindActiveRun) runAbortControllers.current.set(submittedSessionId, controller);
 
-    const savedContent = content;
+    const savedContent = requestedContent;
     const savedReferences = composerReferences;
     const savedAnnotations = pendingAnnotations;
     const optimisticMessageId = `optimistic-${Date.now()}`;
 
+    setEvolveRetry(undefined);
     setMessage("");
     setComposerReferences([]);
     setPendingAnnotations([]);
@@ -3944,6 +4185,7 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
         setError(reason instanceof Error ? reason : t("error.runFailed"));
         if (!streamRunId) {
           setMessage(savedContent);
+          if (evolve) setEvolveRetry({ sessionId: submittedSessionId, message: requestedContent, ...evolve });
           setComposerReferences(savedReferences);
           setPendingAnnotations(savedAnnotations);
           setSession((current) => current ? {
@@ -4018,6 +4260,7 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
       const nextRuns = upsertSessionRunSnapshot(session.id, queued);
       setSessionRuns(nextRuns);
       syncSessionRunActivity(session.id, nextRuns);
+      watchSkillEvolutionRun(session.id, queued.id);
       setIsFollowingOutput(true);
       setError(undefined);
       pushToast("info", t("app.skillProposalQueued"), t("app.skillProposalQueuedDetail", { id: run.id.slice(0, 8) }));
@@ -4032,6 +4275,51 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
         return next;
       });
     }
+  }
+
+  function watchSkillEvolutionRun(sessionId: string, runId: string): void {
+    const key = `${sessionId}:${runId}`;
+    if (skillEvolutionRunAbortControllers.current.has(key)) return;
+    const controller = new AbortController();
+    skillEvolutionRunAbortControllers.current.set(key, controller);
+    let terminalSnapshot: SessionRun | undefined;
+    const reconcile = async (): Promise<void> => {
+      if (!shouldApplySessionScopedUpdate(sessionId, activeSessionIdRef.current)) return;
+      try {
+        await refreshSession(sessionId);
+        // The event stream is durable evidence and can be newer than a list
+        // response served while the terminal transition is still propagating.
+        // Re-apply that terminal snapshot after the best-effort refresh so a
+        // stale list response cannot turn the record live again.
+        if (terminalSnapshot) {
+          const nextRuns = upsertSessionRunSnapshot(sessionId, terminalSnapshot);
+          if (shouldApplySessionScopedUpdate(sessionId, activeSessionIdRef.current)) setSessionRuns(nextRuns);
+        }
+      } catch (reason) {
+        if (!isAbortError(reason) && shouldApplySessionScopedUpdate(sessionId, activeSessionIdRef.current)) {
+          setError(reason instanceof Error ? reason : t("error.resumeRunEvents"));
+        }
+      }
+    };
+    void client.subscribeRunEvents(
+      sessionId,
+      runId,
+      0,
+      (streamEvent) => {
+        if (streamEvent.type !== "run.queued" && streamEvent.type !== "run.status") return;
+        if (streamEvent.run.id !== runId) return;
+        if (isTerminalRunStatus(streamEvent.run.status)) terminalSnapshot = streamEvent.run;
+        const nextRuns = upsertSessionRunSnapshot(sessionId, streamEvent.run);
+        if (shouldApplySessionScopedUpdate(sessionId, activeSessionIdRef.current)) setSessionRuns(nextRuns);
+      },
+      controller.signal,
+    ).then(reconcile).catch(async (reason) => {
+      if (!isAbortError(reason)) await reconcile();
+    }).finally(() => {
+      if (skillEvolutionRunAbortControllers.current.get(key) === controller) {
+        skillEvolutionRunAbortControllers.current.delete(key);
+      }
+    });
   }
 
   async function stopRun(sessionId = activeSessionId): Promise<void> {
@@ -4599,6 +4887,7 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
     return <ConfigurationRequestCard
       key={request.id}
       request={request}
+      onOpenModelSettings={() => openSystemSettings("models")}
       readOnly={sessionArchived}
       onStopTask={request.runId ? async () => { await client.cancelRun(request.sessionId, request.runId!); await refreshSession(request.sessionId); } : undefined}
       runActive={sessionRuns.some((run) => run.id === request.runId && run.status !== "blocked" && isActiveRunStatus(run.status))}
@@ -4606,10 +4895,12 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
       onUnavailable={() => setConfigurationRequests((items) => items.filter((item) => item.id !== request.id))}
       actions={{
         consent: (input, key) => client.consentConfigurationEndpoint(request.sessionId, request.id, input, key),
+        securityConsent: (input, key) => client.consentConfigurationSecurity(request.sessionId, request.id, input, key),
         preview: (input, key) => client.previewConfigurationRequest(request.sessionId, request.id, input, key),
         credential: (input, key) => client.submitConfigurationCredential(request.sessionId, request.id, input, key),
         decide: (input, key) => client.decideConfigurationRequest(request.sessionId, request.id, input, key),
         query: () => client.getConfigurationRequest(request.sessionId, request.id),
+        confirmSettings: (input, key) => client.confirmConfigurationSettings(request.sessionId, request.id, input, key),
         continue: (key) => client.continueConfigurationRequest(request.sessionId, request.id, key),
         reversal: (key) => client.reverseConfigurationRequest(request.sessionId, request.id, key),
       }} />;
@@ -5268,6 +5559,19 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
                   {composerTrigger ? <ComposerReferenceMenu trigger={composerTrigger} suggestions={composerSuggestions} onSelect={selectComposerSuggestion} /> : null}
                   {evolveCommandBlocked ? <EvolveSetup client={client} status={evolveStatus} onStatus={setEvolveStatus} /> : null}
                   {showEvolveAlgorithmPicker ? <EvolveAlgorithmPicker onSelect={selectEvolveAlgorithm} onDismiss={() => setEvolvePickerDismissed(true)} /> : null}
+                  {evolveSubmission && evolveSubmission.sessionId === activeSessionId ? <DirectionDialog
+                    chinese={locale === "zh-CN"} task={evolveTask}
+                    initialAlgorithm={evolveRetry?.sessionId === activeSessionId && evolveRetry.message === evolveSubmission.message
+                      ? evolveRetry.algorithm : readEvolveAlgorithm(evolveSubmission.message)}
+                    value={evolveRetry?.sessionId === activeSessionId && evolveRetry.message === evolveSubmission.message
+                      ? evolveRetry.direction : undefined}
+                    onClose={() => setEvolveSubmission(undefined)}
+                    onConfirm={(algorithm, direction) => {
+                      setEvolveSubmission(undefined);
+                      if (latestMessageRef.current.trim() === evolveSubmission.message) void sendComposerMessage({ algorithm, direction });
+                    }}
+                    onGenerate={(signal) => client.draftEvolveDirection(evolveSubmission.sessionId, evolveTask, signal)}
+                  /> : null}
                   <ComposerCommandChips commands={selectedComposerCommands} onRemove={removeComposerCommand} />
                   <ComposerReferenceChips references={composerReferences} onRemove={removeComposerReference} />
                   {pendingAnnotations.length ? <div className="annotation-chips">{pendingAnnotations.map((annotation) => <button key={annotation.id} onClick={() => setPendingAnnotations((current) => current.filter((item) => item.id !== annotation.id))} title={t("app.removeAnnotation", { name: annotation.artifactLogicalName, note: annotation.note })} type="button"><TargetIcon size={12} /> {annotation.artifactLogicalName}: {annotation.note} <CloseIcon size={12} /></button>)}</div> : null}
@@ -5281,7 +5585,11 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
                   </div> : <textarea ref={composerTextarea} disabled={sessionReadOnly} value={message} onChange={(event) => {
                     const value = event.target.value;
                     setMessage(value);
-                    if (!value.startsWith("/evolve-design")) setEvolvePickerDismissed(false);
+                    if (!value.startsWith("/evolve-design")) {
+                      setEvolvePickerDismissed(false);
+                      setEvolveRetry(undefined);
+                      setEvolveSubmission(undefined);
+                    }
                   }} onKeyDown={(event) => {
                     if (event.shiftKey || !commitsOnEnter(event)) return;
                     if (composerTrigger) return;
@@ -5807,7 +6115,10 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
               {systemSettingsGroup === "proxies" ? (
                 proxySettings
                   ? <ProxySettingsEditor
-                      mcpPolicies={mcpProxyPolicies}
+                      key={proxyEditorRevision}
+                      formDraft={proxyFormEdit}
+                      onFormDraftChange={setProxyFormEdit}
+                      mcpPolicies={mcpProxyPoliciesEdit ?? mcpProxyPolicies}
                       mcpServers={proxyMcpServers(mcpSources)}
                       onCreate={createProxyServer}
                       onDefaultPolicyChange={updateDefaultProxyPolicy}
@@ -5815,7 +6126,9 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
                       onMcpPolicyChange={updateMcpProxyPolicy}
                       onUpdate={updateProxyServer}
                       onWebProxyPolicyChange={updateWebProxyPolicy}
-                      settings={proxySettings}
+                      settings={proxySettingsEdit ?? proxySettings}
+                      onTest={(proxy) => client.testProxy(proxy)}
+                      onNoProxyChange={noProxy => setProxySettingsEdit(current => ({ ...(current ?? proxySettings), noProxy }))}
                       webProxyPolicy={(webSettingsEdit?.values ?? webSettings)?.proxyPolicy ?? "inherit"}
                     />
                    : <p className="muted">{t("settings.loadingProxies")}</p>
@@ -5962,7 +6275,6 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
         onChangeConfirmation={setDeletionConfirmation}
         onConfirm={() => void confirmDeletion()}
       /> : null}
-      <ResearchPackagePreviewMonitor client={client} projectId={session?.projectId} sessionId={session?.id} revision={session?.updatedAt} isRunning={isRunning} />
       <ResearchPackageDialogs
         client={client}
         key={researchPackageDialog ? `${researchPackageDialog.kind}:${researchPackageDialog.sessionId}` : "closed"}

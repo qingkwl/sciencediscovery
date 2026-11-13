@@ -257,3 +257,87 @@ test("a queued run whose frozen model was deleted emits a structured recovery er
   assert.ok(failure);
   assert.deepEqual(failure.event, { type: "run.failed", error: "The session model is not available", errorCode: "SESSION_MODEL_UNAVAILABLE" });
 });
+
+
+test("new interactive sessions choose a persisted fallback without changing defaults or old sessions", async context => {
+  const { state, a, b, c, project, reopen } = await fixture(context);
+  const old = await state.store.createSession(project.id, "Existing inherited session");
+  await state.store.deleteModel(a.id, null);
+  const input = Object.freeze({});
+  const session = await state.store.createSession(project.id, "New fallback", input, {}, { selectFallbackModel: true });
+  assert.deepEqual(input, {}, "fallback selection must not mutate the caller's overrides");
+  assert.notStrictEqual(session.settingsOverrides, input);
+  assert.equal(session.modelId, b.id);
+  assert.equal(session.settingsOverrides.modelId, b.id);
+  assert.equal(state.store.getGlobalSettings().overrides.modelId, undefined);
+  assert.equal(state.store.getProjectSettings(project.id).overrides.modelId, undefined);
+  assert.equal(requiredSession(state.store, old.id).modelId, undefined);
+  await state.store.updateModel(b.id, { name: "Z", model: b.model, baseUrl: b.baseUrl });
+  assert.equal(state.store.listModels()[0]?.id, c.id, "catalog reordering must not change the saved selection");
+  await reopen();
+  assert.equal(requiredSession(state.store, session.id).modelId, b.id);
+  assert.equal(state.store.resolveRuntimeSettings(session.id).effective.modelId, b.id);
+  assert.equal(requiredSession(state.store, old.id).modelId, undefined);
+});
+
+test("a persisted fallback requires recovery when later deleted as the global model", async context => {
+  const { state, a, b, c, project, reopen } = await fixture(context);
+  await state.store.replaceGlobalSettings({});
+  const automatic = await state.store.createSession(project.id, "Automatic fallback", {}, {}, { selectFallbackModel: true });
+  assert.equal(automatic.settingsOverrides.modelId, a.id);
+  await state.store.replaceGlobalSettings({ modelId: b.id });
+  assert.equal(requiredSession(state.store, automatic.id).modelId, a.id, "later defaults must not switch a saved session selection");
+  await state.store.replaceGlobalSettings({ modelId: a.id });
+  const inherited = await state.store.createSession(project.id, "Inherited default", {}, {}, { selectFallbackModel: true });
+  assert.equal(inherited.settingsOverrides.modelId, undefined);
+  await state.store.deleteModel(a.id, c.id);
+  const check = () => {
+    assert.equal(state.store.getGlobalSettings().overrides.modelId, c.id);
+    assert.equal(requiredSession(state.store, inherited.id).modelId, c.id);
+    assert.equal(requiredSession(state.store, automatic.id).settingsOverrides.modelId, a.id);
+    assert.equal(requiredSession(state.store, automatic.id).modelId, undefined);
+    assert.equal(state.store.resolveRuntimeSettings(automatic.id).effective.modelId, undefined);
+    assert.equal(state.store.resolveRuntimeSettings(automatic.id).sources.modelId, "session");
+  };
+  check(); await reopen(); check();
+  await state.store.replaceSessionSettings(automatic.id, {});
+  assert.equal(requiredSession(state.store, automatic.id).modelId, c.id);
+  assert.equal(state.store.resolveRuntimeSettings(automatic.id).sources.modelId, "global");
+});
+
+test("new interactive sessions prefer explicit, project, and global models over the catalog fallback", async context => {
+  const { state, a, b, c, project } = await fixture(context);
+  const create = (input = {}) => state.store.createSession(project.id, "New session", input, {}, { selectFallbackModel: true });
+  await state.store.replaceGlobalSettings({ modelId: c.id });
+  assert.equal((await create()).modelId, c.id);
+  await state.store.replaceProjectSettings(project.id, { modelId: b.id });
+  const inherited = await create();
+  assert.equal(inherited.modelId, b.id);
+  assert.equal(inherited.settingsOverrides.modelId, undefined, "normal inheritance must stay live");
+  assert.equal((await create({ modelId: a.id })).modelId, a.id);
+  await assert.rejects(create({ modelId: randomUUID() }), /existing model/);
+});
+
+test("a new project's first session gets a fallback when the global model is unset", async context => {
+  const { state, a } = await fixture(context);
+  await state.store.replaceGlobalSettings({});
+  const project = await state.store.createProject("New project");
+  const session = await state.store.createSession(project.id, "First session", {}, {}, {
+    allowUnconfiguredModel: true, selectFallbackModel: true,
+  });
+  assert.equal(session.modelId, a.id);
+  assert.equal(state.store.getGlobalSettings().overrides.modelId, undefined);
+});
+
+test("an empty catalog retains unconfigured-session support for setup and internal callers", async context => {
+  const { state, a, b, c, project } = await fixture(context);
+  for (const model of [a, b, c]) await state.store.deleteModel(model.id);
+  const session = await state.store.createSession(project.id, "Waiting for setup", {}, {}, {
+    allowUnconfiguredModel: true, selectFallbackModel: true,
+  });
+  assert.equal(session.modelId, undefined);
+  assert.equal(session.settingsOverrides.modelId, undefined);
+  await assert.rejects(state.store.createSession(project.id, "Requires a model", {}, {}, {
+    selectFallbackModel: true,
+  }), /task model is required/);
+});

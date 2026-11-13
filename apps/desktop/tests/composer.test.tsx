@@ -41,6 +41,7 @@ function render(
     seededCommand?: { command: string; nonce: number; text: string };
     tag?: { kind: "research" | "experiment" | "analysis"; label: string };
     uploading?: boolean;
+    modelName?: string;
     selectedModelId?: string | null;
     unavailableModel?: boolean;
   } = {},
@@ -52,7 +53,7 @@ function render(
       attachLimit={options.limit}
       attachments={options.attachments ?? []}
       landing={options.landing}
-      models={[{ id: "m1", name: "测试模型" } as never]}
+      models={[{ id: "m1", name: options.modelName ?? "测试模型" } as never]}
       onApprovalMode={() => {}}
       onClearAttachments={() => {}}
       onCreateProject={() => {}}
@@ -103,6 +104,12 @@ test("the composer offers the model pill, upload and session settings", () => {
   // give the same choice two homes.
   assert.doesNotMatch(markup, /composer-permission-pill/);
   assert.doesNotMatch(markup, /class="composer-options"/);
+  const longName = "Desktop configuration 长模型名称 85fedd8a-9420-47f7-9790-1ece4fd4cfa4";
+  for (const landing of [false, true]) {
+    const longMarkup = render(false, { modelName: longName, landing });
+    assert.ok(longMarkup.includes(`class="model-name" title="${longName}">${longName}</span>`),
+      "Truncation is visual only: the selected model keeps its complete text and tooltip");
+  }
 });
 
 test("the plus uploads and states the per-file ceiling in its tooltip", () => {
@@ -399,15 +406,58 @@ test("sending a seeded design joins the token to the sentence once", async () =>
         target: { value: "让压缩比更高，并且要快" },
       });
     });
+    // The dialog keeps the last word on the flags, so sending from the composer
+    // carries the token as seeded — there is no second confirmation dialog.
     const send = view.root.findByProps({ "aria-label": "发送" });
     await act(async () => { (send.props.onClick as () => void)(); });
-    // The flags and the sentence travel together, in that order.
     assert.deepEqual(sent, [
       { command: "/evolve-design --algorithm puct", content: "让压缩比更高，并且要快" },
     ]);
     // The token belonged to that message: the next draft starts empty.
     assert.equal(view.root.findByProps({ id: "composer-textarea" }).props.value, "");
     assert.equal(view.root.findAllByType("span").some((node) => node.props.className === "composer-command"), false);
+  } finally {
+    await act(async () => { view.unmount(); });
+  }
+});
+
+test("a seeded design carries the parameters the dialog collected", async () => {
+  // The starting values and the editable set are part of the same message as
+  // the flags: closing the dialog must not leave them behind.
+  const sent: { command?: string; content: string; direction?: unknown }[] = [];
+  const direction = { baseline: '{"ratio": 9}', editable: ["ratio"] };
+  let view;
+  await act(async () => {
+    view = create(
+      <Composer
+        attachments={[]}
+        landing
+        models={[{ id: "m1", name: "测试模型" } as never]}
+        onApprovalMode={() => {}}
+        onClearAttachments={() => {}}
+        onCreateProject={() => {}}
+        onOpenSettings={() => {}}
+        onRemoveAttachment={() => {}}
+        onRetryAttachment={() => {}}
+        onSelectModel={() => {}}
+        onSelectProject={() => {}}
+        onSend={(content, command, carried) => { sent.push({ command, content, direction: carried }); }}
+        onStop={() => {}}
+        onUpload={() => {}}
+        projects={[]}
+        running={false}
+        seededCommand={{ command: "/evolve-design --algorithm puct", direction, nonce: 1, text: "让压缩比更高" }}
+        selectedModelId="m1"
+        uploading={false}
+      />,
+    );
+  });
+  try {
+    const send = view.root.findByProps({ "aria-label": "发送" });
+    await act(async () => { (send.props.onClick as () => void)(); });
+    assert.deepEqual(sent, [
+      { command: "/evolve-design --algorithm puct", content: "让压缩比更高", direction },
+    ]);
   } finally {
     await act(async () => { view.unmount(); });
   }

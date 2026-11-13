@@ -5,8 +5,139 @@ import { createTest } from "../../../test/support/tagged/compat.mjs";
 import { ResearchExportPreviews, type ExportPreviewOptions } from "./research-export-previews.js";
 import { ApiStatusError } from "./http/api-status-error.js";
 const { test } = createTest(import.meta.url, { tags: ["category:ut", "os:linux", "arch:amd64", "arch:arm64"] });
+const statusError = (status: number, code: string) => (error: unknown) =>
+  error instanceof ApiStatusError && error.statusCode === status && error.code === code;
 
-test("background warming caches all default sizes, invalidates on evidence revisions and serializes work", async () => {
+test("deletion aborts active and queued project previews while other projects continue", async () => {
+  let started!: () => void;
+  const admitted = new Promise<void>(resolve => { started = resolve; });
+  const calls: string[] = [];
+  const previews = new ResearchExportPreviews(async () => "r1", async (options, revision, signal) => {
+    calls.push(options.sessionId!);
+    if (options.sessionId === "active") {
+      started();
+      await new Promise<void>((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    }
+    return { revision, estimatedBytes: 1, estimateKind: "uncompressed", files: [], omissions: [] };
+  });
+  const options = { projectId: "p", sessionId: "active", level: "necessary" as const, includeFullTrajectory: false };
+  const active = previews.get(options);
+  const rejected = assert.rejects(active, statusError(404, "EXPORT_PREVIEW_RESOURCE_DELETED"));
+  await admitted;
+  const queued = previews.get({ ...options, sessionId: "dependent" });
+  // Ensure the second request has finished admission and entered the queue.
+  await new Promise<void>(resolve => setImmediate(resolve));
+  previews.cancel("p", "active");
+  await rejected;
+  assert.equal((await queued).revision, "r1", "a surviving sibling retries without a caller-visible failure");
+  await previews.get({ ...options, projectId: "other", sessionId: "other" });
+  await previews.get({ ...options, sessionId: "replacement" });
+  assert.deepEqual(calls, ["active", "dependent", "other", "replacement"]);
+  await previews.close();
+});
+
+test("deleting a sibling restarts active default previews at the new revision", async () => {
+  let started!: () => void;
+  const admitted = new Promise<void>(resolve => { started = resolve; });
+  let revision = "r1", calls = 0;
+  const previews = new ResearchExportPreviews(async () => revision, async (_options, current, signal) => {
+    if (++calls === 1) {
+      started();
+      await new Promise<void>((_resolve, reject) => signal.addEventListener("abort", () => reject(new Error("concurrent store read failed")), { once: true }));
+    }
+    return { revision: current, estimatedBytes: 1, estimateKind: "uncompressed", files: [], omissions: [] };
+  });
+  try {
+    const pending = previews.defaults("p", "survivor", true);
+    await admitted;
+    revision = "r2";
+    previews.cancel("p", "deleted-sibling");
+    const result = await pending;
+    assert.equal(result.revision, "r2");
+    assert.equal(calls, 6, "one cancelled calculation and all five fresh profiles");
+    assert.equal((await previews.defaults("p", "survivor", true)).revision, "r2");
+    assert.equal(calls, 6, "only the fresh results are cached");
+  } finally { await previews.close(); }
+});
+
+test("repeated sibling invalidation is bounded and a later request can recover", async () => {
+  let admitted!: () => void;
+  let ready = new Promise<void>(resolve => { admitted = resolve; });
+  let interrupt = true, calls = 0;
+  const previews = new ResearchExportPreviews(async () => "r", async (_options, revision, signal) => {
+    calls++;
+    if (interrupt) {
+      admitted();
+      await new Promise<void>((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    }
+    return { revision, estimatedBytes: 1, estimateKind: "uncompressed", files: [], omissions: [] };
+  });
+  const options = { projectId: "p", level: "complete" as const, includeFullTrajectory: true };
+  try {
+    const pending = assert.rejects(previews.get(options), statusError(409, "EXPORT_PREVIEW_PENDING"));
+    await ready;
+    ready = new Promise<void>(resolve => { admitted = resolve; });
+    previews.cancel("p", "sibling-a");
+    await ready;
+    previews.cancel("p", "sibling-b");
+    await pending;
+    assert.equal(calls, 2, "only one automatic retry per request");
+    interrupt = false;
+    assert.equal((await previews.get(options)).revision, "r");
+    assert.equal(calls, 3, "a rejected calculation must not poison the cache");
+  } finally { await previews.close(); }
+});
+
+test("project deletion does not retry its active preview", async () => {
+  let started!: () => void;
+  const admitted = new Promise<void>(resolve => { started = resolve; });
+  let calls = 0;
+  const previews = new ResearchExportPreviews(async () => "r", async (_options, _revision, signal) => {
+    calls++; started();
+    await new Promise<void>((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    throw new Error("unreachable");
+  });
+  try {
+    const pending = assert.rejects(previews.get({ projectId: "p", level: "complete", includeFullTrajectory: true }),
+      statusError(404, "EXPORT_PREVIEW_RESOURCE_DELETED"));
+    await admitted; previews.cancel("p"); await pending;
+    assert.equal(calls, 1);
+  } finally { await previews.close(); }
+});
+
+test("shutdown signals an admitted calculation before waiting for its completion", async () => {
+  let started!: () => void;
+  const admitted = new Promise<void>(resolve => { started = resolve; });
+  const previews = new ResearchExportPreviews(async () => "r", async (_options, _revision, signal) => {
+    started();
+    await new Promise<void>((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    throw new Error("unreachable");
+  });
+  const pending = assert.rejects(previews.get({ projectId: "p", level: "complete", includeFullTrajectory: true }),
+    statusError(503, "EXPORT_PREVIEW_SERVICE_CLOSED"));
+  await admitted; await previews.close(); await pending;
+});
+
+test("background warming preheats only the necessary profile, not all five", async () => {
+  const calls: ExportPreviewOptions[] = [];
+  const previews = new ResearchExportPreviews(async () => "r1", async (options, revision) => {
+    calls.push(options);
+    return { revision, estimatedBytes: 1, estimateKind: "uncompressed", files: [], omissions: [] };
+  });
+  try {
+    previews.watch("p", "s");
+    await previews.tick();
+    assert.equal(calls.length, 1, "the background warm runs one profile");
+    assert.equal(calls[0]!.level, "necessary");
+    assert.equal(calls[0]!.includeFullTrajectory, false);
+    assert.equal(calls[0]!.includeFullMemoryGraph, false);
+    // The explicit defaults request still computes all five on demand.
+    await previews.defaults("p", "s");
+    assert.equal(calls.length, 5);
+  } finally { await previews.close(); }
+});
+
+test("default preview sizes cache, invalidate on evidence revisions and serialize work", async () => {
   let revision = "r1", active = 0, peak = 0;
   const calls: ExportPreviewOptions[] = [];
   const previews = new ResearchExportPreviews(async () => revision, async (options, current) => {
@@ -49,7 +180,7 @@ test("background warming defers active sessions and resumes at their terminal re
     await previews.tick();
     const warmed = await previews.defaults("p", "s");
     assert.equal(warmed.revision, "completed");
-    assert.equal(calculations, 6, "one explicit request followed by five terminal profiles");
+    assert.equal(calculations, 6, "one explicit request, the terminal warm, then the four on-demand complete profiles");
   } finally { await previews.close(); }
 });
 
@@ -113,6 +244,37 @@ test("busy default previews expose a retryable API status", async () => {
       const status = error as { statusCode?: number; code?: string };
       return status.statusCode === 409 && status.code === "EXPORT_PREVIEW_PENDING";
     });
+  } finally { await previews.close(); }
+});
+
+test("default previews expose a retryable status when a run races file publication", async () => {
+  let busy = false;
+  const previews = new ResearchExportPreviews(async () => "running", async () => {
+    busy = true;
+    const error = new Error("trajectory is not published yet") as NodeJS.ErrnoException;
+    error.code = "ENOENT";
+    throw error;
+  }, async () => !busy);
+  const options = { projectId: "p", sessionId: "s", level: "necessary" as const, includeFullTrajectory: false };
+  try {
+    await assert.rejects(previews.get(options, true), statusError(409, "EXPORT_PREVIEW_PENDING"));
+  } finally { await previews.close(); }
+});
+
+test("explicit previews answer the pending contract when a run races file publication", async () => {
+  // This used to preserve the raw ENOENT, and the server turned that into
+  // 404 {"error":"File not found"}. A browser logs a 404 as a resource
+  // error, which reds a @mocked journey on its own; the retry contract the
+  // client already understands is the honest answer to a file the run has not
+  // published yet (#1099).
+  const previews = new ResearchExportPreviews(async () => "r1", async () => {
+    const error = new Error("trajectory is not published yet") as NodeJS.ErrnoException;
+    error.code = "ENOENT";
+    throw error;
+  });
+  const options = { projectId: "p", sessionId: "s", level: "necessary" as const, includeFullTrajectory: false };
+  try {
+    await assert.rejects(previews.get(options), statusError(409, "EXPORT_PREVIEW_PENDING"));
   } finally { await previews.close(); }
 });
 

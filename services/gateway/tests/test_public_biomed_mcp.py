@@ -798,15 +798,144 @@ class PublicBiomedMcpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["records"][0]["identifier"], "PMC123")
         self.assertEqual(result["records"][0]["contentScope"], "abstract")
 
-    async def test_pmc_candidate_rejects_non_allowlisted_pdf_host(self) -> None:
-        locator = """<OA><records><record license="CC BY">
-          <link format="pdf" href="https://attacker.example/paper.pdf"/>
-        </record></records></OA>"""
+    async def test_pmc_candidate_reads_the_oa_package_bucket(self) -> None:
+        # PMC retired the OA Web Service in 2026; the replacement service is the
+        # OA package bucket, so the candidate is built from a listing key rather
+        # than from a locator that no longer answers (#1049).
+        listing = """<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+          <Contents><Key>PMC123.1/PMC123.1.pdf</Key></Contents>
+          <Contents><Key>PMC123.2/PMC123.2.pdf</Key></Contents>
+          <Contents><Key>PMC123.2/metadata.json</Key></Contents>
+        </ListBucketResult>"""
         with patch(
             "sciencediscovery_gateway.public_biomed_mcp._get_text",
-            new=AsyncMock(return_value=locator),
+            new=AsyncMock(return_value=listing),
         ):
-            with self.assertRaisesRegex(ValueError, "host allowlist"):
+            result = await _pmc_pdf_candidate("europe-pmc", "PMC123")
+        artifact = result["artifacts"][0]
+        # The newest package version wins, and the URL is built from the
+        # configured bucket, never from a provider-supplied href.
+        self.assertEqual(artifact["sourceUrl"],
+                         "https://pmc-oa-opendata.s3.amazonaws.com/PMC123.2/PMC123.2.pdf")
+        self.assertEqual(artifact["mimeType"], "application/pdf")
+
+    async def test_pmc_candidate_prefers_the_article_pdf_over_a_supplement(self) -> None:
+        # A version directory can hold both the article (`<PMCID>.<n>.pdf`) and a
+        # supplement (`srep32040-s1.pdf`); the supplement sorts after the article
+        # basename, so "take the last PDF" would hand the supplement to the
+        # reader (#1049).
+        listing = """<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+          <Contents><Key>PMC123.1/PMC123.1.pdf</Key></Contents>
+          <Contents><Key>PMC123.1/srep32040-s1.pdf</Key></Contents>
+        </ListBucketResult>"""
+        with patch(
+            "sciencediscovery_gateway.public_biomed_mcp._get_text",
+            new=AsyncMock(return_value=listing),
+        ):
+            result = await _pmc_pdf_candidate("europe-pmc", "PMC123")
+        self.assertEqual(
+            result["artifacts"][0]["sourceUrl"],
+            "https://pmc-oa-opendata.s3.amazonaws.com/PMC123.1/PMC123.1.pdf",
+        )
+
+    async def test_pmc_candidate_selects_the_largest_integer_version(self) -> None:
+        # Version 10 sorts before 2 lexicographically; the newest revision is the
+        # largest integer.
+        listing = """<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+          <Contents><Key>PMC123.2/PMC123.2.pdf</Key></Contents>
+          <Contents><Key>PMC123.10/PMC123.10.pdf</Key></Contents>
+        </ListBucketResult>"""
+        with patch(
+            "sciencediscovery_gateway.public_biomed_mcp._get_text",
+            new=AsyncMock(return_value=listing),
+        ):
+            result = await _pmc_pdf_candidate("europe-pmc", "PMC123")
+        self.assertEqual(
+            result["artifacts"][0]["sourceUrl"],
+            "https://pmc-oa-opendata.s3.amazonaws.com/PMC123.10/PMC123.10.pdf",
+        )
+
+    async def test_pmc_candidate_walks_a_truncated_listing_to_the_article_pdf(self) -> None:
+        # A version directory can fill the 40-key window, and the prefix can also
+        # match a longer PMCID; the article PDF lives on a later page, so the
+        # listing is walked with the continuation token instead of refused (#1049).
+        page_one = """<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+          <IsTruncated>true</IsTruncated>
+          <NextContinuationToken>next-page-token</NextContinuationToken>
+          <Contents><Key>PMC123.1/PMC123.1.pdf</Key></Contents>
+        </ListBucketResult>"""
+        page_two = """<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+          <IsTruncated>false</IsTruncated>
+          <Contents><Key>PMC123.2/PMC123.2.pdf</Key></Contents>
+        </ListBucketResult>"""
+
+        seen: list[dict] = []
+
+        async def fake_get_text(url, *, params=None, accept="", ssl_context=None,
+                                arxiv_diagnostics=False, fixed_endpoint=False):
+            seen.append(dict(params or {}))
+            if params and params.get("continuation-token") == "next-page-token":
+                return page_two
+            return page_one
+
+        with patch(
+            "sciencediscovery_gateway.public_biomed_mcp._get_text",
+            new=AsyncMock(side_effect=fake_get_text),
+        ):
+            result = await _pmc_pdf_candidate("europe-pmc", "PMC123")
+        self.assertEqual(
+            result["artifacts"][0]["sourceUrl"],
+            "https://pmc-oa-opendata.s3.amazonaws.com/PMC123.2/PMC123.2.pdf",
+        )
+        # The real bucket defaults to the V1 document only when `list-type=2` is
+        # absent, so every page must say V2; and the prefix must carry the
+        # trailing dot so a longer PMCID (PMC1230) cannot fill the window.
+        self.assertTrue(seen, "the listing was requested")
+        self.assertTrue(
+            all("list-type" in page and page["list-type"] == "2" for page in seen),
+            "every page speaks ListObjects V2",
+        )
+        self.assertTrue(
+            all(page.get("prefix") == "PMC123." for page in seen),
+            "the prefix is the record's own version directory",
+        )
+
+    async def test_pmc_candidate_refuses_a_truncated_listing_without_a_continuation_token(self) -> None:
+        # Truncation without a continuation token means the walk cannot proceed;
+        # refuse rather than guess at the article key.
+        listing = """<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+          <IsTruncated>true</IsTruncated>
+          <Contents><Key>PMC123.1/PMC123.1.pdf</Key></Contents>
+        </ListBucketResult>"""
+        with patch(
+            "sciencediscovery_gateway.public_biomed_mcp._get_text",
+            new=AsyncMock(return_value=listing),
+        ):
+            with self.assertRaisesRegex(ValueError, "truncated without a continuation token"):
+                await _pmc_pdf_candidate("europe-pmc", "PMC123")
+
+    async def test_pmc_candidate_reports_a_record_without_a_package(self) -> None:
+        listing = """<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+          <Contents><Key>PMC123.1/metadata.json</Key></Contents>
+        </ListBucketResult>"""
+        with patch(
+            "sciencediscovery_gateway.public_biomed_mcp._get_text",
+            new=AsyncMock(return_value=listing),
+        ):
+            with self.assertRaisesRegex(ValueError, "does not provide a PDF"):
+                await _pmc_pdf_candidate("europe-pmc", "PMC123")
+
+    async def test_pmc_candidate_ignores_a_key_that_leaves_the_bucket(self) -> None:
+        # Keys come from the provider, so one that escapes the record's own
+        # version directory must never become a download candidate.
+        listing = """<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+          <Contents><Key>PMC123.1/../../attacker.example/paper.pdf</Key></Contents>
+        </ListBucketResult>"""
+        with patch(
+            "sciencediscovery_gateway.public_biomed_mcp._get_text",
+            new=AsyncMock(return_value=listing),
+        ):
+            with self.assertRaisesRegex(ValueError, "does not provide a PDF"):
                 await _pmc_pdf_candidate("europe-pmc", "PMC123")
 
     def test_raise_for_status_keeps_status_and_retry_after_but_not_the_query(self) -> None:
@@ -836,6 +965,39 @@ class PublicBiomedMcpTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(metadata["endpoint"], "https://export.arxiv.org")
             self.assertNotIn("secret", str(caught.exception))
             self.assertNotIn(body, str(caught.exception))
+
+    def test_gone_responses_are_attributed_to_the_configured_endpoint(self) -> None:
+        # A retired provider path answers 404 for records that exist, so the
+        # scope must say "the service is gone" instead of "we did not classify
+        # it" — otherwise the client reports the record as absent (#1049).
+        request = httpx.Request("GET", "https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi?id=PMC1")
+        for status in (404, 405, 410):
+            with self.assertRaises(RuntimeError) as caught:
+                _raise_for_status(httpx.Response(status, request=request), fixed_endpoint=True)
+            metadata = json.loads(str(caught.exception).split("SOURCE_HTTP_ERROR:", 1)[1])
+            self.assertEqual(metadata["failureScope"], "endpoint")
+            self.assertEqual(metadata["statusCode"], status)
+            self.assertEqual(metadata["endpoint"], "https://www.ncbi.nlm.nih.gov")
+
+    def test_gone_record_lookups_stay_unclassified_without_the_flag(self) -> None:
+        # A record-scoped URL (a PDB entry, a Reactome pathway) that answers 404
+        # means "no such record", not "the endpoint is gone". Without the
+        # fixed-endpoint flag it must stay unclassified so the client reports
+        # NOT_FOUND rather than an outage.
+        request = httpx.Request("GET", "https://data.rcsb.org/rest/v1/core/entry/XXXX")
+        for status in (404, 410):
+            with self.assertRaises(RuntimeError) as caught:
+                _raise_for_status(httpx.Response(status, request=request))
+            metadata = json.loads(str(caught.exception).split("SOURCE_HTTP_ERROR:", 1)[1])
+            self.assertEqual(metadata["failureScope"], "unknown")
+            self.assertEqual(metadata["statusCode"], status)
+
+    def test_a_server_error_stays_unclassified(self) -> None:
+        request = httpx.Request("GET", "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi")
+        with self.assertRaises(RuntimeError) as caught:
+            _raise_for_status(httpx.Response(503, request=request))
+        metadata = json.loads(str(caught.exception).split("SOURCE_HTTP_ERROR:", 1)[1])
+        self.assertEqual(metadata["failureScope"], "unknown")
 
     def test_retry_after_supports_http_date_and_ignores_invalid_values(self) -> None:
         request = httpx.Request("GET", "https://export.arxiv.org/api/query")

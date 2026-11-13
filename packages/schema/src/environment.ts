@@ -486,6 +486,7 @@ export interface ScientificEnvironmentSetup {
 
 export interface SetupScientificEnvironmentsRequest {
   confirmed: boolean;
+  networkProxy?: ResolvedProxy;
 }
 
 export interface ScientificEnvsCapability {
@@ -516,8 +517,20 @@ export interface RunnerExecutionCapability {
   sandbox: SandboxKind;
   dependencyAvailable: boolean;
   sandboxUsable: boolean;
+  /**
+   * The Python channel. Kept for existing consumers; `readyFor` is what a caller
+   * that needs a specific route should read, so a Runner whose managed Shell is
+   * dead is not advertised as a general green light (#1108).
+   */
   ready: boolean;
-  reason: "ready" | "dependency-unavailable" | "incompatible" | "sandbox-unusable";
+  reason: "ready" | "dependency-unavailable" | "incompatible" | "sandbox-unusable" | "shell-unavailable";
+  /** Route-scoped verdicts, both derived from the same probe as `ready`/`reason`. */
+  readyFor?: {
+    /** Sandbox and dependency usable; the managed Shell plays no part. */
+    python: boolean;
+    /** `python` and the managed Shell usable. An absent `shell` field stays unknown, not false. */
+    shell: boolean;
+  };
   detail?: string;
   platform?: "linux" | "macos" | "windows";
   shell?: {
@@ -549,7 +562,10 @@ export interface RunnerCheckResult {
   runnerId: string;
   checkedAt: string;
   connected: boolean;
+  /** The route this result was asked about: Shell callers get the Shell verdict. */
   ready: boolean;
+  /** Route-scoped verdicts, mirrored from the capability so one object cannot disagree with itself. */
+  readyFor?: { python: boolean; shell: boolean };
   reason: string;
   capability?: RunnerExecutionCapability;
   suggestions: string[];
@@ -606,7 +622,14 @@ export interface RunnerHealth {
   scientificEnvs: ScientificEnvsCapability;
   /** Linux syscall filter; not applicable to macOS Seatbelt. */
   seccompBaseline: "multiarch-v1-profile-aware" | null;
-  status: "ok";
+  /**
+   * `ok` when every enabled subsystem came up. `degraded` when the Runner is
+   * serving but an enabled subsystem reached a terminal failure — currently the
+   * managed scientific environment, whose absence leaves `run_shell` unable to
+   * execute anything while the process itself is healthy (#1104). Callers that
+   * only need liveness should use `scientificEnvs`/`execution` for capability.
+   */
+  status: "ok" | "degraded";
   /** `null` means no global cap; positive numbers are retained for older Runner compatibility. */
   workerConcurrency: number | null;
 }

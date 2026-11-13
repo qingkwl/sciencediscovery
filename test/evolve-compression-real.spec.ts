@@ -9,6 +9,7 @@ import { expect } from "@playwright/test";
 import { test, requireRealEnv, requireRealStack, allowRealEnvException } from "./helpers/e2e.ts";
 import { measureSession } from "./helpers/case-measurements.ts";
 import { cleanupJourney, createProjectAndSession, openProjectSession } from "./helpers/journeys.ts";
+import { runTestCleanup } from "./helpers/test-failure.ts";
 import { drbApi, positiveNumber } from "./helpers/deepresearchbench.ts";
 import { evolutionScorecard } from "./helpers/evolve-result.mjs";
 import { apiBaseUrl, authorizationHeader } from "./e2e-auth.js";
@@ -26,7 +27,7 @@ function optionalModelSetting<T extends string>(value: string | undefined, name:
  * Purpose: Guard the documented PUCT text compression tutorial through real design, search and persisted delivery.
  * Steps:
  *   1. Read the tutorial prompt, create a session and choose PUCT in the browser.
- *   2. Submit the real task; acknowledge design checkpoints if the Agent asks.
+ *   2. Confirm the evolution settings and submit the task; acknowledge any design checkpoints.
  *   3. Wait for the main Agent and actual background search to finish; read its persisted result.
  *   4. Record the search's held-out score independently, without improvement or minimum-score assertions.
  * Environment: Linux Swarm stack with platform task delegation, bubblewrap, scientific Python and evolve sidecar.
@@ -60,6 +61,7 @@ test("PUCT-COMPRESS documented text compression search", {
   let fixture: Awaited<ReturnType<typeof createProjectAndSession>> | undefined;
   let runId: string | undefined;
   let searches: any[] = [];
+  let primaryFailure: { error: unknown } | undefined;
   journey.scenario({ goal: "Complete the documented PUCT compression task and report its own final score",
     preconditions: ["Real model", "Working sandbox, Python environment and evolve sidecar"] });
   try {
@@ -90,6 +92,11 @@ test("PUCT-COMPRESS documented text compression search", {
       const before = new Set((await api<any[]>(`${prefix}/runs`)).map(run => run.id));
       await box.fill(text);
       await page.getByRole("button", { name: /^(Run analysis|Add to queue|运行分析|加入队列)$/ }).click();
+      if (/^\/evolve-design(?:\s|$)/u.test(text.trimStart())) {
+        const confirmation = page.getByRole("dialog", { name: /^(Confirm evolution settings|确认演进设置)$/ });
+        await confirmation.getByRole("button", { name: /^(Start evolution|开始演进)$/ }).click();
+        await expect(confirmation).toBeHidden();
+      }
       let created: any;
       // Slash commands may expand into skill context, so compare persisted identities, not rewritten prompt text.
       await expect.poll(async () => {
@@ -183,27 +190,30 @@ test("PUCT-COMPRESS documented text compression search", {
     }
     await page.screenshot({ path: info.outputPath("completed.png"), fullPage: true });
   } catch (error) {
+    primaryFailure = { error };
     metrics.integration_status = "failed";
     metrics.error = error instanceof Error ? error.message : String(error);
     throw error;
   } finally {
-    metrics.finished_at = new Date().toISOString();
-    if (fixture) {
-      const prefix = `/api/sessions/${fixture.session.id}`;
-      await save("session.json", await api(prefix).catch(() => null));
-      await save("children.json", await api(`${prefix}/subagents`).catch(() => []));
-      await save("artifacts.json", await api(`${prefix}/artifacts`).catch(() => []));
-      searches = await api<any[]>(`/api/evolve/runs?sessionId=${fixture.session.id}`).catch(() => searches);
-      for (const search of searches) {
-        await save(`evolve-${search.id}.json`, { search, events: await api(`/api/evolve/runs/${search.id}/events`).catch(() => []) });
-        if (["pending", "running"].includes(search.status)) await page.request.post(`${apiBaseUrl()}/api/evolve/runs/${search.id}/stop`, { headers }).catch(() => {});
+    await runTestCleanup(primaryFailure, async () => {
+      metrics.finished_at = new Date().toISOString();
+      if (fixture) {
+        const prefix = `/api/sessions/${fixture.session.id}`;
+        await save("session.json", await api(prefix).catch(() => null));
+        await save("children.json", await api(`${prefix}/subagents`).catch(() => []));
+        await save("artifacts.json", await api(`${prefix}/artifacts`).catch(() => []));
+        searches = await api<any[]>(`/api/evolve/runs?sessionId=${fixture.session.id}`).catch(() => searches);
+        for (const search of searches) {
+          await save(`evolve-${search.id}.json`, { search, events: await api(`/api/evolve/runs/${search.id}/events`).catch(() => []) });
+          if (["pending", "running"].includes(search.status)) await page.request.post(`${apiBaseUrl()}/api/evolve/runs/${search.id}/stop`, { headers }).catch(() => {});
+        }
+        if (runId) await page.request.post(`${apiBaseUrl()}${prefix}/runs/${runId}/cancel`, { headers }).catch(() => {});
+        // Shared numeric measurements join this case's only metrics document.
+        metrics.measurements = await measureSession(page.request, info, fixture.session.id,
+          { evolveRunIds: searches.map(search => search.id) });
       }
-      if (runId) await page.request.post(`${apiBaseUrl()}${prefix}/runs/${runId}/cancel`, { headers }).catch(() => {});
-      // Shared numeric measurements join this case's only metrics document.
-      metrics.measurements = await measureSession(page.request, info, fixture.session.id,
-        { evolveRunIds: searches.map(search => search.id) });
-    }
-    await save("evolve-metrics.json", metrics);
-    if (fixture && process.env.E2E_KEEP_RESEARCH_RECORDS !== "1") await cleanupJourney(page, fixture);
+      await save("evolve-metrics.json", metrics);
+      if (fixture && process.env.E2E_KEEP_RESEARCH_RECORDS !== "1") await cleanupJourney(page, fixture);
+    });
   }
 });

@@ -86,6 +86,21 @@ test("Store create/update/reload preserves metadata and frozen hash; credentials
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test("a recorded ceiling survives a reload, so the handoff keeps naming the bound the loop enforced", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sd-bound-reload-"));
+  try {
+    const store = new SessionStore(root); await store.load();
+    const project = await store.createProject("Bound reload");
+    const session = await store.createSession(project.id, "Reload", {}, {}, { allowUnconfiguredModel: true });
+    const child = await store.createSubagent(session.id, "run", { description: "Work", prompt: "Work" }, { maxTurns: 300, effectiveMaxTurns: 128 });
+    assert.equal(normalizePersistedSubagent(child)?.effectiveMaxTurns, 128, "the normalizer keeps the field it is the only reader for");
+    const reopened = new SessionStore(root); await reopened.load();
+    const reloaded = reopened.listSubagents(session.id).find(item => item.id === child.id);
+    assert.equal(reloaded?.maxTurns, 300);
+    assert.equal(reloaded?.effectiveMaxTurns, 128, "a reloaded ceiling stop still reports 128, not the configured 300");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("adapter maps SDK events, validates tool requests, accumulates usage and accepts only platform artifacts", async () => {
   const observed: SpecialistRuntimeEvent[] = [];
   let calls = 0;
@@ -333,6 +348,46 @@ test("fallback handles runtime unavailability, respects opt-out, and never swall
       assert.equal(calls, expected ? 1 : 0);
       assert.equal(observed.some(event => event.type === "fallback"), expected);
     }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("a specialist fallback names the ceiling the native loop enforced, not the configured budget", async () => {
+  const { SpecialistUnavailableError } = await import("./codex.js");
+  const { effectiveModelTurns } = await import("@sciencediscovery/runtime-core");
+  const root = await mkdtemp(join(tmpdir(), "sd-fallback-bound-"));
+  try {
+    const store = new SessionStore(root); await store.load();
+    const project = await store.createProject("Fallback bound");
+    const session = await store.createSession(project.id, "Bounds", {}, {}, { allowUnconfiguredModel: true });
+    const child = await store.createSubagent(session.id, "lead", { description: "Codex task", prompt: "Produce output" });
+    const workspaceRoot = store.agentWorkspacePath(session.id, child.id);
+    let fallbackConfigured: number | undefined;
+    const createAgent = codexAgentFactory({
+      runtime: { kind: "codex" }, maxTurns: 300,
+      credential: async () => "test-secret",
+      adapter: { invoke: async () => { throw new SpecialistUnavailableError("Auth unavailable"); } },
+      onRuntimeEvent: async () => {},
+      fallbackFactory: options => {
+        fallbackConfigured = options.maxModelTurns;
+        return {
+          abort() {}, beginExternalWait: () => () => undefined,
+          // The engine composes the bound the fallback loop really enforces.
+          enforcedMaxModelTurns: effectiveModelTurns(options.maxModelTurns),
+          async execute() { return { finalMessages: [{ role: "assistant", content: "Native recovery" }] }; },
+          async prompt() {}, subscribe: () => () => undefined,
+        };
+      },
+    });
+    const handle = runSubagentTask({ bindings: { createAgent, workspace: {
+      config: { baseUrl: "http://unused.test", dataDir: root, model: "unused" }, enabledConnectorIds: [], workspaceRoot,
+      executePython: async () => { throw Error("unused"); }, executeShell: async () => { throw Error("unused"); },
+    } }, profile: createSubagentProfile({ connectorIds: [], deniedToolNames: ["task"], gatewayThreadId: child.id, maxModelTurns: 300, presetId: "general-purpose", runTimeoutMs: 30000, workspaceRoot }),
+      prompt: "delegated brief", requestExecutionId: child.id });
+    // Until the external runtime answers, nothing has enforced a ceiling of its own.
+    assert.equal(handle.enforcedMaxModelTurns, undefined, "the external runtime names no ceiling before it runs");
+    await handle.execute();
+    assert.equal(fallbackConfigured, 300, "the fallback receives the declared budget");
+    assert.equal(handle.enforcedMaxModelTurns, 128, "the record can now name the bound the fallback loop enforced");
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

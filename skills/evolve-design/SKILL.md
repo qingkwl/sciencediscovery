@@ -16,7 +16,7 @@ scoring that cannot shows up as a flat run, not as an error.
 
 **Algorithm first.** The user's `/evolve-design` command may carry `--algorithm puct` or
 `--algorithm openevolve`; if unset, ask. PUCT ranks candidates over a tree, OpenEvolve over
-MAP-Elites islands. The four steps and the four scoring modes are identical for both, so design
+MAP-Elites islands. The four steps and the scoring modes are identical for both, so design
 the scorecard, the split and the starting point the same way and only set `algorithm` in
 `create_evolve_run`.
 
@@ -91,9 +91,11 @@ title: 什么算“更好”
 
 Write the card once, when the step is done — not while you are still working on it.
 
-The card's confirm button answers with the step it confirms: 「确认检查点 N/4，继续。」 or, when the
-client's language is English, "Confirm checkpoint N/4, continue." Treat that as an answer to that
-step and nothing else — continue from it, and do not show the step again.
+The card's confirm button answers with the step it confirms: 「确认检查点 N/3，继续。」 or, when the
+client's language is English, "Confirm checkpoint N/3, continue." The denominator counts the
+checkpoints the reader answers — every step but the last, which is the record of the run starting —
+so it is one fewer than `total`; the step number is what identifies the card. Treat that as an
+answer to that step and nothing else — continue from it, and do not show the step again.
 
 In auto the client keeps the flow moving: when a turn ends on an auto card before step 4, it sends
 「继续步骤 N/4。」 or "Continue with step N/4.". That is not a new instruction and not a
@@ -285,6 +287,20 @@ maintain the measuring apparatus yourself, so every mistake in it is yours. Judg
   tests", "make these cases pass", or describes behaviour case by case. The failure text is the
   learning signal, and `frozenGlobs` **must** include the test paths, or the shortest way to a
   higher score is to weaken the tests. Shards ≤ half the case count.
+If the user's command includes an `evolve-input` block, it records the JSON baseline and
+top-level fields they confirmed in the app. The setup dialog collects the task, the algorithm,
+the checkpoint pace and that block; the command then reaches the composer as flags the user
+still edits and sends. Use the confirmed baseline for scoring design and respect their field
+selection. Do not substitute a new baseline or expand the selection. Ask the user to start a new
+design with the updated input if they want to change either. For a local `custom_script` scorer,
+read the candidate JSON from `SCIENCE_AGENT_CANDIDATE` with `json.load`. Do not import
+the candidate as a Python module when the user confirmed a JSON baseline.
+
+- **The score has to run on this conversation's selected runner** → `npu_job`. The starting
+  point is a JSON object. `editableFields` lists the top-level fields that may change.
+  `evaluatorSource` is the fixed Python program: it reads `_EVOLVE_CANDIDATE` and prints one
+  JSON line with `device` equal to `npu` and a `score` from 0 to 1, larger is better. A number the candidate prints is not
+  the score. Use this only when the conversation has a remote runner and a ticked NPU card.
 - **Neither fits** → `custom_script`, which you write: simulations, optimisation heuristics,
   anything whose quality is a computation with no natural table and no test suite. **Read
   `references/custom-script.md` before writing the evaluator** — it holds the contract, how it
