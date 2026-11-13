@@ -372,7 +372,13 @@ these bytes, do NOT hand-fix; rerun this gate after checking the notary log
     # accept both the installer and the app. (Command substitution instead
     # of a pipe: `spctl | grep -q` under pipefail dies on SIGPIPE once grep
     # exits early — capture once, grep the string.)
-    SPCTL_DMG="$(spctl -a -vv -t open "$DMG" 2>&1 || true)"
+    # [mac-desktop] W24 — a DMG needs --context context:primary-signature:
+    # without it Gatekeeper answers "Insufficient Context" (observed on the
+    # first fully-notarized DMG, 2026-11-13: staple+validate both green,
+    # plain `spctl -a -t open` rejected, the context-flagged form accepted
+    # "source=Notarized Developer ID"). The .app assesses fine without a
+    # context; the flag is DMG-only.
+    SPCTL_DMG="$(spctl -a -vv -t open --context context:primary-signature "$DMG" 2>&1 || true)"
     printf '%s\n' "$SPCTL_DMG" | grep -q 'accepted' \
       || die "spctl rejected the DMG: $SPCTL_DMG"
     SPCTL_APP="$(spctl -a -vv -t execute "$APP" 2>&1 || true)"
