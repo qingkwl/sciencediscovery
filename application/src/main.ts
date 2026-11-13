@@ -681,15 +681,22 @@ async function ensureBackend(
     // reaches the main UI in ~10-20s instead of minutes. Set on the current
     // process too: bootstrapPackaged reads process.env to decide the unpack
     // path, while the stack child inherits them through extraEnv.
-    process.env.SCIENCE_AGENT_IN_PLACE_ENVS = "1";
-    process.env.SCIENCE_AGENT_LAZY_JIUWEN = "1";
+    // [mac-desktop] W22: darwin NEVER sets IN_PLACE — any write inside the
+    // .app bundle (pyvenv.cfg/.pth/__pycache__ fixes, import-time .pyc)
+    // breaks the codesign seal, and the NEXT launch dies before main.cjs
+    // (amfid rejects the binary, zero output). win32 keeps in-place: the
+    // NSIS install dir has no seal to break.
+    const inplaceEnv: NodeJS.ProcessEnv = IS_DARWIN ? {} : {
+      SCIENCE_AGENT_IN_PLACE_ENVS: "1",
+      SCIENCE_AGENT_LAZY_JIUWEN: "1",
+    };
+    Object.assign(process.env, inplaceEnv);
     const extraEnv: NodeJS.ProcessEnv = {
       ...(dataDir ? { SCIENCE_DISCOVERY_DATA_DIR: dataDir } : {}),
       ...stackEnvForPorts(ports),
       ...loopbackGuard,
       ...(proxyEnv ?? {}),
-      SCIENCE_AGENT_IN_PLACE_ENVS: "1",
-      SCIENCE_AGENT_LAZY_JIUWEN: "1",
+      ...inplaceEnv,
     };
     if (packaged && dataDir) {
       provisioningThisRun = needsUnpack(dataDir, packaged.resourcesPath);
@@ -1000,15 +1007,19 @@ async function startWizardBackend(dataDir: string, proxyEnv: NodeJS.ProcessEnv |
     // reaches the main UI in ~10-20s instead of minutes. Set on the current
     // process too: bootstrapPackaged reads process.env to decide the unpack
     // path, while the stack child inherits them through extraEnv.
-    process.env.SCIENCE_AGENT_IN_PLACE_ENVS = "1";
-    process.env.SCIENCE_AGENT_LAZY_JIUWEN = "1";
+    // [mac-desktop] W22: darwin NEVER sets IN_PLACE (bundle writes break the
+    // codesign seal — see the comment at the other spawn site above).
+    const inplaceEnv: NodeJS.ProcessEnv = IS_DARWIN ? {} : {
+      SCIENCE_AGENT_IN_PLACE_ENVS: "1",
+      SCIENCE_AGENT_LAZY_JIUWEN: "1",
+    };
+    Object.assign(process.env, inplaceEnv);
     const extraEnv: NodeJS.ProcessEnv = {
       SCIENCE_DISCOVERY_DATA_DIR: dataDir,
       ...stackEnvForPorts(ports),
       ...loopbackGuard,
       ...(proxyEnv ?? {}),
-      SCIENCE_AGENT_IN_PLACE_ENVS: "1",
-      SCIENCE_AGENT_LAZY_JIUWEN: "1",
+      ...inplaceEnv,
     };
     if (packaged) {
       provisioningThisRun = needsUnpack(dataDir, packaged.resourcesPath);

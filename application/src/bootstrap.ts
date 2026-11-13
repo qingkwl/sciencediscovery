@@ -136,6 +136,17 @@ export function packagedEnv(paths: PackagedPaths, dataDir: string, platform: She
   // this flag), and defense in depth keeps the unisolated escape hatch a
   // Windows-only contract even if that branch ever changes.
   if (platform === "win32") env.SCIENCE_AGENT_EVOLVE_UNISOLATED = "1";
+  // [mac-desktop] W22: the jw venv runs straight out of the sealed .app
+  // bundle. Python writes __pycache__/.pyc next to imported sources on
+  // first import — inside the bundle, each write breaks the codesign seal
+  // (measured: 118 runtime-written .pyc files under backend/jw/.venv on the
+  // W19 adhoc install, incl. beartype's tagged caches). DMG runs never see
+  // this (EROFS); /Applications installs do. CPython honours
+  // PYTHONDONTWRITEBYTECODE by skipping ALL bytecode writes, so the bundle
+  // tree stays byte-identical to what was signed. Cost: jw modules that the
+  // build's precompile missed re-compile in memory on every launch (the
+  // payload ships 99.9% coverage, so this is measured noise).
+  if (platform === "darwin") env.PYTHONDONTWRITEBYTECODE = "1";
   return env;
 }
 
@@ -661,6 +672,7 @@ export async function bootstrapPackaged(
   paths: PackagedPaths,
   dataDir: string,
   log: (line: string) => void,
+  platform: ShellPlatform = CURRENT_SHELL_PLATFORM,
 ): Promise<BootstrapResult> {
   const bootstrapStarted = Date.now();
   log("[perf] bootstrapPackaged start");
@@ -687,6 +699,17 @@ export async function bootstrapPackaged(
     process.env.SCIENCE_AGENT_IN_PLACE_ENVS = undefined;
     inPlaceEnvs = false;
   }
+  // [mac-desktop] W22 —— darwin 上可写 payload（/Applications 安装）也强制走
+  // 拷贝模式。in-place 的全部修复（pyvenv.cfg home / .pth / 补编译 __pycache__）
+  // 都写进 bundle 内部，任何一次写入都击穿 codesign 封条（CodeResources 哈希
+  // 不再匹配）：下一启 amfid 拒载主二进制（零输出瞬死，实测），notarization
+  // 票据作废，M4 的 spctl 门禁必挂。Windows 的 NSIS 目录没有封条概念，维持
+  // in-place 不变。拷贝模式实测 ~3.1s（W19 包），首启成本可忽略。
+  if (inPlaceEnvs && platform === "darwin") {
+    log("darwin payload must stay sealed (codesign/notarization): falling back to copied envs");
+    process.env.SCIENCE_AGENT_IN_PLACE_ENVS = undefined;
+    inPlaceEnvs = false;
+  }
   const envsDir = inPlaceEnvs ? paths.envsTemplate : join(dataDir, "envs");
   // Which payload this launch is running from. Stamped below so an upgrade is
   // told apart from a relaunch of the same payload (needsBytecodeJudgement).
@@ -702,7 +725,11 @@ export async function bootstrapPackaged(
     // next jw spawn (init/precompile) runs against a nonexistent interpreter.
     // W16: skip on a read-only payload (DMG run) — the fix writes into
     // <resources>; jw stays runnable via its relative python symlinks (W15).
-    if (payloadWritable) {
+    // [mac-desktop] W22: skip on darwin too — a WRITABLE /Applications install
+    // is exactly where the seal matters most; jw runs fine on its relative
+    // symlinks with the build-machine home left inert (same reasoning as the
+    // read-only DMG case).
+    if (payloadWritable && platform !== "darwin") {
       const jwVenv = join(paths.jwSrc, ".venv");
       if (existsSync(join(jwVenv, "pyvenv.cfg"))) {
         await fixVenvHome(jwVenv, paths.python, log);
@@ -732,13 +759,23 @@ export async function bootstrapPackaged(
   // them and keep the jw venv running on its relative symlinks (W15) with
   // the build-machine home left inert in pyvenv.cfg. (fixVenvLaunchers is a
   // no-op on darwin anyway; the guard also covers a win32 read-only case.)
-  if (payloadWritable) {
+  // [mac-desktop] W22: on darwin a writable payload is NOT licence to write
+  // — fixVenvHome(jwVenv) writes pyvenv.cfg INSIDE the sealed .app bundle,
+  // breaking the codesign seal for every later launch (see the W22 note at
+  // the in-place guard above). jw runs fine without the fix (relative
+  // symlinks, inert build-machine home). fixVenvLaunchers over envsDir is
+  // harmless on darwin (it targets dataDir envs or no-ops in-place) and is
+  // kept unguarded.
+  if (payloadWritable && platform !== "darwin") {
     await fixVenvLaunchers(paths, envsDir, log);
     const jwVenv = join(paths.jwSrc, ".venv");
     if (existsSync(join(jwVenv, "pyvenv.cfg"))) {
       await fixVenvHome(jwVenv, paths.python, log);
       log("first run: pointed the bundled JiuwenSwarm venv at the bundled interpreter");
     }
+  } else if (platform === "darwin") {
+    // darwin: only the (harmless) envsDir launchers pass; never the jw fix.
+    await fixVenvLaunchers(paths, envsDir, log);
   }
   perfB("jw-venv-fix-done");
 
@@ -822,8 +859,17 @@ export async function bootstrapPackaged(
   // copy below: both read the read-only resources while the copy writes
   // dataDir\envs, and each self-skips when the payload already ships its
   // caches. Must be awaited in BOTH branches of the compile section.
+  // [mac-desktop] W22: on darwin the template-phase targets live INSIDE the
+  // sealed bundle (stdlib under <resources>\python, the jw venv) — a
+  // cache-less target would compile .pyc INTO the bundle and break the
+  // codesign seal (see the W22 guard at the in-place branch). The payload
+  // ships precompiled caches; a gap self-heals in memory per launch
+  // (PYTHONDONTWRITEBYTECODE) instead of by writing into the seal.
+  // precompileTargets() keeps listing them (win32 still compiles them in
+  // place) — the filter is darwin-only, right here at the consumption site.
   const templateRuns = precompileTargets(paths, envsDir)
     .filter((t) => t.phase === "template")
+    .filter((t) => platform !== "darwin")
     .map((t) => compileIfCacheless(t, compileEnv, log));
 
   log(`first run: unpacking bundled Python environments into ${envsDir}`);
