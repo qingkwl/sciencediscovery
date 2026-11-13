@@ -131,5 +131,14 @@ export function darwinRoleMenu(dev: boolean): RoleMenuSpec {
         { role: "front" },
       ],
     },
+    // Uninstall & data cleanup lives here (D4 §8 companion): mac convention is
+    // drag-to-trash with data kept, but the deep-clean entry must not depend
+    // on an external FAQ — see uninstall-data.ts + main.ts wiring.
+    helpMenu: {
+      label: "帮助",
+      submenu: [
+        { role: "__sd_uninstall_data__" },
+      ],
+    },
   };
 }

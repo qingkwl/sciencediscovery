@@ -39,6 +39,10 @@ export interface RoleMenuSpec {
   /** DEV-only (reload/devtools are developer affordances, same call as win32); null in packaged builds. */
   viewMenu: { role: "viewMenu"; submenu: RoleMenuEntry[] } | null;
   windowMenu: { role: "windowMenu"; submenu: RoleMenuEntry[] };
+  /** darwin-only: hosts the uninstall & data-cleanup entry (D4 §8 companion);
+   *  null on win32 (no menu bar — the NSIS uninstaller owns that flow).
+   *  Plain label, not a role: Electron has no "helpMenu" role in its union. */
+  helpMenu: { label: string; submenu: RoleMenuEntry[] } | null;
 }
 
 /** Inputs shared by both platform adaptations' shellLogDirFor. */

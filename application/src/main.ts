@@ -8,7 +8,7 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, Notification, session, shell as electronShell, Tray } from "electron";
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createConnection, createServer } from "node:net";
 import { dirname, join } from "node:path";
 import { bootstrapPackaged, needsUnpack, packagedEnv, packagedPaths, type PackagedPaths } from "./bootstrap.ts";
@@ -23,6 +23,7 @@ import {
   portsForEpoch, probeHealthyEpoch, stackEnvForPorts, uiUrlForPorts, type StackPorts,
 } from "./ports.ts";
 import { parseRegDword, parseRegQueryValue, parseScutilProxy, proxyEnvFromSystem, type SystemProxySettings as SystemProxySettingsT } from "./proxy.ts";
+import { uninstallFootprints, type DataFootprint } from "./uninstall-data.ts";
 import { COLD_BACKEND_TIMEOUT_MS, killStackTree, spawnStack, startupBudgetMs, summarizeStackFailure, waitHealthy, waitHealthyOrExited, type StackHandle } from "./stack.ts";
 import { shouldRetryUiLoad, UI_LOAD_RETRY_LIMIT, uiLoadRetryDelayMs, waitForUiOrigin } from "./ui-retry.ts";
 import { loadWindowState, saveWindowState } from "./window-state.ts";
@@ -1601,6 +1602,83 @@ void app.whenReady().then(async () => {
   persistedWizard = wizardState;
   wizardMode = needsWizard(wizardState);
 
+  // --- Uninstall & data-cleanup dialog (darwin-only menu entry) ------------
+  // D4 §8: mac has no uninstaller UI (drag-to-trash is the platform
+  // convention), but "drag removes only the .app, data stays" deserves an
+  // in-app place to be *told* — and deep-clean needed a discoverable entry
+  // that does not depend on an external FAQ site. Scope matches the NSIS
+  // "also delete user data" checkbox exactly (main data dir + Library
+  // scatter); the dialog never deletes without TWO explicit confirmations.
+  const showUninstallDialog = (): void => {
+    const dataDir = effectiveDataDir(process.env, persistedWizard);
+    const footprints = uninstallFootprints(dataDir, app.getPath("home"), IS_DARWIN ? "darwin" : "win32");
+    const lines = footprints.map(f => `• ${f.label}\n  ${f.path ?? "（未知位置——数据目录未配置）"}`);
+    const detail = [
+      "卸载（拖废纸篓）只会移除应用本体，以上用户数据默认保留。",
+      "",
+      "如需在卸载前彻底清理，可点「删除全部用户数据」——",
+      "该操作不可恢复，删除后所有会话、密钥与设置将丢失。",
+      "",
+      "「打开数据目录」可在删除前查看这些位置的实际内容。",
+    ].join("\n");
+    void dialog.showMessageBox({
+      type: "info",
+      title: "卸载与数据清理",
+      message: "卸载 ScienceDiscovery",
+      detail: `${lines.join("\n\n")}\n\n${detail}`,
+      buttons: ["打开数据目录", "删除全部用户数据…", "关闭"],
+      defaultId: 2,
+      cancelId: 2,
+      noLink: true,
+    }).then(({ response }) => {
+      if (response === 0) {
+        const target = dataDir ?? app.getPath("home");
+        logToDisk(`uninstall dialog: opening data dir ${target}`);
+        void electronShell.openPath(target);
+        return;
+      }
+      if (response !== 1) return;
+      // First confirmation: name the exact scope with sizes where known.
+      const scopeList = footprints.map(f => `• ${f.path ?? f.label}`).join("\n");
+      void dialog.showMessageBox({
+        type: "warning",
+        title: "删除全部用户数据",
+        message: "确认删除以下全部数据？",
+        detail: `${scopeList}\n\n此操作不可恢复。删除后应用将回到首次启动状态。`,
+        buttons: ["取消", "仍要删除"],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true,
+      }).then(({ response: r2 }) => {
+        if (r2 !== 1) return;
+        // Second confirmation: typed-in-the-face severity framing.
+        void dialog.showMessageBox({
+          type: "warning",
+          title: "最后确认",
+          message: "真的要删除全部用户数据吗？",
+          detail: "将立即删除所有会话、模型密钥、运行环境与设置。\n点击「删除并退出」后应用会退出，数据被永久移除。",
+          buttons: ["取消", "删除并退出"],
+          defaultId: 0,
+          cancelId: 0,
+          noLink: true,
+        }).then(({ response: r3 }) => {
+          if (r3 !== 1) return;
+          logToDisk(`uninstall dialog: deep-clean confirmed, removing ${footprints.length} footprint(s)`);
+          for (const f of footprints) {
+            if (!f.path) continue;
+            try {
+              if (existsSync(f.path)) rmSync(f.path, { recursive: true, force: true });
+              logToDisk(`uninstall dialog: removed ${f.path}`);
+            } catch (err) {
+              logToDisk(`uninstall dialog: FAILED to remove ${f.path}: ${String(err)}`);
+            }
+          }
+          app.quit();
+        });
+      });
+    });
+  };
+
   // win32: no app menu bar — production users need none of it (reload/
   // devtools/zoom are developer affordances; quitting stays on the tray).
   // null clears the menu bar entirely; the tray context menu below is
@@ -1611,12 +1689,20 @@ void app.whenReady().then(async () => {
   if (shouldInstallRoleMenu(IS_DARWIN ? "darwin" : "win32")) {
     const spec = darwinRoleMenu(!app.isPackaged);
     const entry = (e: { role?: string; separator?: boolean }): Electron.MenuItemConstructorOptions =>
-      e.separator === true ? { type: "separator" } : { role: e.role as Electron.MenuItemConstructorOptions["role"] };
+      e.separator === true
+        ? { type: "separator" }
+        : e.role === "__sd_uninstall_data__"
+          ? {
+              label: "卸载与数据清理…",
+              click: () => showUninstallDialog(),
+            }
+          : { role: e.role as Electron.MenuItemConstructorOptions["role"] };
     Menu.setApplicationMenu(Menu.buildFromTemplate([
       { ...spec.appMenu, submenu: spec.appMenu.submenu.map(entry) },
       { ...spec.editMenu, submenu: spec.editMenu.submenu.map(entry) },
       ...(spec.viewMenu ? [{ ...spec.viewMenu, submenu: spec.viewMenu.submenu.map(entry) }] : []),
       { ...spec.windowMenu, submenu: spec.windowMenu.submenu.map(entry) },
+      ...(spec.helpMenu ? [{ label: spec.helpMenu.label, submenu: spec.helpMenu.submenu.map(entry) }] : []),
     ]));
   } else {
     Menu.setApplicationMenu(null);
