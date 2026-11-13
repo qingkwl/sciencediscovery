@@ -74,6 +74,17 @@ mac:
   entitlements: build/entitlements.mac.plist
   entitlementsInherit: build/entitlements.mac.plist
   artifactName: ScienceDiscovery-${version}-mac-${arch}.${ext}
+  # [mac-desktop] W23 — .pyc files are Python bytecode (DATA files), but
+  # isbinaryfile@4's magic sniff classifies them as Mach-O binaries, so the
+  # signer walks ~40k .pyc files one-by-one with a --timestamp round-trip to
+  # Apple per file: the 2026-11-13 signed build spent 47+ minutes inside
+  # lark_oapi alone (thousands of packages still ahead). signIgnore feeds
+  # osx-sign's shouldIgnoreFilePath — skipped files stay in the bundle and
+  # remain covered by the CodeResources seal hashes, so notarization and
+  # Gatekeeper are unaffected (only per-file ad-hoc signature entries, which
+  # data files never need, are skipped). Same treatment as .kext upstream.
+  signIgnore:
+    - \.pyc$
 
 dmg:
   # Standard drag-to-Applications layout: app on the left, /Applications alias
