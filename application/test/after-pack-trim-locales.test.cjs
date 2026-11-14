@@ -32,6 +32,24 @@ function workspace(paks) {
   return { context: { appOutDir }, localesDir };
 }
 
+/** [mac-desktop] W28: darwin's staging shape — one <locale>.lproj dir per
+ *  locale, each holding locale.pak, nested under the framework Resources dir.
+ *  The hook removes whole .lproj dirs on darwin (they double as Launch
+ *  Services locale declarations). NOTE the naming: darwin .lproj dirs use
+ *  Electron's underscore form (en / zh_CN / zh_TW), not the dash form of
+ *  win32's flat paks — verified against a real electron-builder 37 staging. */
+function darwinWorkspace(lprojs) {
+  const appOutDir = mkdtempSync(join(tmpdir(), "sd-locales-mac-"));
+  const resourcesDir = join(appOutDir, "ScienceDiscovery.app", "Contents",
+    "Frameworks", "Electron Framework.framework", "Versions", "A", "Resources");
+  mkdirSync(resourcesDir, { recursive: true });
+  for (const name of lprojs) {
+    mkdirSync(join(resourcesDir, name), { recursive: true });
+    writeFileSync(join(resourcesDir, name, "locale.pak"), "");
+  }
+  return { context: { appOutDir }, resourcesDir };
+}
+
 test("trims every pak except en-US/zh-CN/zh-TW and leaves non-paks alone", async () => {
   const { context, localesDir } = workspace([
     "en-US.pak", "zh-CN.pak", "zh-TW.pak",
@@ -52,9 +70,59 @@ test("a missing locales dir fails the build instead of silently skipping the tri
   try {
     await assert.rejects(
       () => hook({ appOutDir }),
-      /locales dir not present/,
+      /no locale staging found/,
       "the hook returned successfully on a missing locales dir; the ~30 MB W4 win is silently lost again",
     );
+  } finally { rmSync(appOutDir, { recursive: true, force: true }); }
+});
+
+test("[mac] trims whole .lproj dirs except en/zh_CN/zh_TW on the darwin layout", async () => {
+  // W28: darwin stages one <locale>.lproj dir per locale (Electron's
+  // underscore naming) under the framework Resources dir; the hook removes
+  // them whole (pak + Launch Services declaration together). Non-lproj
+  // entries in Resources must survive.
+  const { context, resourcesDir } = darwinWorkspace([
+    "en.lproj", "zh_CN.lproj", "zh_TW.lproj",
+    "de.lproj", "ja.lproj", "fr.lproj", "zh_HK.lproj",
+  ]);
+  try {
+    writeFileSync(join(resourcesDir, "Info.plist"), "not a locale");
+    await hook(context);
+    const left = readdirSync(resourcesDir).sort();
+    assert.deepEqual(left, ["Info.plist", "en.lproj", "zh_CN.lproj", "zh_TW.lproj"]);
+  } finally { rmSync(context.appOutDir, { recursive: true, force: true }); }
+});
+
+test("[mac] a darwin staging without en/zh_CN fails the verification", async () => {
+  // The trim loop alone would succeed (nothing kept is also nothing removed
+  // wrongly), but the product would boot without its UI locales — the
+  // dialect-aware verification must catch it.
+  const { context } = darwinWorkspace(["zh_TW.lproj", "de.lproj", "ja.lproj"]);
+  try {
+    await assert.rejects(
+      () => hook(context),
+      /trim verification failed: .*missing=\[en\.lproj, zh_CN\.lproj\]/,
+      "a darwin staging without en/zh_CN passed the post-trim verification",
+    );
+  } finally { rmSync(context.appOutDir, { recursive: true, force: true }); }
+});
+
+test("[mac] a darwin Resources dir without .lproj children is not claimed as staging", async () => {
+  // The darwin candidate requires actual .lproj dirs; an appOutDir that has
+  // neither the flat locales/ dir nor .lproj dirs must fail as missing
+  // staging, not trim some unrelated Resources content.
+  const appOutDir = mkdtempSync(join(tmpdir(), "sd-locales-mac-"));
+  const resourcesDir = join(appOutDir, "ScienceDiscovery.app", "Contents",
+    "Frameworks", "Electron Framework.framework", "Versions", "A", "Resources");
+  mkdirSync(resourcesDir, { recursive: true });
+  writeFileSync(join(resourcesDir, "Info.plist"), "");
+  try {
+    await assert.rejects(
+      () => hook({ appOutDir }),
+      /no locale staging found/,
+      "the hook claimed a .lproj-less Resources dir as locale staging",
+    );
+    assert.equal(readdirSync(resourcesDir).length, 1, "the hook touched non-locale content");
   } finally { rmSync(appOutDir, { recursive: true, force: true }); }
 });
 
@@ -66,9 +134,10 @@ test("a leftover pak the trim should have removed fails the post-trim verificati
     const hookSource = require("node:fs").readFileSync(require.resolve("../scripts/after-pack-trim-locales.cjs"), "utf8");
     // Run the real hook but with a KEEP that admits de.pak, then assert the
     // verification (which uses its OWN expectation) still fails the build.
+    // W28: KEEP now covers both dialects (dash-paks + underscore-lproj).
     const loosened = hookSource.replace(
-      "const KEEP = /^(en-US|zh-CN|zh-TW)\\.pak$/;",
-      "const KEEP = /^(en-US|zh-CN|zh-TW|de)\\.pak$/;",
+      "const KEEP = /^(en-US|zh-CN|zh-TW)\\.pak$|^(en|zh_CN|zh_TW)\\.lproj$/;",
+      "const KEEP = /^(en-US|zh-CN|zh-TW|de)\\.pak$|^(en|zh_CN|zh_TW|de)\\.lproj$/;",
     );
     assert.notEqual(loosened, hookSource, "the KEEP anchor changed shape; update this guard");
     const sandbox = join(context.appOutDir, "sandbox.cjs");
@@ -76,7 +145,7 @@ test("a leftover pak the trim should have removed fails the post-trim verificati
     const loosenedHook = require(sandbox).default;
     await assert.rejects(
       () => loosenedHook(context),
-      /trim verification failed: 4 \.pak remaining .*de\.pak/,
+      /trim verification failed: flat staging kept .*de\.pak/,
       "the post-trim verification did not catch a pak the trim should have removed",
     );
   } finally { rmSync(context.appOutDir, { recursive: true, force: true }); }
@@ -100,11 +169,12 @@ test("the verification expectation is independent of the KEEP regex", async () =
   // `!KEEP.test(name)` (reusing the trim's own regex), a KEEP regression
   // passes trim AND verification together — the hole the mutation test above
   // exercises. Pin that the verification reads counts and a membership list,
-  // not the regex.
+  // not the regex. W28: the count cap now lives per dialect
+  // (flatKept.length > 3 / lprojKept.length > 3) with its own membership list.
   const hookSource = require("node:fs").readFileSync(require.resolve("../scripts/after-pack-trim-locales.cjs"), "utf8");
   const verification = hookSource.slice(hookSource.indexOf("Post-trim assertion"));
-  assert.ok(/remaining\.length > 3/.test(verification),
-    "the verification no longer caps the .pak count; a KEEP-regex-only check re-opens the hole");
+  assert.ok(/flatKept\.length > 3/.test(verification) && /lprojKept\.length > 3/.test(verification),
+    "the verification no longer caps the locale count per dialect; a KEEP-regex-only check re-opens the hole");
   assert.ok(!/!KEEP\.test/.test(verification),
     "the verification reuses the KEEP regex; a KEEP regression would pass trim and check together");
 });
