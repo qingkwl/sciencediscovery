@@ -134,9 +134,12 @@ else
   SRC_ARGS=()
   [ -n "${MICROMAMBA_SOURCE:-}" ] && SRC_ARGS=(--source "$MICROMAMBA_SOURCE")
   # --output is the FULL target file path (fetch renames onto it atomically).
+  # ${SRC_ARGS[@]+...} guard: /bin/bash on macOS is 3.2, where "set -u" +
+  # empty-array expansion "${SRC_ARGS[@]}" is a fatal unbound-variable error
+  # (fixed upstream in bash 4.4) — the guard expands only when non-empty.
   ( cd "$REPO_ROOT" && node scripts/fetch-managed-micromamba.mjs \
       --arch "$ARCH" --platform darwin \
-      --output "$MICROMAMBA_BIN" "${SRC_ARGS[@]}" \
+      --output "$MICROMAMBA_BIN" ${SRC_ARGS[@]+"${SRC_ARGS[@]}"} \
   ) || die "micromamba fetch failed (GitHub releases 502 in bursts — retry; or MICROMAMBA_SOURCE=/path/to/micromamba to reuse a local copy)"
   [ -x "$MICROMAMBA_BIN" ] || die "fetch claimed success but $MICROMAMBA_BIN is missing"
   echo "micromamba OK: $($MICROMAMBA_BIN --version)"
