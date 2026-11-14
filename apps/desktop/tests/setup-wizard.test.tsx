@@ -84,6 +84,21 @@ describe("the first-run setup wizard", () => {
     assert.ok(!markup.includes(TEXT.wizard.testAndContinue));
   });
 
+  it("lists the Seatbelt row as item 0 of the environment check (B2-2)", () => {
+    // Static rendering runs no effect, so the list itself only appears after
+    // the starting phase; the items registry still drives what CAN appear.
+    // The TEXT contract is what the fail-closed page quotes verbatim.
+    assert.ok(TEXT.wizard.boot.items.seatbelt);
+    assert.ok(TEXT.wizard.boot.seatbeltFailedTitle);
+    assert.ok(TEXT.wizard.boot.seatbeltRetryHint.includes("重启"));
+    // zh + en both define the row (the shell renders whichever locale the
+    // SPA loaded; a missing key would render "undefined" in one language).
+    const itemsOrder = (Object.keys(TEXT.wizard.boot.items) as string[]).filter(k =>
+      ["seatbelt", "api", "runner", "model"].includes(k));
+    assert.deepEqual(itemsOrder, ["seatbelt", "api", "runner", "model"],
+      "Seatbelt is item 0, before API/runner/model");
+  });
+
   it("is a model step whose final action waits for a successful test", () => {
     const markup = renderToStaticMarkup(
       <SetupWizard
