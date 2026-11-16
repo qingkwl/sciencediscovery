@@ -39,6 +39,22 @@ export const ZH = {
     omissionsSummary: (count: number) => `未包含 ${count} 个工作区文件`, download: "下载", preparing: "正在后台准备证据包…", close: "关闭", copyMissing: "复制任务对应的会话或操作记录已不存在，已停止等待。请重新创建续聊。", copyPollingFailed: "暂时无法读取复制进度，已停止重试。请稍后刷新或重新操作。", legacyUnavailable: "本地服务暂时不可用，正在重试…", exportPollingFailed: "暂时无法读取导出进度，已停止重试。请稍后重新导出。", exportMissing: "导出任务已不存在，请重新导出。",
     necessary: "必要导出", complete: "完整导出", necessaryHint: "保留当前结果、输入依赖与相关证据，精简可选历史。", completeHint: "保留所选范围内的已有历史和版本。", graph: "包含完整科学记忆图谱", estimate: "预计大小（未压缩）", calculating: "正在计算范围与大小…", files: "工作区文件", omissions: "范围与省略说明", evidenceOnly: "证据包用于检查和继续研究；导入不会执行代码或恢复历史授权。", choose: "选择 .sdresearch 研究包", objects: "个内容对象", importHint: "恢复会话、文件和研究证据为只读快照。继续研究将创建独立的新会话。原始记录保留不变。", branchHint: "新分支保留所选回复及之前的对话与可恢复研究证据，不包含之后的内容；原会话保持不变。", reply: "分支起点", working: "正在处理…", startExport: "开始后台导出", confirmImport: "确认导入", exportSaving: "正在保存证据包…", exportSaved: "证据包已保存", exportSaveFailed: "保存证据包失败", exportCanceled: "已取消导出", openLocation: "打开文件位置", exportsInProgress: (count: number) => `${count} 个导出进行中`, retrySave: "重新保存", savedExports: "已保存的会话包",
   },
+  /** 导出记录: the study packages this machine has saved, reachable again after
+   *  the export dialog closed or the app restarted (#1154). */
+  exportHistory: {
+    title: "导出记录",
+    description: "本机保存过的研究包，可从这里找回",
+    heading: "已保存的研究包",
+    empty: "还没有保存过研究包。",
+    noMatch: "没有符合筛选条件的研究包。",
+    unavailable: "导出记录只在桌面应用内可用。",
+    searchPlaceholder: "搜索文件名或会话",
+    allProjects: "全部项目",
+    missing: "文件已被移动或删除",
+    reveal: "打开文件位置",
+    forget: "移除记录",
+    revealMissing: "文件已被移动或删除，可以从记录里移除它。",
+  },
   appName: "ScienceDiscovery",
   /** The BCP 47 tag the language calls itself, for `Intl` and `<html lang>`. */
   languageTag: "zh-CN",
@@ -93,6 +109,7 @@ export const ZH = {
   },
 
   sessionBar: {
+    export: "导出",
     workspaceToggle: "工作区面板",
     sessionMenu: "会话菜单",
     sessionTitle: "会话名称",
@@ -523,13 +540,17 @@ export const ZH = {
       timeoutTitle: "部分组件未就绪",
       timeoutSub: "执行引擎首次准备可能较慢；可等待后重新检查。",
       fallbackError: "未知原因。可查看日志后重试；杀毒软件可能拦截了环境准备。",
+      seatbeltFailedTitle: "未检测到 macOS 沙箱（Seatbelt）",
+      seatbeltRetryHint: "若刚解除 MDM 限制或修改了系统配置，请重启应用后重新检测。",
       items: {
+        seatbelt: "macOS 沙箱（Seatbelt）",
         api: "本地 API 服务",
         runner: "执行引擎（Python 运行环境）",
         model: "默认任务模型（可选，可稍后在设置中配置）",
       },
       notChecked: "未检查",
       runnerNeedsToken: "未检查（需要令牌）",
+      seatbeltNotApplicable: "未检查（仅 macOS 提供沙箱）",
       retry: "重新检查",
       retryBoot: "重试",
       logs: "打开日志文件夹",
@@ -911,6 +932,7 @@ export const ZH = {
         "sandbox-network": { label: "网络", description: "run_shell 的网络访问" },
         remote: { label: "远程", description: "远端 Runner 与项目可用机器" },
         timeouts: { label: "超时", description: "墙钟限制与不限模式" },
+        "export-history": { label: "导出记录", description: "本机保存过的研究包" },
       },
       global: {
         modelHeading: "主模型",
