@@ -5,7 +5,14 @@ import type { ResearchPackageExportProfile } from "@sciencediscovery/research-pa
 import { ApiStatusError } from "./http/api-status-error.js";
 
 export type ExportPreviewOptions = { projectId: string; sessionId?: string; level: "necessary" | "complete"; selectedFiles?: Set<string>; includeFullTrajectory: boolean; includeFullMemoryGraph?: boolean };
-export type ResearchExportPreview = { revision: string; estimatedBytes: number; estimateKind: "uncompressed"; files: Array<{ path: string; size: number; selected?: boolean }>; omissions: string[]; exportProfile?: ResearchPackageExportProfile };
+export type ResearchExportPreview = {
+  revision: string; estimatedBytes: number; estimateKind: "uncompressed";
+  files: Array<{ path: string; size: number; selected?: boolean }>; omissions: string[]; exportProfile?: ResearchPackageExportProfile;
+  /** The one package cap (#1152). Additive: older clients keep their own default. */
+  maxBytes?: number;
+  /** The exact uncompressed tar size this selection would produce, which is what a refusal is based on. */
+  archiveBytes?: number;
+};
 export type DefaultExportPreviews = {
   revision: string;
   necessary: ResearchExportPreview;
@@ -16,6 +23,16 @@ export type DefaultExportPreviews = {
 };
 type WarmMemo = { revision?: string; allowed?: boolean; pendingRevision?: string; pending?: Promise<boolean> };
 const WATCH_IDLE_MS = 30_000;
+
+// There is deliberately no wall-clock budget on `defaults()`. A slow preview and a
+// pathological one look identical from the clock: the first-install fixture in
+// `research-package-http.test.ts` takes ~49 s for one dialog's five profiles, so a
+// threshold low enough to cut a genuinely pathological preview also answers 202 to
+// work that was about to finish. What the dialog needed was to stop lying about
+// the wait — the client names its own cancellation and shows a retrying state —
+// and what the service needed was to stop serialising every session behind one
+// chain. A pending-for-slow rule has to key off queue starvation rather than
+// elapsed time, and that is a separate change.
 
 const isMissingPreviewFile = (error: unknown): boolean =>
   typeof error === "object" && error !== null && (error as NodeJS.ErrnoException).code === "ENOENT";
@@ -34,11 +51,28 @@ export class ResearchExportPreviews {
   private readonly watching = new Map<string, { projectId: string; sessionId: string; lastSeenAt: number }>();
   private readonly revisions = new Map<string, Promise<string>>();
   private readonly controllers = new Map<AbortController, ExportPreviewOptions>();
-  private queue: Promise<unknown> = Promise.resolve();
+  /**
+   * One serial chain *per session*, not one for the whole service.
+   *
+   * The five profiles a dialog asks for share a session's evidence and must stay
+   * ordered against each other — the intra-session hazard below (awaiting a
+   * queue entry admitted later would deadlock) is unchanged, because within one
+   * session the ordering is exactly what it was. What changes is that session A's
+   * dialog no longer serialises behind session B's, and an aborted dialog cannot
+   * make the next session wait behind work nobody wants (#1140 §7.5).
+   */
+  private readonly queues = new Map<string, Promise<unknown>>();
   private closed = false;
   private ticking = false;
   constructor(private readonly revision: (projectId: string, sessionId?: string) => Promise<string>,
-    private readonly calculate: (options: ExportPreviewOptions, revision: string, signal: AbortSignal) => Promise<ResearchExportPreview>,
+    /**
+   * @param scope Opaque per-request state, created by `defaults()` for its five
+   *   profiles. It exists so work that is only valid within one dialog request — the
+   *   complete workspace listing — is shared across those five calls and cannot leak
+   *   into the next request, where the workspace may have changed.
+   */
+  private readonly calculate: (options: ExportPreviewOptions, revision: string, signal: AbortSignal,
+    scope?: Map<string, unknown>) => Promise<ResearchExportPreview>,
     private readonly canWarm: (projectId: string, sessionId: string) => Promise<boolean> = async () => true,
     private readonly now: () => number = () => Date.now()) {}
 
@@ -104,9 +138,10 @@ export class ResearchExportPreviews {
     return current;
   }
 
-  async get(options: ExportPreviewOptions, deferWhileRunning = false, memo?: WarmMemo): Promise<ResearchExportPreview> {
+  async get(options: ExportPreviewOptions, deferWhileRunning = false, memo?: WarmMemo,
+    scope?: Map<string, unknown>): Promise<ResearchExportPreview> {
     for (let attempt = 0; ; attempt++) {
-      try { return await this.getAttempt(options, deferWhileRunning, memo); }
+      try { return await this.getAttempt(options, deferWhileRunning, memo, scope); }
       catch (error) {
         // A run can begin after admission but before trajectory/CAS files are
         // published, so a read inside the preview can hit a file that is not on
@@ -125,7 +160,8 @@ export class ResearchExportPreviews {
     }
   }
 
-  private async getAttempt(options: ExportPreviewOptions, deferWhileRunning: boolean, memo?: WarmMemo): Promise<ResearchExportPreview> {
+  private async getAttempt(options: ExportPreviewOptions, deferWhileRunning: boolean, memo?: WarmMemo,
+    scope?: Map<string, unknown>): Promise<ResearchExportPreview> {
     const admitted = await this.assertCanCalculate(options, deferWhileRunning, memo);
     if (this.closed) throw serviceClosed();
     const revision = admitted ?? await this.currentRevision(options.projectId, options.sessionId);
@@ -136,7 +172,9 @@ export class ResearchExportPreviews {
     const controller = new AbortController();
     this.controllers.set(controller, options);
     const signal = controller.signal;
-    const work = this.queue.then(async () => {
+    const queueKey = `${options.projectId}:${options.sessionId ?? ""}`;
+    const tail = this.queues.get(queueKey) ?? Promise.resolve();
+    const work = tail.then(async () => {
       await setImmediate();
       signal.throwIfAborted();
       if (this.closed) throw serviceClosed();
@@ -153,7 +191,7 @@ export class ResearchExportPreviews {
         const existing = this.entries.get(this.key(options, current));
         const ready = existing && this.completed.get(existing);
         if (ready) return ready;
-        const result = await this.calculate(options, current, signal);
+        const result = await this.calculate(options, current, signal, scope);
         signal.throwIfAborted();
         await this.assertCanCalculate(options, deferWhileRunning, memo);
         signal.throwIfAborted();
@@ -177,7 +215,11 @@ export class ResearchExportPreviews {
       signal.throwIfAborted();
       throw error;
     });
-    this.queue = work.catch(() => undefined);
+    const next = work.catch(() => undefined);
+    this.queues.set(queueKey, next);
+    // Drop the chain once it is idle, so a long-lived service does not keep one
+    // settled promise per session it has ever served.
+    void next.then(() => { if (this.queues.get(queueKey) === next) this.queues.delete(queueKey); });
     this.remember(key, work);
     void work.finally(() => this.controllers.delete(controller)).catch(() => {
       if (this.entries.get(key) === work) this.entries.delete(key);
@@ -187,12 +229,16 @@ export class ResearchExportPreviews {
 
   async defaults(projectId: string, sessionId: string, deferWhileRunning = false, memo: WarmMemo = {}): Promise<DefaultExportPreviews> {
     for (let attempt = 0; attempt < 3; attempt++) {
+      // One scope per attempt: the five profiles below ask about the same workspace,
+      // and it is the same request, so the scan and the catalog write happen once.
+      // A retry gets a fresh scope.
+      const scope = new Map<string, unknown>();
       const [necessary, complete, completeWithTrajectory, completeWithMemoryGraph, completeWithTrajectoryAndMemoryGraph] = await Promise.all([
-        this.get({ projectId, sessionId, level: "necessary", includeFullTrajectory: false, includeFullMemoryGraph: false }, deferWhileRunning, memo),
-        this.get({ projectId, sessionId, level: "complete", includeFullTrajectory: false, includeFullMemoryGraph: false }, deferWhileRunning, memo),
-        this.get({ projectId, sessionId, level: "complete", includeFullTrajectory: true, includeFullMemoryGraph: false }, deferWhileRunning, memo),
-        this.get({ projectId, sessionId, level: "complete", includeFullTrajectory: false, includeFullMemoryGraph: true }, deferWhileRunning, memo),
-        this.get({ projectId, sessionId, level: "complete", includeFullTrajectory: true, includeFullMemoryGraph: true }, deferWhileRunning, memo),
+        this.get({ projectId, sessionId, level: "necessary", includeFullTrajectory: false, includeFullMemoryGraph: false }, deferWhileRunning, memo, scope),
+        this.get({ projectId, sessionId, level: "complete", includeFullTrajectory: false, includeFullMemoryGraph: false }, deferWhileRunning, memo, scope),
+        this.get({ projectId, sessionId, level: "complete", includeFullTrajectory: true, includeFullMemoryGraph: false }, deferWhileRunning, memo, scope),
+        this.get({ projectId, sessionId, level: "complete", includeFullTrajectory: false, includeFullMemoryGraph: true }, deferWhileRunning, memo, scope),
+        this.get({ projectId, sessionId, level: "complete", includeFullTrajectory: true, includeFullMemoryGraph: true }, deferWhileRunning, memo, scope),
       ]);
       if ([complete, completeWithTrajectory, completeWithMemoryGraph, completeWithTrajectoryAndMemoryGraph].every((preview) => preview.revision === necessary.revision))
         return { revision: necessary.revision, necessary, complete, completeWithTrajectory, completeWithMemoryGraph, completeWithTrajectoryAndMemoryGraph };
@@ -236,6 +282,6 @@ export class ResearchExportPreviews {
     this.closed = true; this.watching.clear(); this.entries.clear();
     for (const controller of this.controllers.keys()) controller.abort(serviceClosed());
     // Finish admitted work before its store or workspace can be disposed.
-    await Promise.allSettled([this.queue, ...this.revisions.values()]);
+    await Promise.allSettled([...this.queues.values(), ...this.revisions.values()]);
   }
 }
