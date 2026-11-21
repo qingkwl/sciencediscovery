@@ -53,6 +53,55 @@ interface SdShellJiuwen {
    *  and the startup flow before loading this SPA (constant true from the
    *  preload; absent in a plain browser). */
   wizardIntroDone?: boolean;
+  /** [mac-direct] The installation-level opt-in, exposed only where it
+   *  exists (a darwin shell). A plain browser has no bridge; a win32 shell
+   *  answers `available: false` because it hard-sets the env flag this
+   *  switch would imply. */
+  directExecution?: {
+    get: () => Promise<{ available: boolean; enabled: boolean }>;
+    set: (enabled: boolean) => Promise<{ available: boolean; enabled: boolean }>;
+  };
+}
+
+/**
+ * The [mac-direct] opt-in as a settings-row state machine.
+ *
+ * `available` is false and stays false in a plain browser and on every shell
+ * that does not offer the switch, so the row never renders there. On a shell
+ * that does, the value comes back from the main process's re-read of its
+ * persisted file — including the bounce-back when a write failed — and a
+ * write re-renders from the reply alone (no refetch: the reply IS the
+ * post-write truth).
+ */
+export function useShellDirectExecution(): {
+  available: boolean;
+  enabled: boolean;
+  setEnabled: (next: boolean) => void;
+} {
+  const [state, setState] = useState<{ available: boolean; enabled: boolean }>({ available: false, enabled: false });
+
+  const shell = (window as typeof window & { sdShell?: SdShellJiuwen }).sdShell;
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!shell?.directExecution) return;
+    void shell.directExecution.get().then((answer) => {
+      if (!cancelled) setState(answer);
+    }).catch(() => { /* no switch to show: keep available=false */ });
+    return () => { cancelled = true; };
+    // The preload installs window.sdShell before any app code runs, so its
+    // identity is stable for the page lifetime; "shell" is a module-level read.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const setEnabled = (next: boolean) => {
+    void shell?.directExecution?.set(next).then((answer) => setState(answer)).catch(() => {
+      // A failed write leaves the row where it was; the re-read on next
+      // mount still tells the truth.
+    });
+  };
+
+  return { available: state.available, enabled: state.enabled, setEnabled };
 }
 
 /**

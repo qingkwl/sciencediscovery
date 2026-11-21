@@ -60,23 +60,35 @@ async function fetchSettings(
 /** Run once; the wizard page polls until green or gives up (env provisioning).
  * `seatbeltProbe` (optional, B2-2) is a pre-computed verdict from
  * sandbox-probe.ts's runSeatbeltProbe; omitting it (a plain browser path with
- * no shell bridge) reports "unknown", which never gates. */
+ * no shell bridge) reports "unknown", which never gates.
+ * `directOptIn` ([mac-direct], optional): a darwin installation that opted
+ * into direct execution was promised unsandboxed candidates, so a FAILED
+ * probe is reported as "ok" with the failure kept in the reason fields — the
+ * wizard page shows the same banner copy for both verdicts and nothing here
+ * contradicts what the user chose in 设置. Default installs keep the
+ * fail-closed short-circuit below. */
 export async function runSelfCheck(
   apiBase: string, token: string, runnerBase: string | null, fetchImpl: WizardFetch,
   seatbeltProbe?: { kind: "ok" | "failed" | "not-applicable" } & Partial<{
     reason: string; diagnostics: string[];
   }>,
+  directOptIn = false,
 ): Promise<SelfCheckResult> {
-  const seatbelt = seatbeltProbe?.kind === "ok" || seatbeltProbe?.kind === "failed"
-    ? seatbeltProbe.kind
-    : seatbeltProbe?.kind === "not-applicable"
-      ? "not-applicable"
-      : "unknown";
-  // reason/diagnostics are failure-page payload: only a "failed" verdict
-  // carries them (ok/not-applicable verdicts have nothing to explain).
-  const seatbeltDetail = seatbelt === "failed" ? {
-    ...(seatbeltProbe?.reason ? { seatbeltReason: seatbeltProbe.reason } : {}),
-    ...(seatbeltProbe?.diagnostics?.length ? { seatbeltDiagnostics: seatbeltProbe.diagnostics } : {}),
+  const probeKind = directOptIn && seatbeltProbe?.kind === "failed" ? "ok" as const : null;
+  const seatbelt = probeKind
+    ?? (seatbeltProbe?.kind === "ok" || seatbeltProbe?.kind === "failed"
+      ? seatbeltProbe.kind
+      : seatbeltProbe?.kind === "not-applicable"
+        ? "not-applicable"
+        : "unknown");
+  // reason/diagnostics are failure-page payload: they ride along whenever the
+  // probe actually failed — that includes the [mac-direct] opt-in rewrite
+  // above, where the verdict reads "ok" but the failure text stays for the
+  // page to show beside the same banner copy (ok/not-applicable/unknown
+  // verdicts that never failed have nothing to explain).
+  const seatbeltDetail = seatbeltProbe?.kind === "failed" ? {
+    ...(seatbeltProbe.reason ? { seatbeltReason: seatbeltProbe.reason } : {}),
+    ...(seatbeltProbe.diagnostics?.length ? { seatbeltDiagnostics: seatbeltProbe.diagnostics } : {}),
   } : {};
   // Fail-closed (B2-2): a failed Seatbelt verdict gates entry regardless of
   // the other components — skip the backend round-trips, the user is not

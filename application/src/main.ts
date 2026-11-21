@@ -40,6 +40,7 @@ import {
   runSelfCheck,
 } from "./wizard-api.ts";
 import { runSeatbeltProbe, seatbeltGateDecision, seatbeltErrorPageQuery, type SeatbeltVerdict } from "./sandbox-probe.ts";
+import { readDirectExecution, writeDirectExecution } from "./direct-execution.ts";
 import { setupAutoUpdate, updateEnabled } from "./updater.ts";
 import { type AgentInfo } from "./agent-ready.ts";
 // electron-updater exports a PLATFORM SINGLETON (NsisUpdater on win /
@@ -274,6 +275,27 @@ function writeShellLocale(locale: "zh-CN" | "en"): void {
     // Best-effort mirror: the fail-closed page falls back to
     // navigator.language when this is missing.
   }
+}
+
+// --- [mac-direct] installation-level opt-in -----------------------------------
+//
+// The env pair every stack spawn carries when the darwin installation opted
+// into direct candidate execution. SCIENCE_AGENT_SANDBOX_PROVIDER=none puts
+// the runner itself in direct mode (start-stack whitelists "none" and the
+// runner's own provider whitelist accepts it), and SCIENCE_AGENT_EVOLVE_
+// UNISOLATED=1 answers the evolve API's opt-in question the same way the
+// Windows shell always does. Both stay absent on a default install — Seatbelt
+// answers there, and the fail-closed probe gate is untouched. Read per spawn
+// (not cached): the settings row can flip while a stack is running, and the
+// next spawn — not this one — is what the row's "applies on restart" copy
+// promises.
+function darwinDirectEnv(): NodeJS.ProcessEnv {
+  if (!IS_DARWIN) return {};
+  if (!readDirectExecution(app.getPath("userData"))) return {};
+  return {
+    SCIENCE_AGENT_SANDBOX_PROVIDER: "none",
+    SCIENCE_AGENT_EVOLVE_UNISOLATED: "1",
+  };
 }
 
 async function loadUi(endpoints: Endpoints, token: string | null): Promise<void> {
@@ -748,6 +770,12 @@ async function ensureBackend(
       ...loopbackGuard,
       ...(proxyEnv ?? {}),
       ...inplaceEnv,
+      // [mac-direct] A darwin installation that opted in runs candidates with
+      // direct execution: the runner provider goes "none" and the evolve API
+      // reads the same opt-in through its own env flag. Every run still needs
+      // the per-run confirmation (pre-flight), so this env pair only ever
+      // opens the door the user must still knock on per run.
+      ...darwinDirectEnv(),
     };
     if (packaged && dataDir) {
       provisioningThisRun = needsUnpack(dataDir, packaged.resourcesPath);
@@ -932,9 +960,17 @@ async function startupFlow(proxyEnv: NodeJS.ProcessEnv | null): Promise<void> {
   // load-bearing: "failed" replaces the whole session with the error page
   // and never loads the SPA (upstream red line). Non-darwin hosts
   // short-circuit to not-applicable inside the probe without spawning.
-  const gate = seatbeltGateDecision(
-    await runSeatbeltProbe(process.platform, (cmd, args) => spawn(cmd, args)),
-  );
+  // [mac-direct] The one exception is a darwin installation that opted
+  // into direct execution: that user was promised "runs without the
+  // sandbox" — the probe failure no longer contradicts anything they were
+  // told — so a FAILED verdict degrades to a logged warning and the stack
+  // spawns with the direct provider pair (darwinDirectEnv). Every default
+  // install keeps the untouched fail-closed block.
+  const verdict = await runSeatbeltProbe(process.platform, (cmd, args) => spawn(cmd, args));
+  const optedInDirect = IS_DARWIN && readDirectExecution(app.getPath("userData"));
+  const gate = optedInDirect
+    ? { action: "continue" as const }
+    : seatbeltGateDecision(verdict);
   if (gate.action === "block") {
     log(`seatbelt gate FAILED: ${gate.reason}`);
     // F13: the page is a file:// origin — it cannot read the SPA's
@@ -943,6 +979,9 @@ async function startupFlow(proxyEnv: NodeJS.ProcessEnv | null): Promise<void> {
     // navigator.language when we never got one.
     await mainWindow?.loadFile(join(distDir, gate.page), { search: seatbeltErrorPageQuery(gate, readShellLocale()) });
     return;
+  }
+  if (optedInDirect && verdict.kind === "failed") {
+    log(`[mac-direct] opt-in install: Seatbelt probe FAILED, continuing with direct execution — ${verdict.reason}`);
   }
   SD_PERF("seatbelt-gate-passed");
   // Resolve the data dir first so the "connect" stage already reports the
@@ -1092,6 +1131,8 @@ async function startWizardBackend(dataDir: string, proxyEnv: NodeJS.ProcessEnv |
       ...loopbackGuard,
       ...(proxyEnv ?? {}),
       ...inplaceEnv,
+      // [mac-direct] same pair as the daily-start spawn site above.
+      ...darwinDirectEnv(),
     };
     if (packaged) {
       provisioningThisRun = needsUnpack(dataDir, packaged.resourcesPath);
@@ -1263,7 +1304,11 @@ function registerWizardIpc(proxyEnv: NodeJS.ProcessEnv | null): void {
     if (seatbeltVerdict === null) {
       seatbeltVerdict = await runSeatbeltProbe(process.platform, (cmd, args) => spawn(cmd, args));
     }
-    return runSelfCheck(base, wizardToken(), wizardRunnerBase(), fetch, seatbeltVerdict);
+    // [mac-direct] an opted-in darwin install runs unsandboxed by choice;
+    // the self-check keeps the failure in the reason payload but reports ok
+    // (wizard-api rewrites failed → ok with the same detail fields).
+    const optIn = IS_DARWIN && readDirectExecution(app.getPath("userData"));
+    return runSelfCheck(base, wizardToken(), wizardRunnerBase(), fetch, seatbeltVerdict, optIn);
   });
 
   // Optional model configuration after backend self-check passes.
@@ -1581,6 +1626,24 @@ ipcMain.handle("sd-shell:save-token", async (_event, token: string) => {
 ipcMain.handle("sd-shell:report-locale", (_event, locale: unknown) => {
   if (locale === "zh-CN" || locale === "en") writeShellLocale(locale);
   return true;
+});
+
+// --- [mac-direct] installation-level opt-in for direct execution ---------------
+// The 设置 › 通用 switch on darwin. Windows never reads or writes it (its
+// shell always sets the env flag — see packagedEnv), so the IPC pair stays
+// darwin-gated: a plain-browser SPA has no bridge anyway, and a win32 shell
+// answering "false" for a flag it hard-sets would only confuse the row out
+// of existence. The reply is the RE-READ persisted value, so a failed write
+// surfaces as "the toggle bounced back" instead of a silent stale switch.
+ipcMain.handle("sd-shell:direct-execution-get", () => ({
+  available: IS_DARWIN,
+  enabled: IS_DARWIN ? readDirectExecution(app.getPath("userData")) : false,
+}));
+ipcMain.handle("sd-shell:direct-execution-set", (_event, on: unknown) => {
+  if (!IS_DARWIN) return { available: false, enabled: false };
+  const enabled = writeDirectExecution(app.getPath("userData"), on === true);
+  log(`[mac-direct] opt-in ${enabled ? "enabled" : "disabled"} (applies on the next stack start)`);
+  return { available: true, enabled };
 });
 
 // --- study-package export: native save dialog + destination-bound save --------

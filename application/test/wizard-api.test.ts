@@ -175,6 +175,57 @@ test("a failed Seatbelt verdict gates entry fail-closed and skips backend probes
   assert.equal(calls.length, 0, "fail-closed short-circuits before any backend round-trip");
 });
 
+test("[mac-direct] a failed verdict still gates fail-closed when the opt-in is off (R-回归: default user unchanged)", async () => {
+  // directOptIn defaults to false — the exact pre-existing call shape
+  // (omitted argument) must keep the red-line block for every default
+  // install. This is the pin the whole feature's defensibility rests on.
+  const { fetchImpl, calls } = makeFetch([
+    { pattern: /\/api\/health$/, reply: () => ({ status: 200, body: { status: "ok" } }) },
+  ]);
+  const res = await runSelfCheck(BASE, TOKEN, "http://127.0.0.1:4311", fetchImpl, {
+    kind: "failed",
+    reason: "沙箱探测失败（sandbox-exec 退出码 71）",
+    diagnostics: [],
+  }, false);
+  assert.equal(res.seatbelt, "failed");
+  assert.equal(res.ok, false);
+  assert.equal(calls.length, 0);
+});
+
+test("[mac-direct] an opted-in install reports ok on a failed verdict and keeps the failure detail", async () => {
+  // The user chose unsandboxed candidates in 设置; the probe failing no
+  // longer contradicts anything they were told. The gate must NOT
+  // short-circuit here — the backend probes below still run — and the
+  // failure text stays in the payload so the page can show it.
+  const { fetchImpl, calls } = makeFetch([
+    apiHealth(READY_DETAIL),
+    RUNNER_SIDE,
+    { pattern: /\/api\/settings$/, reply: () => ({ status: 200, body: { effective: { modelId: "m" } } }) },
+  ]);
+  const res = await runSelfCheck(BASE, TOKEN, "http://127.0.0.1:4311", fetchImpl, {
+    kind: "failed",
+    reason: "沙箱探测失败（sandbox-exec 退出码 71）",
+    diagnostics: ["sandbox-exec -p '(version 1)(allow default)' /usr/bin/true"],
+  }, true);
+  assert.equal(res.seatbelt, "ok", "opt-in rewrite: failed → ok");
+  assert.equal(res.ok, true);
+  assert.equal(res.seatbeltReason?.includes("71"), true, "the failure detail is kept for display");
+  assert.deepEqual(res.seatbeltDiagnostics, ["sandbox-exec -p '(version 1)(allow default)' /usr/bin/true"]);
+  assert.ok(calls.length >= 2, "no fail-closed short-circuit: the backend probes ran");
+});
+
+test("[mac-direct] the opt-in rewrites ONLY a failed verdict; ok/not-applicable pass through untouched", async () => {
+  for (const kind of ["ok", "not-applicable"] as const) {
+    const { fetchImpl } = makeFetch([
+      apiHealth(READY_DETAIL),
+      { pattern: /\/api\/settings$/, reply: () => ({ status: 200, body: { effective: { modelId: "m" } } }) },
+    ]);
+    const res = await runSelfCheck(BASE, TOKEN, "http://127.0.0.1:4311", fetchImpl, { kind }, true);
+    assert.equal(res.seatbelt, kind);
+    assert.equal(res.ok, true);
+  }
+});
+
 test("an ok Seatbelt verdict passes through and never gates", async () => {
   const { fetchImpl } = makeFetch([
     apiHealth(READY_DETAIL),

@@ -13,9 +13,10 @@
 // limitations under the License.
 
 import { useLanguage } from "../../app/use-language.js";
+import { useShellDirectExecution } from "../../app/shell-bridge.js";
 import { setLanguage, TEXT } from "../../text.js";
 import { ListSelect } from "./ListSelect.js";
-import { Group, Row } from "./rows.js";
+import { Group, Row, Switch } from "./rows.js";
 
 /**
  * 设置 › 通用.
@@ -30,10 +31,21 @@ import { Group, Row } from "./rows.js";
  * the setting that decides what every other label on the page says, and an
  * OS-drawn popup in the system's own type and colours reads as a piece of the
  * operating system that wandered in.
+ *
+ * [mac-direct] Below the guide sits the installation-level opt-in for direct
+ * candidate execution — but only where it exists. The row asks the shell
+ * first (`useShellDirectExecution`): a darwin shell answers `available: true`
+ * and the switch renders; a Windows shell hard-sets the env flag this row
+ * would toggle, and a plain browser has no shell at all, so both hide the
+ * section rather than show a switch that does nothing. The hint carries the
+ * whole warning — what runs, with whose access, and that each run still
+ * confirms — because the switch is the only place the contract is spelled
+ * out before the first confirmation dialog.
  */
 export function GeneralSettings({ onShowGuide }: { onShowGuide: () => void }) {
   const language = useLanguage();
   const text = TEXT.settings.general.language;
+  const direct = useShellDirectExecution();
 
   return (
     <>
@@ -62,6 +74,20 @@ export function GeneralSettings({ onShowGuide }: { onShowGuide: () => void }) {
           </button>
         </Row>
       </Group>
+      {direct.available ? (
+        <Group heading={TEXT.settings.general.directExecution.heading}>
+          <Row
+            hint={TEXT.settings.general.directExecution.hint}
+            title={TEXT.settings.general.directExecution.field}
+          >
+            <Switch
+              label={TEXT.settings.general.directExecution.field}
+              onChange={direct.setEnabled}
+              value={direct.enabled}
+            />
+          </Row>
+        </Group>
+      ) : null}
     </>
   );
 }

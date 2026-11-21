@@ -216,4 +216,16 @@ contextBridge.exposeInMainWorld("sdShell", {
   exportFile,
   /** Finished exports, kept across restarts (#1154). */
   exportHistory,
+  /** [mac-direct] 设置 › 通用 reads/writes the installation-level opt-in for
+   *  direct candidate execution. Only a darwin shell answers `available: true`
+   * (Windows hard-sets the env flag it implies, a plain browser has no shell),
+   * so the settings row renders only where the answer says it exists. The
+   * write replies with the re-read persisted value — a failed write shows up
+   * as the toggle bouncing back rather than a stale switch. */
+  directExecution: {
+    get: (): Promise<{ available: boolean; enabled: boolean }> =>
+      ipcRenderer.invoke("sd-shell:direct-execution-get"),
+    set: (enabled: boolean): Promise<{ available: boolean; enabled: boolean }> =>
+      ipcRenderer.invoke("sd-shell:direct-execution-set", enabled),
+  },
 });

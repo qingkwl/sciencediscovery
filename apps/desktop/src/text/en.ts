@@ -619,6 +619,16 @@ export const EN: Text = {
         field: "Interface tour",
         action: "Replay",
       },
+      /** [mac-direct] Installation-level opt-in: with it on, evolution
+       *  candidates run with your own file, network and environment access
+       *  (no sandbox). macOS shell only; every run still asks for its own
+       *  confirmation. Copy red line: this is the user's explicit choice,
+       *  never worded as a fallback for a broken sandbox. */
+      directExecution: {
+        heading: "Evolution sandbox",
+        field: "Run candidates without a sandbox",
+        hint: "With this on, evolution candidates run with your own file, network and environment access (no sandbox). Each run still asks to confirm; applies after a restart.",
+      },
     },
     loading: "Loading…",
     retry: "Retry",
