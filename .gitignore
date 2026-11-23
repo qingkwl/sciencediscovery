@@ -103,3 +103,5 @@ data-*/
 
 # one-click packaging stamps/logs (scripts/package-sd-windows.sh)
 /.package-stamps/
+.tmp-freeze-dist/
+.tmp-freeze-work/
