@@ -62,6 +62,7 @@ PROBE_ENV = {
     "verify_gateway_mcp_config_files": "both",
     "verify_paper_worker_entry": "services",
     "verify_package_presence_matrix": "jw",
+    "verify_frozen_manifest": "both",
 }
 PROBE_ORDER = list(PROBE_ENV)
 
