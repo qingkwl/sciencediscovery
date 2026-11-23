@@ -29,7 +29,7 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { copyFile, cp, mkdir, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
-import { existsSync, lstatSync, readFileSync, readlinkSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, readlinkSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -1498,6 +1498,56 @@ const pycByRegion = {};
   topRel.length = Math.min(topRel.length, 10);
 }
 say(`A5 path budget: maxRel=${maxRel} (runtime limit ${maxRelRuntime} @ default root ${DEFAULT_ROOT_LEN}, build limit ${maxRelBuild} incl. compileall +${COMPILEALL_TEMP_MARGIN}) — longest: ${maxRelPath}`);
+
+// [D3 P3-2] A5 frozen-face report: the onedir rails' deepest paths are
+// a TREND quantity of their own — the frozen trees are what P3-3 leaves
+// behind after the venv retirement, and their maxRel (measured in the
+// same install-root-relative space, payload prefix INCLUDED) decides
+// the post-dual-rail budget. The dual-rail gate above still uses the
+// WHOLE payload max (venv trees included); this report is the leading
+// indicator for the day that shrinks. 2026-11-23 first measurement
+// (win32 sandbox build): jw=185 services=148 (payload prefixes
+// backend\jw\frozen\sd-jw\sd-jw resp. envs-template\frozen\
+// sd-services\sd-services included) — jw's deep path is
+// jiuwenswarm\agents\harness\code\rails\...\basic-information.aet.md;
+// 185 < 195 but only by 10, so the jw onedir prefix is the next
+// squeeze target if the post-retirement budget needs room (P3-3 can
+// move it to backend\f\sd-jw\, buying 9).
+{
+  const frozenMaxRel = (onedirDir) => {
+    let deepest = 0;
+    let deepestPath = "";
+    const stack = [onedirDir];
+    while (stack.length > 0) {
+      const dir = stack.pop();
+      let entries;
+      try { entries = readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+      for (const e of entries) {
+        const p = join(dir, e.name);
+        if (e.isDirectory()) { stack.push(p); continue; }
+        const rel = installRootRel(p);
+        if (rel.length > deepest) { deepest = rel.length; deepestPath = rel; }
+      }
+    }
+    return { deepest, deepestPath };
+  };
+  const faces = {
+    jw: join(jwPayload, "frozen", "sd-jw", "sd-jw"),
+    services: join(out, "envs-template", "frozen", "sd-services", "sd-services"),
+  };
+  const parts = [];
+  for (const [key, dir] of Object.entries(faces)) {
+    if (!existsSync(dir)) continue;
+    const { deepest, deepestPath } = frozenMaxRel(dir);
+    parts.push(`${key}=${deepest}`);
+    if (dialect.hasTrampolines && deepest > maxRelRuntime) {
+      fail(`A5 frozen face: onedir '${key}' maxRel=${deepest} > ${maxRelRuntime} (${deepestPath}) — the frozen rail itself breaches the budget`);
+    }
+  }
+  if (parts.length > 0) {
+    say(`A5 frozen faces: ${parts.join(", ")} (runtime limit ${maxRelRuntime}; venv-era deep paths retire with P3-3, these are what stays)`);
+  }
+}
 if (dialect.hasTrampolines && maxRel > maxRelRuntime) {
   fail(`payload path budget exceeded: maxRel=${maxRel} > ${maxRelRuntime} (over by ${maxRel - maxRelRuntime}) under the worst-case default install root (${DEFAULT_ROOT_LEN} chars).\n` +
     `  Longest paths:\n    ${topRel.map(([n, p]) => `${n}  ${p}`).join("\n    ")}\n` +

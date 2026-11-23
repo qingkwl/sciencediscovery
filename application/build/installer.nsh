@@ -287,6 +287,17 @@
 ;    why it moved this logic to a page at all), so Quit is used: it is the only
 ;    outcome whose semantics cannot be misread. Users who decline re-run the
 ;    installer and pick a shorter directory; the MessageBox text says so.
+;
+;    [D3 P3-2] Derivation: 259 (MAX_PATH usable) - 1 - maxRel = this value;
+;    maxRel comes from assemble-backend's A5 walk, printed EVERY build.
+;    Dual-rail era (2026-11-23): the venv trees still own maxRel=192 → 66
+;    stays. After P3-3 retires the venv rails the payload max becomes the
+;    FROZEN face (A5 frozen-faces line: jw=185 / services=148, win32 first
+;    measurement) → the value moves to 259-1-185 = 73 IF the jw onedir
+;    stays at backend\jw\frozen\sd-jw\ (or ~82 after the backend\f\sd-jw\
+;    squeeze noted in assemble-backend). Update BOTH sides in the same
+;    commit; a stale value here fails in the UNSAFE direction (letting
+;    roots the payload cannot fit pass the guard).
 !define SD_INSTALL_ROOT_MAX 66
 
 !macro customPageAfterChangeDir
