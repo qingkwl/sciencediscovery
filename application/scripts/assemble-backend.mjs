@@ -747,6 +747,51 @@ for (const e of await readdir(sitePackages, { withFileTypes: true })) {
 }
 
 // ---------------------------------------------------------------------------
+// 5.5 JiuwenSwarm frozen onedir (D3 P1-5)
+//
+// Build the frozen sd-jw exe from the STAGED jw src tree's venv and place it
+// at backend/jw/frozen/sd-jw/ — the layout jiuwenswarm.mjs's frozenJwExe()
+// resolves (P1-3). The venv+src staging above STAYS for the dual-rail
+// verification window (SD_JW_FREEZE=0); retirement of that staging is P3-3
+// once P4's window closes.
+//
+// Build contract: PyInstaller runs from the staged tree's OWN venv python
+// (the spec asserts this — collect_* must resolve against exactly the venv
+// the payload ships). CODEBUDDY_SAFE_DELETE_ENABLED=0: PyInstaller's build
+// cleanup triggers the sandbox safe-delete shim at bulk thresholds (lesson
+// L8), killing otherwise-successful builds.
+// ---------------------------------------------------------------------------
+const sdFreezeSpec = join(repo, "application", "scripts", "freeze", "sd-jw.spec");
+if (!existsSync(sdFreezeSpec)) {
+  fail(`D3 freeze spec missing: ${relative(out, sdFreezeSpec)}`);
+}
+{
+  const frozenOut = join(jwPayload, "frozen", "sd-jw");
+  const stagedVenvPython = join(jwPayload, ".venv", dialect.venvBin, dialect.venvPythonName);
+  if (!existsSync(stagedVenvPython)) {
+    fail(`staged jw venv python missing (freeze build source): ${relative(out, stagedVenvPython)}`);
+  }
+  say("building frozen sd-jw onedir (PyInstaller, ~6 min)");
+  try {
+    // payloadCompileEnv (the compileAll env filter, defined later at §7)
+    // is not yet in scope here; build a minimal env instead — the freeze
+    // build child needs PATH and the shim-disable, nothing else exported.
+    const freezeEnv = { ...process.env, CODEBUDDY_SAFE_DELETE_ENABLED: "0" };
+    execFileSync(stagedVenvPython, ["-m", "PyInstaller", "--distpath", frozenOut, "--workpath", join(out, "..", "freeze-work"), sdFreezeSpec, "--noconfirm"], {
+      env: freezeEnv, windowsHide: true, stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024,
+    });
+  } catch (error) {
+    const detail = (error.stdout?.toString?.() ?? "") + (error.stderr?.toString?.() ?? error.message);
+    fail(`frozen sd-jw build FAILED:\n${detail.slice(0, 4000)}`);
+  }
+  const frozenExe = join(frozenOut, "sd-jw", "sd-jw.exe");
+  if (!existsSync(frozenExe)) {
+    fail(`frozen build produced no exe: ${relative(out, frozenExe)}`);
+  }
+  say(`frozen sd-jw OK: ${relative(out, frozenExe)}`);
+}
+
+// ---------------------------------------------------------------------------
 // 6. envs-template — the 5 venvs, editable .pth paths → placeholder
 
 say("copying venv template (envs-template)");
@@ -1215,6 +1260,10 @@ runProbeCollection("sd-services venv", sdServicesVenvPython, "services");
 const requiredFiles = [
   join(jwPayload, ".sciencediscovery-patches.json"),
   join(jwPayload, ".venv", dialect.venvBin, dialect.family === "darwin" ? "jiuwenswarm-start" : "jiuwenswarm-start.exe"),
+  // [D3 P1-5] the frozen exe the P1-3 spawn rail resolves; required because
+  // the manifest is what the INSTALLER verifies — a missing onedir must
+  // fail the build here, not the first spawn on a user machine.
+  join(jwPayload, "frozen", "sd-jw", "sd-jw", "sd-jw.exe"),
   join(out, "backend", "services", "api", "dist", "server.js"),
   join(out, "backend", "services", "runner", "dist", "server.js"),
   join(out, "envs-template", "sd-services", ...dialect.sitePackages(PYTHON_MINOR).split("/"), "_editable_impl_sciencediscovery_gateway.pth"),
