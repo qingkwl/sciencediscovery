@@ -996,6 +996,10 @@ const compileAll = (pythonExe, target, exclude) =>
     ...(exclude ? ["-x", exclude] : []), target], { env: compileEnv, windowsHide: true, stdio: "pipe", maxBuffer: 64 * 1024 * 1024 });
 const basePythonExe = join(out, "python", ...dialect.bundledBasePythonPath.split("/"));
 const jwVenvPython = join(jwPayload, ".venv", dialect.venvBin, dialect.venvPythonName);
+// sd-services venv interpreter as staged in the payload (envs-template):
+// the A1b+ probe collection's --env services run uses it. Same dialect
+// resolution as jwVenvPython above.
+const sdServicesVenvPython = join(out, "envs-template", "sd-services", dialect.venvBin, dialect.venvPythonName);
 const compileTargets = [
   { label: "python stdlib", python: basePythonExe, path: join(out, "python", ...dialect.stdlibCompileTarget(PYTHON_MINOR)) },
   ...VENV_NAMES.map(name => ({ label: `venv ${name}`, python: basePythonExe, path: join(out, "envs-template", name, ...dialect.sitePackages(PYTHON_MINOR).split("/")) })),
@@ -1166,6 +1170,43 @@ try {
   const detail = (error.stdout?.toString?.() ?? "") + (error.stderr?.toString?.() ?? error.message);
   fail(`payload runtime probe FAILED (jw venv):\n${detail}`);
 }
+
+// A1b+ probe COLLECTION (D3 P0-3): the single probe above stays the
+// authority for the sweep contract; the collection below grows to cover
+// the P0-dynamic-paths inventory (A/B/C areas) one probe per dynamic
+// import path. Two runs — the payload carries TWO python trees:
+//   --env jw        upstream tree + babel chain (jwVenvPython)
+//   --env services  first-party sidecars + candidates (sdServicesVenvPython)
+// Sentinel-gated like the single probe (VERIFY_OK required, exit code
+// alone is never trusted — same lesson as W22/L51). B/C-area probes
+// land as jw src settles; the frozen plan in run_verify.py means a
+// file absent from PROBE_ORDER is drift, not a skip.
+const verifyDir = join(dirname(fileURLToPath(import.meta.url)), "verify");
+const runVerify = join(verifyDir, "run_verify.py");
+if (!existsSync(runVerify)) {
+  fail(`probe collection runner missing: ${relative(out, runVerify)}`);
+}
+function runProbeCollection(label, pythonExe, envFilter) {
+  const collectionEnv = { ...compileEnv };
+  delete collectionEnv.SD_PROBE_DEV_TREE;
+  delete collectionEnv.SD_VERIFY_TARGET;
+  collectionEnv.SD_VERIFY_TARGET = "venv";
+  try {
+    const out2 = execFileSync(pythonExe, [runVerify, "--env", envFilter], {
+      env: collectionEnv, windowsHide: true, encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"], maxBuffer: 16 * 1024 * 1024,
+    });
+    if (!/^VERIFY_OK/m.test(out2 ?? "") && !/^VERIFY_PARTIAL/m.test(out2 ?? "")) {
+      fail(`probe collection FAILED (${label}): no VERIFY_OK/VERIFY_PARTIAL sentinel\n${out2 ?? ""}`);
+    }
+    say(`probe collection OK (${label})`);
+  } catch (error) {
+    const detail = (error.stdout?.toString?.() ?? "") + (error.stderr?.toString?.() ?? error.message);
+    fail(`probe collection FAILED (${label}):\n${detail}`);
+  }
+}
+runProbeCollection("jw venv", jwVenvPython, "jw");
+runProbeCollection("sd-services venv", sdServicesVenvPython, "services");
 
 
 // A2 RequiredFiles manifest: every file an installer must contain, checked
