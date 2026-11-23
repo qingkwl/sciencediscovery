@@ -710,6 +710,10 @@ await sweepNodeModules(jwSrcOut);
 
 // Rewrite the setuptools editable finder so package paths resolve relative to
 // wherever the payload got installed (site-packages → .venv → src).
+// [D3 P3-4 RETIREMENT MARKER — venv-rail step] The frozen exe has no
+// editable installs (its imports resolve from the PYZ); this whole
+// rewrite retires with the jw venv staging. Keep until the P4 window
+// closes — it is load-bearing for the venv rail the rollback uses.
 const finderGlob = /^(?:__editable___.*_finder\.py)$/;
 const sitePackages = join(jwSrcOut, ".venv", ...dialect.sitePackages(PYTHON_MINOR).split("/"));
 // parents[N] must land exactly on the jw src root: N is derived from the
@@ -1103,6 +1107,12 @@ if (dialect.hasTrampolines) {
 // no-op. checked-hash (PEP 552): validity keys on the source CONTENT hash, so
 // downstream copy chains (electron-builder → NSIS → dataDir) may restamp
 // mtimes freely without invalidating what we ship.
+// [D3 P3-4 RETIREMENT MARKER — venv-rail step] Retires together with the
+// venv staging in 5/6 and A6's pyc face when the dual-rail window closes
+// (P4: two clean releases, then delete 7c + the precompileTargets call
+// in bootstrap). The frozen onedirs need NO precompile — their bytecode
+// is baked into the PYZ archives; frozen integrity is A6's frozen face
+// (frozen-manifest), not this step.
 say("precompiling Python bytecode for bundled venvs");
 // Do NOT spread process.env into the compile environment unfiltered. It used to
 // read `{...process.env, PYTHONWARNINGS: "ignore"}`, which let a build script's
