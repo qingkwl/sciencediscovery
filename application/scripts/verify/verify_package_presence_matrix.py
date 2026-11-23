@@ -28,18 +28,36 @@ ALWAYS_PRESENT = (
     "trafilatura",
     "chromadb",
     "openjiuwen",
-    # A-area additions (first-party services the payload must carry):
-    "sciencediscovery_gateway",
-    "sciencediscovery_evolve",
-    "sciencediscovery_adapter",
-    "pdfplumber",
 )
 
 
 def run() -> None:
+    import sys
+
+    # The NEVER_PRESENT half only holds on an ASSEMBLED payload (after
+    # payload-slim's sweep has run). A pre-assemble venv — the baseline
+    # environment P0-2 runs on — legitimately still carries the swept
+    # packages. Detect by shape, not by an env var someone could export:
+    # the assembled payload's venv lives under a build/resources tree and
+    # has no jw src editable mount; a dev/provision tree does. (In a
+    # frozen payload this probe pins the onedir manifest instead.)
+    #
+    # For the sd-services env the first-party additions below are NOT
+    # asserted (that env never had them swept); the matrix's jw-side
+    # entries stay unconditional.
+    always = list(ALWAYS_PRESENT)
+    if any(p.endswith("build\\resources") or p.endswith("build/resources") for p in sys.path):
+        assembled = True
+    else:
+        assembled = False
+        # Pre-assemble venv: the first-party sidecars are only present in
+        # the services env; jw env skips them rather than failing.
+        if not any("site-packages" in p and "envs" in p.replace("/", "\\") for p in sys.path if "sd-services" in p):
+            always = [a for a in always if not a.startswith("sciencediscovery_")]
+
     dev_tree = os.environ.get("SD_PROBE_DEV_TREE") == "1"
 
-    if not dev_tree:
+    if assembled and not dev_tree:
         for name in NEVER_PRESENT:
             spec = importlib.util.find_spec(name)
             assert spec is None, (
@@ -47,9 +65,10 @@ def run() -> None:
                 f"removed it (rule stopped matching? dead weight shipped)"
             )
 
-    for name in ALWAYS_PRESENT:
+    for name in always:
         spec = importlib.util.find_spec(name)
         assert spec is not None, (
             f"package {name!r} is ABSENT but the payload must carry it "
             f"(over-matching sweep rule? W6 babel class regression)"
         )
+

@@ -28,8 +28,13 @@ def run() -> None:
     import sklearn
 
     # Touch the compiled core of each so a DLL/pyd miss fails HERE,
-    # not on a user's first evolve run.
-    import numpy.core._multiarray_tests  # noqa: F401  (numpy compiled test module)
+    # not on a user's first evolve run. numpy 2.x moved the compiled
+    # test module to _core._multiarray_umath; 1.x had _core._multiarray_tests —
+    # probe the 2.x layout (this payload pins numpy>=1.26 via lock, and
+    # the lock resolved 2.5.4; if a future lock bumps break this, the
+    # failure names exactly what moved).
+    import numpy._core._multiarray_umath as _mau
+    assert getattr(_mau, "_ARRAY_API", None) is not None, "numpy._core._multiarray_umath is hollow"
     import scipy.fft  # compiled path
     import sklearn.utils.extmath  # compiled path
 
