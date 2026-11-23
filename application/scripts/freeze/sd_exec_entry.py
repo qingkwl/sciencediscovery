@@ -121,7 +121,24 @@ if _SD_TREE == "jw":
     # Entries in _JW_ENTRIES but NOT in _STATIC (web/desktop/jiuwenbox)
     # stay dispatchable through the runtime table when run unfrozen.
 else:
-    _STATIC = {}  # services spec lands in P2; entries added there
+    # [SD-D3 P2-1] services static surface: start-stack.mjs spawns the
+    # evolve sidecar as `<python> -m sciencediscovery_evolve.server`, so
+    # the -m channel carries it; the STATIC surface below covers the
+    # entry-table names (evolve/gateway/candidate) for table dispatch.
+    # evolve: FastAPI sidecar (server.main reads argv itself)
+    from sciencediscovery_evolve.server import main as _e_evolve
+    # gateway: the dispatcher's gateway entry runs the uniprot MCP by
+    # default; the mcp:<name> channel selects the other two at runtime.
+    from sciencediscovery_gateway import uniprot_mcp as _g_uniprot
+    from sciencediscovery_gateway import public_biomed_mcp as _g_public_biomed
+    from sciencediscovery_gateway import llm_wiki_mcp as _g_llm_wiki
+    _MCP_TABLE = {
+        "uniprot": _g_uniprot, "public_biomed": _g_public_biomed, "llm_wiki": _g_llm_wiki,
+    }
+    _STATIC = {
+        "evolve": _e_evolve,
+        "gateway": _g_uniprot,
+    }
 
 
 def _die(code: int, message: str) -> None:
@@ -171,10 +188,15 @@ def main() -> None:
 
     if entry == "paper":
         # Loose-file entry (see module docstring): the worker script is
-        # staged on disk next to the exe, not in the archive.
+        # staged on disk near the exe, not in the archive. COLLECT puts
+        # datas under _internal/ (onedir layout) — exe-adjacent AND
+        # _internal are both checked; venv layout services/paper/ is the
+        # dev fallback.
+        exe_dir = Path(sys.executable).resolve().parent
         candidates = [
-            Path(sys.executable).resolve().parent / "paper_worker.py",
-            Path(sys.executable).resolve().parent / "paper" / "paper_worker.py",
+            exe_dir / "paper_worker.py",
+            exe_dir / "_internal" / "paper_worker.py",
+            exe_dir / "paper" / "paper_worker.py",
         ]
         script = next((c for c in candidates if c.is_file()), None)
         if script is None:
@@ -185,12 +207,21 @@ def main() -> None:
 
     if entry.startswith("mcp:"):
         name = entry.split(":", 1)[1]
-        module = f"sciencediscovery_gateway.{name}"
-        try:
-            mod = __import__(module, fromlist=["main"])
-        except ImportError as exc:
-            _die(3, f"unknown MCP server {name!r}: {exc}")
-        mod.main(*rest)
+        # Services tree: the frozen MCP table (static imports above);
+        # venv/dev run falls back to the dynamic import.
+        table = globals().get("_MCP_TABLE")
+        mod = table.get(name) if table else None
+        if mod is None:
+            module = f"sciencediscovery_gateway.{name}"
+            try:
+                mod = __import__(module, fromlist=["main"])
+            except ImportError as exc:
+                _die(3, f"unknown MCP server {name!r}: {exc}")
+        main_fn = getattr(mod, "main", None)
+        if not callable(main_fn):
+            _die(3, f"mcp server {name!r} has no callable main()")
+        sys.argv = [entry, *rest]
+        main_fn()
         return
 
     if entry not in _ENTRIES:
