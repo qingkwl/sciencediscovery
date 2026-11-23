@@ -31,7 +31,7 @@ import { execFileSync } from "node:child_process";
 import { copyFile, cp, mkdir, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync, lstatSync, readdirSync, readFileSync, readlinkSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   copyVenvRuntimeDlls, greenletRuntimeProblem, greenletVersionAtLeast,
   replaceVenvSymlinks, pythonNamesFor, relocatablePythonTree,
@@ -808,7 +808,9 @@ if (!existsSync(sdFreezeSpec)) {
 // machine. The bootstrap (P3-3) re-verifies on first run.
 // ---------------------------------------------------------------------------
 {
-  const { buildFrozenManifest, verifyFrozenManifest } = await import(join(repo, "scripts", "lib", "frozen-manifest.mjs"));
+  // Windows: dynamic import of an absolute path needs a file:// URL
+  // (ERR_UNSUPPORTED_ESM_URL_SCHEME otherwise; first full assemble catch).
+  const { buildFrozenManifest, verifyFrozenManifest } = await import(pathToFileURL(join(repo, "scripts", "lib", "frozen-manifest.mjs")).href);
   const jwOnedir = join(jwPayload, "frozen", "sd-jw", "sd-jw");
   const servicesOnedir = join(out, "envs-template", "frozen", "sd-services", "sd-services");
   const manifest = await buildFrozenManifest({
