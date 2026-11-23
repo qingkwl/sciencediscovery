@@ -698,6 +698,25 @@ export async function bootstrapPackaged(
     log(`[perf] bootstrap ${event} +${Date.now() - bootstrapStarted}ms${extra ? ` ${extra}` : ""}`);
   };
   perfB("enter");
+
+  // [D3 P3-3] Frozen-payload integrity probe: when frozen onedirs ship,
+  // verify them against the build-time manifest (frozen-manifest.json,
+  // assemble 5.5c) BEFORE any spawn. A missing/corrupted file surfaces
+  // here as a readable error instead of a cryptic loader traceback on
+  // the first spawn. 14k files hash in a few seconds (cold disk); the
+  // venv rails stay unverified (their gates are A1/A6's).
+  {
+    const { verifyFrozenPayload } = await import("./frozen-verify.ts");
+    const verdict = await verifyFrozenPayload(paths.resourcesPath, log);
+    if (verdict !== null && !verdict.ok) {
+      // Hard error: a broken frozen rail cannot be worked around.
+      throw new Error(
+        `frozen payload integrity check FAILED: ${verdict.problems[0]?.kind} ${verdict.problems[0]?.path}`
+        + ` (${verdict.problems.length} problem${verdict.problems.length === 1 ? "" : "s"}); reinstall ScienceDiscovery.`,
+      );
+    }
+  }
+
   // Optionally run venvs straight from the read-only payload.
   // Packaged mode never mutates venvs at runtime, so copying them into the
   // data directory is pure overhead on first start.
