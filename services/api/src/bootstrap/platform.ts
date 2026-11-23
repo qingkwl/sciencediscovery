@@ -276,7 +276,7 @@ export function createPlatformServices(
     mcpGateway,
     { memoryGraphSink, outages: mcpSourceOutages },
   );
-  const paperService = new PaperService(store, config.paperPythonPath, config.paperWorkerPath);
+  const paperService = new PaperService(store, config.paperPythonPath, config.paperWorkerPath, undefined, config.paperFrozenCommand);
   const artifactManager = new GovernedDownloadManager(
     store,
     mcpRegistry,

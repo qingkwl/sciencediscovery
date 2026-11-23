@@ -266,6 +266,29 @@ const envsDir = process.env.SCIENCE_AGENT_ENVS_DIR
 // and in the payload (envs-template\sd-services, staged by assemble-backend).
 const SHARED_ENV = join(envsDir, "sd-services");
 
+// [D3 P2-2] Frozen rail for the shared-venv sidecars: when a sd-services
+// onedir exists (payload <dataDir>/frozen/sd-services layout from assemble
+// stage 5.5b; explicit env override; dev sandbox .tmp-freeze-dist), the
+// evolve/memory-graph sidecars spawn as `<exe> <entry>` / `<exe> -m <module>`
+// (the dispatcher carries both channels) and the venv machinery below
+// (uv sync, gateway venv probes) is bypassed. SD_SD_SERVICES_FREEZE=0
+// forces the venv rail for the P4 verification window.
+const FROZEN_SERVICES_EXE = (() => {
+  if (process.env.SD_SD_SERVICES_FREEZE === "0") return "";
+  const explicit = process.env.SCIENCE_AGENT_SD_SERVICES_EXE?.trim();
+  if (explicit && existsSync(resolve(explicit))) return resolve(explicit);
+  for (const cand of [
+    join(dataDir, "frozen", "sd-services", "sd-services", "sd-services.exe"),
+    resolve(repositoryRoot, ".tmp-freeze-dist", "sd-services", "sd-services.exe"),
+  ]) {
+    if (existsSync(cand)) return cand;
+  }
+  return "";
+})();
+if (FROZEN_SERVICES_EXE) {
+  say(`frozen sd-services exe: ${FROZEN_SERVICES_EXE} (spawn rail ON)`);
+}
+
 // Build (--no-build skips it). Registry overrides apply to this process only
 // and never touch user/global configuration.
 const runOpts = { cwd: repositoryRoot };
@@ -450,10 +473,16 @@ if (!options.noBuild) {
 
 // Gateway interpreter discovery: two known locations, in the same order as
 // resolveMcpPython; venvPython() handles bin/python vs Scripts/python.exe
-// internally.
+// internally. [D3 P2-2] frozen rail: the exe IS the interpreter for every
+// bundled MCP server; resolveMcpPython in the API resolves the same file
+// (node-client.ts), so the env passthrough below just points there.
 let gatewayPython = process.env.SCIENCE_AGENT_GATEWAY_PYTHON_PATH;
 if (!gatewayPython || !existsSync(gatewayPython)) {
-  const candidates = [venvPython(SHARED_ENV), venvPython(join(repositoryRoot, "services", "gateway", ".venv"))];
+  const candidates = [
+    ...(FROZEN_SERVICES_EXE ? [FROZEN_SERVICES_EXE] : []),
+    venvPython(SHARED_ENV),
+    venvPython(join(repositoryRoot, "services", "gateway", ".venv")),
+  ];
   gatewayPython = candidates.find(existsSync);
 }
 if (!gatewayPython) {
@@ -464,8 +493,9 @@ if (!gatewayPython) {
 
 // memory-graph: provision unconditionally (the feature toggle lives in
 // System Settings; the environment must be ready)
-let memoryGraphPython = venvPython(SHARED_ENV);
-if (!existsSync(memoryGraphPython)) {
+// [D3 P2-2] frozen rail: the exe spawns it via the -m channel.
+let memoryGraphPython = FROZEN_SERVICES_EXE || venvPython(SHARED_ENV);
+if (!FROZEN_SERVICES_EXE && !existsSync(memoryGraphPython)) {
   if (packaged) fail(`${SHARED_ENV} is missing; the packaged installation is incomplete — reinstall ScienceDiscovery.`);
   say("Provisioning the shared Python environment (workspace)...");
   await uvSyncProject(repositoryRoot, SHARED_ENV, { locked: true, extraArgs: ["--extra", "candidates"] });
@@ -473,15 +503,16 @@ if (!existsSync(memoryGraphPython)) {
 if (!existsSync(memoryGraphPython)) memoryGraphPython = "";
 
 // evolve: the candidate runtime lives in the shared venv via the workspace's
-// candidates extra (synced above).
-let evolvePython = venvPython(SHARED_ENV);
-if (!existsSync(evolvePython)) evolvePython = "";
+// candidates extra (synced above). [D3 P2-2] frozen rail: the exe carries
+// the candidates four (collect_all in the P2-1 spec).
+let evolvePython = FROZEN_SERVICES_EXE || venvPython(SHARED_ENV);
+if (!FROZEN_SERVICES_EXE && !existsSync(evolvePython)) evolvePython = "";
 
 // adapter: the JiuwenSwarm front door (on by default)
 let adapterPython = "";
 if (process.env.SCIENCE_AGENT_ADAPTER === "1") {
-  adapterPython = venvPython(SHARED_ENV);
-  if (!existsSync(adapterPython)) {
+  adapterPython = FROZEN_SERVICES_EXE || venvPython(SHARED_ENV);
+  if (!FROZEN_SERVICES_EXE && !existsSync(adapterPython)) {
     if (packaged) fail(`${SHARED_ENV} is missing; the packaged installation is incomplete — reinstall ScienceDiscovery.`);
     say("Provisioning the shared Python environment (workspace)...");
     await uvSyncProject(repositoryRoot, SHARED_ENV, { locked: true });

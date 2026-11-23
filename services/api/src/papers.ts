@@ -79,6 +79,8 @@ export class PaperService {
     private readonly pythonPath: string,
     private readonly workerPath: string,
     private readonly fetchImpl?: typeof fetch,
+    /** [D3 P2-2] frozen rail: prefer `<exe> paper …` when provided. */
+    private readonly frozenCommand?: { exe: string; args: string[] },
   ) {
     this.cas = new CasStore(store.dataDir);
     this.dataCas = new CasStore(store.dataDir, "data");
@@ -364,7 +366,10 @@ export class PaperService {
       try {
         await mkdir(stagingRoot, { recursive: false });
         await writeFile(pdfPath, options.bytes);
-        const { stdout } = await execFileAsync(this.pythonPath, [this.workerPath, pdfPath, analysisPath], {
+        const { stdout } = await execFileAsync(
+          this.frozenCommand ? this.frozenCommand.exe : this.pythonPath,
+          this.frozenCommand ? [...this.frozenCommand.args, pdfPath, analysisPath] : [this.workerPath, pdfPath, analysisPath],
+          {
           encoding: "utf8",
           maxBuffer: 10 * 1024 * 1024,
           signal: options.signal,
