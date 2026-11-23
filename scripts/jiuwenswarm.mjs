@@ -72,6 +72,44 @@ const jwPython = cfg => venvEntry(venvDir(cfg), "python");
  */
 const jwEntryCache = new Map();
 
+/**
+ * [D3 P1-3] Frozen-exe spawn contract. When a frozen sd-jw onedir is
+ * deployed (payload layout: <root>/frozen/sd-jw/sd-jw.exe, and the
+ * dev sandbox .tmp-freeze-dist layout for local probing), the venv
+ * entry resolution -- entry_points.txt scans, trampoline fallbacks,
+ * burned-shebang dodges (F10.6k/W18) -- is RETIRED for the spawn
+ * itself: every jw console script maps to `<exe> <entry>` through the
+ * dispatcher (freeze/sd_exec_entry.py's table, which carries the real
+ * [project.scripts] names). The frozen exe already contains the
+ * patches (runtime hook), so PYTHONPATH-based sitecustomize transport
+ * is unnecessary too.
+ *
+ * SD_JW_FREEZE=0 forces the venv path (verification-window dual-rail;
+ * the env var is read once per process, never inherited by spawns).
+ */
+export function frozenJwExe(cfg) {
+  if (process.env.SD_JW_FREEZE === "0") return undefined;
+  // root = .sciencediscovery-data/jiuwenswarm (payload: <data>/jiuwenswarm;
+  // dev: same layout) — the frozen onedir candidates:
+  //   payload deploy:  <root>/frozen/sd-jw/sd-jw.exe      (P1-5 layout)
+  //   dev sandbox:     <root>/../../.tmp-freeze-dist/sd-jw/sd-jw.exe
+  //   explicit:        SD_JW_FROZEN_EXE (wins when set)
+  const explicit = process.env.SD_JW_FROZEN_EXE;
+  if (explicit && existsSync(explicit)) return explicit;
+  for (const rel of ["frozen/sd-jw/sd-jw.exe", "../../.tmp-freeze-dist/sd-jw/sd-jw.exe"]) {
+    const cand = resolve(cfg.root, rel);
+    if (existsSync(cand)) return cand;
+  }
+  return undefined;
+}
+
+/** Map a venv console-script name to its frozen dispatch entry. The
+ *  dispatcher's table is the authority (freeze/sd_exec_entry.py); jw's
+ *  `jiuwenswarm-<x>` naming maps to the bare `<x>` entry directly. */
+function frozenEntryName(name) {
+  return name.replace(/^jiuwenswarm-/, "");
+}
+
 /** The site-packages directories of a venv, Windows and POSIX layouts
  * (W18: scan both — the resolver runs on the TARGET platform's payload). */
 function venvSitePackagesDirs(venvAbs) {
@@ -92,6 +130,17 @@ function venvSitePackagesDirs(venvAbs) {
 export function resolveVenvEntry(venvAbs, name) {
   const key = `${venvAbs}::${name}`;
   if (jwEntryCache.has(key)) return jwEntryCache.get(key);
+
+  // [D3 P1-3] Frozen layout short-circuit: if the frozen exe exists for
+  // this tree, EVERY entry spawns through it — the venv scan below is
+  // the venv-layout rail only (SD_JW_FREEZE=0 or no frozen payload).
+  const frozenExe = frozenJwExe({ root: resolve(venvAbs, "..", "..") });
+  if (frozenExe) {
+    const spec = { exe: frozenExe, args: [frozenEntryName(name)], frozen: true };
+    jwEntryCache.set(key, spec);
+    return spec;
+  }
+
   let spec = null;
   for (const sitePackages of venvSitePackagesDirs(venvAbs)) {
     try {
