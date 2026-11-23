@@ -240,6 +240,14 @@ hiddenimports = webview_hiddenimports + http2_submodules + [
     "loguru",
     "dotenv",
     "jiuwenswarm.channels.web.app_web",
+    # [SD-D3 2] -m passthrough targets: start_services spawns children
+    # as `<exe> -m <module>` -- runpy resolves them at RUNTIME, so each
+    # must be an explicit hiddenimport (the static dispatcher surface
+    # does not cover -m children).
+    "jiuwenswarm.app",
+    "jiuwenswarm.channels.web.app_web",
+    "jiuwenswarm.server.app_agentserver",
+    "jiuwenswarm.gateway.app_gateway",
 ] + openjiuwen_submodules + symphony_submodules + team_kv_cache_hiddenimports + dispatch_submodules
 
 # [SD-D3 3] runtime hook: sitecustomize chain + CREATE_NO_WINDOW.
@@ -324,6 +332,13 @@ datas += _rust_datas
 hiddenimports += _rust_hidden
 _bundled_binaries += _rust_binaries
 
+# [SD-D3 2] The dispatcher must know which tree it serves. The jw exe
+# sets SD_EXEC_TREE via a tiny runtime pre-hook (env-based so the same
+# dispatcher source serves the services spec unchanged).
+_sd_tree_hook = os.path.join(SPEC_DIR, "_sd_tree_hook.py")
+with open(_sd_tree_hook, "w", encoding="utf-8") as _fh:
+    _fh.write('import os\nos.environ["SD_EXEC_TREE"] = "jw"\n')
+
 a = Analysis(
     [entry_script],
     pathex=[project_root, symphony_root],
@@ -332,13 +347,14 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[_sd_runtime_hook],
+    runtime_hooks=[_sd_tree_hook, _sd_runtime_hook],
     excludes=excludes,
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
     noarchive=False,
 )
+
 pyz = PYZ(a.pure)
 
 exe = EXE(
