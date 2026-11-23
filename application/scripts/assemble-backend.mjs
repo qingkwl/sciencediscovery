@@ -792,6 +792,44 @@ if (!existsSync(sdFreezeSpec)) {
 }
 
 // ---------------------------------------------------------------------------
+// 5.5b sd-services frozen onedir (D3 P2-2/P2-5)
+//
+// Same contract as 5.5 but for the shared services venv: build the
+// sd-services exe from the STAGED envs-template venv and place it at
+// backend/envs-template/frozen/sd-services/ — the layout resolveMcpPython
+// (node-client.ts) and config.ts (paperFrozenCommand) probe on the target
+// machine. start-stack.mjs's FROZEN_SERVICES_EXE resolves the same path.
+// The venv staging stays (dual rail); retirement is P3-3.
+// ---------------------------------------------------------------------------
+{
+  const sdServicesSpec = join(repo, "application", "scripts", "freeze", "sd-services.spec");
+  if (!existsSync(sdServicesSpec)) {
+    fail(`D3 services freeze spec missing: ${relative(out, sdServicesSpec)}`);
+  }
+  const frozenOut = join(out, "envs-template", "frozen", "sd-services");
+  const stagedVenvDir = join(out, "envs-template", "sd-services");
+  const stagedVenvPython = join(stagedVenvDir, dialect.venvBin, dialect.venvPythonName);
+  if (!existsSync(stagedVenvPython)) {
+    fail(`staged sd-services venv python missing (freeze build source): ${relative(out, stagedVenvPython)}`);
+  }
+  say("building frozen sd-services onedir (PyInstaller, ~3 min)");
+  try {
+    const freezeEnv = { ...process.env, CODEBUDDY_SAFE_DELETE_ENABLED: "0" };
+    execFileSync(stagedVenvPython, ["-m", "PyInstaller", "--distpath", frozenOut, "--workpath", join(out, "..", "freeze-work"), sdServicesSpec, "--noconfirm"], {
+      env: freezeEnv, windowsHide: true, stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024,
+    });
+  } catch (error) {
+    const detail = (error.stdout?.toString?.() ?? "") + (error.stderr?.toString?.() ?? error.message);
+    fail(`frozen sd-services build FAILED:\n${detail.slice(0, 4000)}`);
+  }
+  const frozenServicesExe = join(frozenOut, "sd-services", "sd-services.exe");
+  if (!existsSync(frozenServicesExe)) {
+    fail(`frozen services build produced no exe: ${relative(out, frozenServicesExe)}`);
+  }
+  say(`frozen sd-services OK: ${relative(out, frozenServicesExe)}`);
+}
+
+// ---------------------------------------------------------------------------
 // 6. envs-template — the 5 venvs, editable .pth paths → placeholder
 
 say("copying venv template (envs-template)");
