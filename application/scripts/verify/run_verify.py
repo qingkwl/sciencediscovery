@@ -45,18 +45,27 @@ HERE = Path(__file__).resolve().parent
 # The frozen plan. Adding a file without adding it here is a collection
 # drift bug: run_verify reports unknown files as failures (EMPTY module
 # guard, same lesson as the CI catalog).
-PROBE_ORDER = [
-    "verify_evolve_candidate_runtime",
-    "verify_evolve_pip_branch_unreachable",
-    "verify_evolve_vendored_runner_path",
-    "verify_adapter_sitecustomize_chain",
-    "verify_adapter_openjiuwen_metadata",
-    "verify_gateway_mcp_config_files",
-    "verify_paper_worker_entry",
-    "verify_package_presence_matrix",
-]
+#
+# ENV groups which venv a probe belongs to — the payload carries TWO
+# python trees (sd-services venv for the first-party sidecars, jw venv
+# for the upstream tree), so a baseline run is really two runs:
+#   --env services   sciencediscovery_* + candidates + pdfplumber
+#   --env jw         openjiuwen/jiuwenswarm + babel chain + chromadb
+#   --env both       env-independent contracts (data files, source shape)
+# A probe absent from its group's run is a FAIL (a skip is not a pass).
+PROBE_ENV = {
+    "verify_evolve_candidate_runtime": "services",
+    "verify_evolve_pip_branch_unreachable": "services",
+    "verify_evolve_vendored_runner_path": "services",
+    "verify_adapter_sitecustomize_chain": "jw",
+    "verify_adapter_openjiuwen_metadata": "jw",
+    "verify_gateway_mcp_config_files": "both",
+    "verify_paper_worker_entry": "services",
+    "verify_package_presence_matrix": "jw",
+}
+PROBE_ORDER = list(PROBE_ENV)
 
-VALID_TARGETS = ("venv", "dev")
+VALID_TARGETS = ("venv", "dev", "frozen")  # 'frozen' activates post-D3 onedir assertions
 
 
 def target() -> str:
@@ -76,7 +85,20 @@ def target() -> str:
 
 def main() -> int:
     run_target = target()
-    print(f"[verify] target={run_target} probes={len(PROBE_ORDER)}")
+    # --env services|jw|both: which payload python tree this run targets.
+    env_filter = "both"
+    for i, arg in enumerate(sys.argv[1:]):
+        if arg == "--env" and i + 2 < len(sys.argv):
+            env_filter = sys.argv[i + 2]
+        elif arg.startswith("--env="):
+            env_filter = arg.split("=", 1)[1]
+    if env_filter not in ("services", "jw", "both"):
+        print(f"VERIFY_FAIL: invalid --env {env_filter!r}", file=sys.stderr)
+        return 2
+
+    selected = {n: PROBE_ENV[n] for n in PROBE_ORDER
+                if PROBE_ENV[n] in (env_filter, "both")}
+    print(f"[verify] target={run_target} env={env_filter} probes={len(selected)}/{len(PROBE_ORDER)}")
 
     unknown = sorted(
         p.stem for p in HERE.glob("verify_*.py")
@@ -89,7 +111,7 @@ def main() -> int:
     failure_mode = os.environ.get("SD_VERIFY_FAILURE_MODE", "hard").strip().lower()
     results: list[tuple[str, str, str]] = []  # (name, status, detail)
 
-    for name in PROBE_ORDER:
+    for name in selected:
         try:
             mod = importlib.import_module(name)
             outcome = mod.run()
@@ -110,6 +132,7 @@ def main() -> int:
         print(line)
 
     failed = [r for r in results if r[1] == "FAIL"]
+    skipped = [r for r in results if r[1].startswith("SKIP")]
     print("\n[verify] === summary ===")
     for name, status, _ in results:
         print(f"  {status:6}  {name}")
@@ -119,6 +142,12 @@ def main() -> int:
         return 1
     if failed:
         print(f"VERIFY_OK: {len(failed)}/{len(results)} probes failed but failure mode is soft")
+        return 0
+    if skipped:
+        # Baseline runs must be all-green-with-reasons: a SKIP is legal
+        # (env absent) but the collection is not "all passed" while any
+        # probe skipped — P0-2 acceptance requires both envs green.
+        print(f"VERIFY_PARTIAL: {len(skipped)} probe(s) skipped, {len(results) - len(skipped)} passed")
         return 0
     print(f"VERIFY_OK: all {len(results)} probes passed (target={run_target})")
     return 0

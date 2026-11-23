@@ -13,7 +13,9 @@ import sys
 
 
 def target() -> str:
-    """The collection's target env: 'venv' (assembled payload) or 'dev'.
+    """The collection's target env: 'venv' (assembled payload), 'dev',
+    or 'frozen' (post-D3 onedir — activates the extra assertions in
+    pip-branch / vendored-runner / sitecustomize probes).
 
     Payload-only probes downgrade themselves on a dev tree with a loud
     SKIP-PAYLOAD-ONLY marker (returned so run_verify prints it).
