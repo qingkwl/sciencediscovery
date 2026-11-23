@@ -830,6 +830,45 @@ if (!existsSync(sdFreezeSpec)) {
 }
 
 // ---------------------------------------------------------------------------
+// 5.5c frozen-payload integrity manifest (D3 P3-1)
+//
+// Snapshot every file of both frozen onedirs into frozen-manifest.json
+// and self-verify it BEFORE the tree ships. The W25 lesson in its new
+// shape: a silently-wrong file (sweep ate it, AV quarantined it, the
+// copy raced) must fail THIS build, not the first spawn on a user
+// machine. The bootstrap (P3-3) re-verifies on first run.
+// ---------------------------------------------------------------------------
+{
+  const { buildFrozenManifest, verifyFrozenManifest } = await import(join(repo, "scripts", "lib", "frozen-manifest.mjs"));
+  const jwOnedir = join(jwPayload, "frozen", "sd-jw", "sd-jw");
+  const servicesOnedir = join(out, "envs-template", "frozen", "sd-services", "sd-services");
+  const manifest = await buildFrozenManifest({
+    jw: jwOnedir,
+    services: servicesOnedir,
+  });
+  const covered = Object.keys(manifest.onedirs);
+  if (covered.length === 0) {
+    fail("frozen manifest: no onedir found to snapshot (5.5/5.5b must run first)");
+  }
+  say(`A6 frozen snapshot: ${covered.map((k) => `${k}=${manifest.onedirs[k].fileCount} files`).join(", ")}`);
+
+  // Self-check: the snapshot must verify against the tree it just walked.
+  const resolver = (entryPath) => {
+    const [rootKey, ...rest] = entryPath.split("/");
+    const base = rootKey === "jw" ? jwOnedir : servicesOnedir;
+    return join(base, ...rest);
+  };
+  const { problems } = await verifyFrozenManifest(manifest, resolver);
+  if (problems.length > 0) {
+    fail(`frozen manifest self-check FAILED (${problems.length} problems; first: ${JSON.stringify(problems[0])})`);
+  }
+
+  const manifestPath = join(out, "frozen-manifest.json");
+  await writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+  say(`A6 frozen manifest written: ${relative(out, manifestPath)} (${manifest.files.length} entries)`);
+}
+
+// ---------------------------------------------------------------------------
 // 6. envs-template — the 5 venvs, editable .pth paths → placeholder
 
 say("copying venv template (envs-template)");
@@ -1512,6 +1551,32 @@ if (!dialect.hasTrampolines) {
     fail(`payload bytecode budget failed: ${verdict.reason}.\n` +
       `  The .pyc files are either missing or were written OUTSIDE the payload. Check the build environment for PYTHONPYCACHEPREFIX (it redirects compileall's output and still exits 0 — problems W25) and check the "precompiled bytecode for <label>" lines above for a target that was skipped.\n` +
       `  Do NOT ship: the installed tree recompiles on first run, a multi-minute startup regression.`);
+  }
+}
+
+// [D3 P3-1] A6 frozen face: when a frozen onedir ships, its integrity
+// manifest must exist AND cover it — this is the gate-side twin of the
+// 5.5c self-check (the same file, asserted from the gate's side so a
+// 5.5c regression cannot ship an onedir without its manifest).
+{
+  const frozenJwExe = join(jwPayload, "frozen", "sd-jw", "sd-jw", "sd-jw.exe");
+  const manifestPath = join(out, "frozen-manifest.json");
+  if (existsSync(frozenJwExe)) {
+    if (!existsSync(manifestPath)) {
+      fail(`A6: frozen sd-jw exe shipped but ${relative(out, manifestPath)} is missing (5.5c snapshot step failed)`);
+    }
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    const covered = manifest.onedirs ?? {};
+    for (const key of ["jw", "services"]) {
+      const onedir = key === "jw"
+        ? join(jwPayload, "frozen", "sd-jw", "sd-jw")
+        : join(out, "envs-template", "frozen", "sd-services", "sd-services");
+      if (!existsSync(onedir)) continue;
+      if (!covered[key] || covered[key].fileCount < 50) {
+        fail(`A6: frozen onedir '${key}' shipped with no/too-thin manifest coverage (${covered[key]?.fileCount ?? 0} entries; a real onedir is hundreds+)`);
+      }
+    }
+    say(`A6 frozen integrity: manifest covers ${manifest.files.length} entries (${Object.keys(covered).join(", ")})`);
   }
 }
 
