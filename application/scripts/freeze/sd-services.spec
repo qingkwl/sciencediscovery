@@ -43,8 +43,19 @@ sd_repo_root = os.path.abspath(os.path.join(SPEC_DIR, "..", "..", ".."))
 project_root = os.path.abspath(
     os.path.join(sd_repo_root, ".sciencediscovery-data", "envs", "sd-services")
 )
+# [SD-D3 P1-5] assemble staged mode (mirror of sd-jw.spec): the staged
+# venv IS the tree root for this spec — services venvs have no src
+# wrapper, so project_root == the venv dir itself.
+_staged_venv = os.environ.get("SD_FREEZE_VENV")
+if _staged_venv:
+    project_root = os.path.abspath(os.path.join(_staged_venv, ".."))
 
-_services_venv_scripts = os.path.join(project_root, "Scripts" if sys.platform == "win32" else "bin")
+# [SD-D3 1] Same escape as sd-jw.spec: assemble 5.5b stages this venv
+# into envs-template and builds from the STAGED copy (SD_FREEZE_VENV);
+# manual/sandbox runs use the provisioned source venv.
+_services_venv_scripts = os.environ.get("SD_FREEZE_VENV") or os.path.join(
+    project_root, "Scripts" if sys.platform == "win32" else "bin"
+)
 if os.path.abspath(os.path.dirname(sys.executable)) != os.path.abspath(_services_venv_scripts):
     raise SystemExit(
         f"SD-D3: run this spec with the sd-services venv python ({_services_venv_scripts}), not {sys.executable}"

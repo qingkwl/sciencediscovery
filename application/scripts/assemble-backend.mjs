@@ -780,7 +780,10 @@ if (!existsSync(sdFreezeSpec)) {
     // payloadCompileEnv (the compileAll env filter, defined later at §7)
     // is not yet in scope here; build a minimal env instead — the freeze
     // build child needs PATH and the shim-disable, nothing else exported.
-    const freezeEnv = { ...process.env, CODEBUDDY_SAFE_DELETE_ENABLED: "0" };
+    // SD_FREEZE_VENV: the spec's venv guard + project_root follow the
+    // STAGED tree when this is set (see sd-jw.spec's staged-mode block).
+    const stagedVenvBin = join(jwPayload, ".venv", dialect.venvBin);
+    const freezeEnv = { ...process.env, CODEBUDDY_SAFE_DELETE_ENABLED: "0", SD_FREEZE_VENV: stagedVenvBin };
     execFileSync(stagedVenvPython, ["-m", "PyInstaller", "--distpath", frozenOut, "--workpath", join(out, "..", "freeze-work"), sdFreezeSpec, "--noconfirm"], {
       env: freezeEnv, windowsHide: true, stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024,
     });
@@ -818,7 +821,8 @@ if (!existsSync(sdFreezeSpec)) {
   }
   say("building frozen sd-services onedir (PyInstaller, ~3 min)");
   try {
-    const freezeEnv = { ...process.env, CODEBUDDY_SAFE_DELETE_ENABLED: "0" };
+    const stagedVenvBin2 = join(stagedVenvDir, dialect.venvBin);
+    const freezeEnv = { ...process.env, CODEBUDDY_SAFE_DELETE_ENABLED: "0", SD_FREEZE_VENV: stagedVenvBin2 };
     execFileSync(stagedVenvPython, ["-m", "PyInstaller", "--distpath", frozenOut, "--workpath", join(out, "..", "freeze-work"), sdServicesSpec, "--noconfirm"], {
       env: freezeEnv, windowsHide: true, stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024,
     });

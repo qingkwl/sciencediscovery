@@ -46,6 +46,16 @@ sd_repo_root = os.path.abspath(os.path.join(SPEC_DIR, "..", "..", ".."))
 project_root = os.path.abspath(
     os.path.join(sd_repo_root, ".sciencediscovery-data", "jiuwenswarm", "src")
 )
+# [SD-D3 P1-5] assemble staged mode: assemble 5.5 stages the whole jw
+# tree (venv included) into the payload and builds from THAT copy —
+# SD_FREEZE_VENV carries the staged venv's Scripts/bin dir; the staged
+# tree root is two levels up from it. Everything below (build_config
+# gate, collect faces, pathex) then resolves against the staged tree,
+# which is a byte-identical copy of the source tree (same contract,
+# different physical location).
+_staged_venv = os.environ.get("SD_FREEZE_VENV")
+if _staged_venv:
+    project_root = os.path.abspath(os.path.join(_staged_venv, "..", ".."))
 
 # [SD-D3 5] upstream build_config gate, pointed at the provisioned tree.
 build_config_module = runpy.run_path(os.path.join(project_root, "scripts", "build_config.py"))
@@ -63,7 +73,12 @@ if symphony_root not in sys.path:
 # [SD-D3 1] The venv to collect from is the jw venv of the provisioned
 # tree. Upstream specs run inside their dev venv; SD runs pyinstaller
 # FROM that venv's python so collect_* resolve against it.
-_jw_venv_scripts = os.path.join(project_root, ".venv", "Scripts" if sys.platform == "win32" else "bin")
+# assemble 5.5 overrides this with SD_FREEZE_VENV: it stages the jw tree
+# (venv included) into the payload and builds from the STAGED venv, which
+# is a byte-identical copy — same contract, different physical tree.
+_jw_venv_scripts = os.environ.get("SD_FREEZE_VENV") or os.path.join(
+    project_root, ".venv", "Scripts" if sys.platform == "win32" else "bin"
+)
 if os.path.abspath(os.path.dirname(sys.executable)) != os.path.abspath(_jw_venv_scripts):
     raise SystemExit(
         f"SD-D3: run this spec with the jw venv python ({_jw_venv_scripts}), not {sys.executable}"
