@@ -799,6 +799,46 @@ if (!existsSync(sdFreezeSpec)) {
 }
 
 // ---------------------------------------------------------------------------
+// 6. envs-template — the 5 venvs, editable .pth paths → placeholder
+
+say("copying venv template (envs-template)");
+for (const name of VENV_NAMES) {
+  await cp(join(data, "envs", name), join(out, "envs-template", name), {
+    recursive: true,
+    force: true,
+    filter: pyFilter(),
+  });
+  // _editable_impl_*.pth contains an absolute path into the dev repo; swap the
+  // repo prefix for the placeholder the shell resolves at first run. The
+  // separator inside the rewritten body follows the TARGET platform's
+  // dialect (Windows .pth paths carry "\", POSIX ones "/") — the runtime
+  // rewrite in bootstrap.ts substitutes only the placeholder, so the rest of
+  // the string must already be correct for the platform that will read it.
+  const sp = join(out, "envs-template", name, ...dialect.sitePackages(PYTHON_MINOR).split("/"));
+  if (!existsSync(sp)) continue;
+  for (const e of await readdir(sp, { withFileTypes: true })) {
+    if (!e.isFile() || !/^_editable_impl_.*\.pth$/.test(e.name)) continue;
+    const file = join(sp, e.name);
+    const text = (await readFile(file, "utf8")).trim();
+    // Field incident (stale editable venv): the envs came from a data dir
+    // carried over after a repo migration; their .pth files still pointed at
+    // the old checkout path. This branch only warned and shipped anyway, and
+    // every Python sidecar died with ModuleNotFoundError on the installed
+    // machine while the build machine looked healthy. A mispointed editable
+    // is always a broken payload — fail the build instead of shipping it.
+    // A directory boundary must follow the repo prefix: `repo` is also a
+    // prefix of `repo-something-else`, and that sibling path would silently
+    // slice into a wrong tail (e.g. `-something-else\...`) instead of failing.
+    if (!text.startsWith(repo) || !/^[\\/]/.test(text.slice(repo.length))) {
+      fail(`${name}/${e.name} points outside the repo (${text}) — the venv's editable install is stale; reinstall the editable packages from this repo before assembling`);
+    }
+    const tail = text.slice(repo.length).replace(/^[\\/]+/, "").replace(/\//g, dialect.pthSeparator);
+    await writeFile(file, `${BACKEND_PLACEHOLDER}${dialect.pthSeparator}${tail}\n`, "utf8");
+    say(`placeholdered ${name}/${e.name}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 5.5b sd-services frozen onedir (D3 P2-2/P2-5)
 //
 // ORDER: this block MUST run after §6 (envs-template staging) — it builds
@@ -885,46 +925,6 @@ if (!existsSync(sdFreezeSpec)) {
   const manifestPath = join(out, "frozen-manifest.json");
   await writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
   say(`A6 frozen manifest written: ${relative(out, manifestPath)} (${manifest.files.length} entries)`);
-}
-
-// ---------------------------------------------------------------------------
-// 6. envs-template — the 5 venvs, editable .pth paths → placeholder
-
-say("copying venv template (envs-template)");
-for (const name of VENV_NAMES) {
-  await cp(join(data, "envs", name), join(out, "envs-template", name), {
-    recursive: true,
-    force: true,
-    filter: pyFilter(),
-  });
-  // _editable_impl_*.pth contains an absolute path into the dev repo; swap the
-  // repo prefix for the placeholder the shell resolves at first run. The
-  // separator inside the rewritten body follows the TARGET platform's
-  // dialect (Windows .pth paths carry "\", POSIX ones "/") — the runtime
-  // rewrite in bootstrap.ts substitutes only the placeholder, so the rest of
-  // the string must already be correct for the platform that will read it.
-  const sp = join(out, "envs-template", name, ...dialect.sitePackages(PYTHON_MINOR).split("/"));
-  if (!existsSync(sp)) continue;
-  for (const e of await readdir(sp, { withFileTypes: true })) {
-    if (!e.isFile() || !/^_editable_impl_.*\.pth$/.test(e.name)) continue;
-    const file = join(sp, e.name);
-    const text = (await readFile(file, "utf8")).trim();
-    // Field incident (stale editable venv): the envs came from a data dir
-    // carried over after a repo migration; their .pth files still pointed at
-    // the old checkout path. This branch only warned and shipped anyway, and
-    // every Python sidecar died with ModuleNotFoundError on the installed
-    // machine while the build machine looked healthy. A mispointed editable
-    // is always a broken payload — fail the build instead of shipping it.
-    // A directory boundary must follow the repo prefix: `repo` is also a
-    // prefix of `repo-something-else`, and that sibling path would silently
-    // slice into a wrong tail (e.g. `-something-else\...`) instead of failing.
-    if (!text.startsWith(repo) || !/^[\\/]/.test(text.slice(repo.length))) {
-      fail(`${name}/${e.name} points outside the repo (${text}) — the venv's editable install is stale; reinstall the editable packages from this repo before assembling`);
-    }
-    const tail = text.slice(repo.length).replace(/^[\\/]+/, "").replace(/\//g, dialect.pthSeparator);
-    await writeFile(file, `${BACKEND_PLACEHOLDER}${dialect.pthSeparator}${tail}\n`, "utf8");
-    say(`placeholdered ${name}/${e.name}`);
-  }
 }
 
 // ---------------------------------------------------------------------------
