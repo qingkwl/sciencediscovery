@@ -799,7 +799,55 @@ if (!existsSync(sdFreezeSpec)) {
 }
 
 // ---------------------------------------------------------------------------
+// 5.5b sd-services frozen onedir (D3 P2-2/P2-5)
+//
+// ORDER: this block MUST run after §6 (envs-template staging) — it builds
+// from the STAGED sd-services venv, which §6 is what copies into place.
+// (First full-assemble run failed here with "staged venv python missing"
+// because 5.5b sat before §6; keep the numbering but not the position.)
+//
+// Same contract as 5.5 but for the shared services venv: build the
+// sd-services exe from the STAGED envs-template venv and place it at
+// backend/envs-template/frozen/sd-services/ — the layout resolveMcpPython
+// (node-client.ts) and config.ts (paperFrozenCommand) probe on the target
+// machine. start-stack.mjs's FROZEN_SERVICES_EXE resolves the same path.
+// The venv staging stays (dual rail); retirement is P3-3.
+// ---------------------------------------------------------------------------
+{
+  const sdServicesSpec = join(repo, "application", "scripts", "freeze", "sd-services.spec");
+  if (!existsSync(sdServicesSpec)) {
+    fail(`D3 services freeze spec missing: ${relative(out, sdServicesSpec)}`);
+  }
+  const frozenOut = join(out, "envs-template", "frozen", "sd-services");
+  const stagedVenvDir = join(out, "envs-template", "sd-services");
+  const stagedVenvPython = join(stagedVenvDir, dialect.venvBin, dialect.venvPythonName);
+  if (!existsSync(stagedVenvPython)) {
+    fail(`staged sd-services venv python missing (freeze build source): ${relative(out, stagedVenvPython)}`);
+  }
+  say("building frozen sd-services onedir (PyInstaller, ~3 min)");
+  try {
+    const stagedVenvBin2 = join(stagedVenvDir, dialect.venvBin);
+    const freezeEnv = { ...process.env, CODEBUDDY_SAFE_DELETE_ENABLED: "0", SD_FREEZE_VENV: stagedVenvBin2 };
+    execFileSync(stagedVenvPython, ["-m", "PyInstaller", "--distpath", frozenOut, "--workpath", join(out, "..", "freeze-work"), sdServicesSpec, "--noconfirm"], {
+      env: freezeEnv, windowsHide: true, stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024,
+    });
+  } catch (error) {
+    const detail = (error.stdout?.toString?.() ?? "") + (error.stderr?.toString?.() ?? error.message);
+    fail(`frozen sd-services build FAILED:\n${detail.slice(0, 4000)}`);
+  }
+  const frozenServicesExe = join(frozenOut, "sd-services", "sd-services.exe");
+  if (!existsSync(frozenServicesExe)) {
+    fail(`frozen services build produced no exe: ${relative(out, frozenServicesExe)}`);
+  }
+  say(`frozen sd-services OK: ${relative(out, frozenServicesExe)}`);
+}
+
+// ---------------------------------------------------------------------------
 // 5.5c frozen-payload integrity manifest (D3 P3-1)
+//
+// ORDER: MUST run after BOTH 5.5 (jw freeze) and 5.5b (services freeze) —
+// it snapshots the two frozen onedirs. Sat before 5.5b until the first
+// full-chain run caught a services manifest with 0 entries.
 //
 // Snapshot every file of both frozen onedirs into frozen-manifest.json
 // and self-verify it BEFORE the tree ships. The W25 lesson in its new
@@ -877,50 +925,6 @@ for (const name of VENV_NAMES) {
     await writeFile(file, `${BACKEND_PLACEHOLDER}${dialect.pthSeparator}${tail}\n`, "utf8");
     say(`placeholdered ${name}/${e.name}`);
   }
-}
-
-// ---------------------------------------------------------------------------
-// 5.5b sd-services frozen onedir (D3 P2-2/P2-5)
-//
-// ORDER: this block MUST run after §6 (envs-template staging) — it builds
-// from the STAGED sd-services venv, which §6 is what copies into place.
-// (First full-assemble run failed here with "staged venv python missing"
-// because 5.5b sat before §6; keep the numbering but not the position.)
-//
-// Same contract as 5.5 but for the shared services venv: build the
-// sd-services exe from the STAGED envs-template venv and place it at
-// backend/envs-template/frozen/sd-services/ — the layout resolveMcpPython
-// (node-client.ts) and config.ts (paperFrozenCommand) probe on the target
-// machine. start-stack.mjs's FROZEN_SERVICES_EXE resolves the same path.
-// The venv staging stays (dual rail); retirement is P3-3.
-// ---------------------------------------------------------------------------
-{
-  const sdServicesSpec = join(repo, "application", "scripts", "freeze", "sd-services.spec");
-  if (!existsSync(sdServicesSpec)) {
-    fail(`D3 services freeze spec missing: ${relative(out, sdServicesSpec)}`);
-  }
-  const frozenOut = join(out, "envs-template", "frozen", "sd-services");
-  const stagedVenvDir = join(out, "envs-template", "sd-services");
-  const stagedVenvPython = join(stagedVenvDir, dialect.venvBin, dialect.venvPythonName);
-  if (!existsSync(stagedVenvPython)) {
-    fail(`staged sd-services venv python missing (freeze build source): ${relative(out, stagedVenvPython)}`);
-  }
-  say("building frozen sd-services onedir (PyInstaller, ~3 min)");
-  try {
-    const stagedVenvBin2 = join(stagedVenvDir, dialect.venvBin);
-    const freezeEnv = { ...process.env, CODEBUDDY_SAFE_DELETE_ENABLED: "0", SD_FREEZE_VENV: stagedVenvBin2 };
-    execFileSync(stagedVenvPython, ["-m", "PyInstaller", "--distpath", frozenOut, "--workpath", join(out, "..", "freeze-work"), sdServicesSpec, "--noconfirm"], {
-      env: freezeEnv, windowsHide: true, stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024,
-    });
-  } catch (error) {
-    const detail = (error.stdout?.toString?.() ?? "") + (error.stderr?.toString?.() ?? error.message);
-    fail(`frozen sd-services build FAILED:\n${detail.slice(0, 4000)}`);
-  }
-  const frozenServicesExe = join(frozenOut, "sd-services", "sd-services.exe");
-  if (!existsSync(frozenServicesExe)) {
-    fail(`frozen services build produced no exe: ${relative(out, frozenServicesExe)}`);
-  }
-  say(`frozen sd-services OK: ${relative(out, frozenServicesExe)}`);
 }
 
 // ---------------------------------------------------------------------------
