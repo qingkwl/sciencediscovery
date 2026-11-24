@@ -880,6 +880,36 @@ for (const name of VENV_NAMES) {
     fail(`frozen services build produced no exe: ${relative(out, frozenServicesExe)}`);
   }
   say(`frozen sd-services OK: ${relative(out, frozenServicesExe)}`);
+  // [D3 P3-4, W13 — hollow-exe post-mortem probe] The 5.5b build once
+  // produced an exe whose PYZ contained ZERO sciencediscovery_adapter and
+  // ZERO sciencediscovery_memory_graph modules (collect_submodules silently
+  // emptied by the placeholdered staged venv; only the dispatcher's static
+  // imports survived) — every installed machine then died at the adapter,
+  // the UI's front door. A file-counting manifest cannot see a missing
+  // MODULE, so grep the freeze workdir's PYZ archive TOC (the exact list of
+  // what went into the exe) and require every first-party package to be
+  // present with real submodule depth. This is the probe that would have
+  // caught W13 at build time, and it needs zero cooperation from the
+  // packages (no __main__ entry points, no probe flags).
+  {
+    const pyzToc = join(out, "..", "freeze-work", "sd-services", "PYZ-00.toc");
+    if (!existsSync(pyzToc)) {
+      fail(`frozen exe module probe FAILED: PYZ TOC not found at ${pyzToc}`);
+    }
+    const tocText = readFileSync(pyzToc, "utf8");
+    for (const pkg of ["sciencediscovery_evolve", "sciencediscovery_gateway", "sciencediscovery_adapter", "sciencediscovery_memory_graph"]) {
+      // Count "…'pkg.sub…'" archive entries; the entry form is
+      // ('pkg.module', 'path.pyc', 'PYZ-00.pyz', ...). The bare package
+      // root counts as 1, so a healthy sweep is always >= 1; W13's hollow
+      // builds scored exactly 0 for adapter/memory_graph.
+      const re = new RegExp(`'${pkg}(?:\\.[A-Za-z0-9_]+)?'`, "g");
+      const hits = tocText.match(re)?.length ?? 0;
+      if (hits < 2) {
+        fail(`frozen exe module probe FAILED: ${pkg} has ${hits} module(s) in the PYZ (hollow exe — W13 regression). Refusing to ship.`);
+      }
+      say(`frozen exe module probe OK: ${pkg} (${hits} modules)`);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------

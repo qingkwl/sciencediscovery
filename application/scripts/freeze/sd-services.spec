@@ -66,6 +66,28 @@ binaries = []
 hiddenimports = []
 
 # --- first-party packages: the five sidecars, full submodule sweep ---
+# [D3 P3-4, W13 — the silent-empty-collection incident] collect_submodules
+# resolves through the RUNNING venv's import machinery, and the staged
+# venv's editable .pth files have already been placeholdered to
+# @@SD_BACKEND_ROOT@@ by assemble §6 (which runs BEFORE 5.5b) — a path
+# that exists nowhere at freeze time. Result: all four packages silently
+# collected ZERO modules; only the packages the dispatcher statically
+# imports survived into the exe, and the installed app died at the
+# adapter (the UI's front door) with ModuleNotFoundError. The dev sandbox
+# never saw it because its probe builds ran from the SOURCE venv, whose
+# .pth still points at the real repo. Fix: prepend the four src trees
+# (pathex already carries them for the entry script) to sys.path so
+# package resolution works regardless of the venv's editable state, and
+# FAIL LOUDLY when a package yields no modules — a silent zero is never
+# a valid answer for a package we own.
+_first_party_srcs = [
+    os.path.join(sd_repo_root, "services", name, "src")
+    for name in ("evolve", "gateway", "adapter", "memory-graph")
+]
+for _p in _first_party_srcs:
+    if not os.path.isdir(_p):
+        raise SystemExit(f"SD-D3: first-party src tree missing for freeze: {_p}")
+sys.path.insert(0, *_first_party_srcs)
 for pkg in (
     "sciencediscovery_evolve",
     "sciencediscovery_gateway",
@@ -73,6 +95,11 @@ for pkg in (
     "sciencediscovery_memory_graph",
 ):
     mods = collect_submodules(pkg)
+    if not mods:
+        # W13: an empty sweep means the resolver found no package — with
+        # the src trees on sys.path above this can only mean breakage,
+        # never "the package is empty". Refuse to build a hollow exe.
+        raise SystemExit(f"SD-D3: collect_submodules({pkg!r}) returned ZERO modules — refusing to freeze a hollow exe")
     hiddenimports += mods
     datas += copy_metadata(pkg.replace("_", "-"), recursive=True)
 
