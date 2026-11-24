@@ -1477,8 +1477,13 @@ say(`required-files manifest OK (${requiredFiles.length} entries)`);
 // a missing receipt is a hard failure — the runtime verify reads it too.
 {
   const stagedTag = stagedPatchTag(jwPayload);
+  // [D3 P3-4 early retirement] the verifier runs on the BUNDLED base
+  // interpreter, not the jw venv python — 6b retired .venv from the payload
+  // above, and swarm-patches.py is pure stdlib (argparse/hashlib/json/re),
+  // which the base python fully covers. A2b runs after 6b, so jwVenvPython
+  // is a deleted file here (spawn ENOENT, caught in the first retired build).
   const command = patchVerifyCommand({
-    jwPython: jwVenvPython,
+    jwPython: basePythonExe,
     swarmPatchesPy: join(backendOut, "scripts", "swarm-patches.py"),
     jwPayloadDir: jwPayload,
     tag: stagedTag,

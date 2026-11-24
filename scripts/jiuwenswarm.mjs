@@ -451,10 +451,22 @@ async function verifyCompatibilityPatches(cfg) {
     process.stderr.write("JiuwenSwarm: compatibility patches already verified (fingerprint match); skipping.\n");
     return;
   }
-  const { stdout } = await runLogged(cfg, "verify-locate", jwPython(cfg), [
-    "-c", "import importlib.util,pathlib; print(pathlib.Path(importlib.util.find_spec('jiuwenswarm').origin).parent.parent)",
-  ]);
-  await runLogged(cfg, "verify", jwPython(cfg), [join(scriptDir, "swarm-patches.py"), "verify", stdout.trim().split(/\r?\n/).pop(), cfg.tag]);
+  // [D3 P3-4 early retirement] the verify chain no longer spawns the jw venv
+  // python (the venv rail is retired from the payload; jwPython(cfg) resolves
+  // to the frozen dispatcher exe, which takes ENTRY names / -m / paper — NOT
+  // -c). The locate step's whole purpose was "the directory containing the
+  // jiuwenswarm package" — that is cfg.src by construction, so the -c probe
+  // is replaced by the known path. The verify itself runs on the BUNDLED base
+  // interpreter (SCIENCE_AGENT_PYTHON_PATH, injected by the packaged shell;
+  // dev falls back to findHostPython) — swarm-patches.py is pure stdlib,
+  // which the base python fully covers.
+  const verifierPython = process.env.SCIENCE_AGENT_PYTHON_PATH && existsSync(process.env.SCIENCE_AGENT_PYTHON_PATH)
+    ? process.env.SCIENCE_AGENT_PYTHON_PATH
+    : findHostPython();
+  if (!verifierPython) {
+    throw new Error("python3/python is required to verify the jw compatibility patches (set SCIENCE_AGENT_PYTHON_PATH).");
+  }
+  await runLogged(cfg, "verify", verifierPython, [join(scriptDir, "swarm-patches.py"), "verify", cfg.src, cfg.tag]);
   // fingerprint 为 null（补丁目录缺失等异常态）时不落 marker：verify 虽然过了，
   // 但下次仍应重新校验——缓存只覆盖"指纹可计算且匹配"这一种可信状态。
   if (fingerprint !== null) recordVerified(cfg, fingerprint);
