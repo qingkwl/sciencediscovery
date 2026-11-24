@@ -115,6 +115,12 @@ export function packagedEnv(paths: PackagedPaths, dataDir: string, platform: She
     // deployment modes put the dot-dirs under the same subdirectory.
     JIUWENSWARM_HOME: join(dataDir, "jiuwenswarm-home"),
     JIUWENSWARM_SRC: paths.jwSrc,
+    // [D3 P3-4 early retirement, W12 twin] The jw onedir ships inside the
+    // payload's jw src tree (backend\jw\frozen\sd-jw\sd-jw\sd-jw.exe — the
+    // PyInstaller 2-level onedir shape). Hand it to the stack explicitly so
+    // jiuwenswarm.mjs's candidate scan does not have to guess between the
+    // dataDir and payload layouts on a clean install.
+    SD_JW_FROZEN_EXE: join(paths.jwSrc, "frozen", "sd-jw", "sd-jw", "sd-jw.exe"),
     // [D3 P3-4 early retirement] The frozen onedirs are the only Python
     // runtime shipped: hand the stack and the API the services dispatcher
     // exe straight from the payload (resources\envs-template\frozen\...,

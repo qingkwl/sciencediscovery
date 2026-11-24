@@ -788,7 +788,11 @@ try {
           SCIENCE_AGENT_EVOLVE_INTERNAL_TOKEN: process.env.SCIENCE_AGENT_EVOLVE_INTERNAL_TOKEN ?? "sciencediscovery-evolve-local",
         },
       }));
-      if (!await waitHealthy("evolve", `http://127.0.0.1:${evolvePort}/health`, { timeoutSeconds: healthTimeoutSeconds })) {
+      // [D3 P3-4] the frozen dispatcher's first cold start pays a one-time
+      // cost (AV scans the onedir's DLLs on first load — measured minutes on
+      // locked-down machines), same class as memory-graph's 60s floor.
+      const evolveTimeout = Math.max(healthTimeoutSeconds, 60);
+      if (!await waitHealthy("evolve", `http://127.0.0.1:${evolvePort}/health`, { timeoutSeconds: evolveTimeout })) {
         throw new Error("evolve sidecar failed to start; stopping the stack.");
       }
       perf("evolve-healthy");

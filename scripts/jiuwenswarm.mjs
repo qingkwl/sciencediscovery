@@ -106,14 +106,33 @@ export function frozenJwExe(cfg) {
 }
 
 /** The frozen-onedir candidate scan shared by both modes:
- *   payload deploy:  <root>/frozen/sd-jw/sd-jw.exe      (P1-5 layout)
- *   dev sandbox:     <root>/../../.tmp-freeze-dist/sd-jw/sd-jw.exe
- *   explicit:        SD_JW_FROZEN_EXE (wins when set) */
+ *   explicit:        SD_JW_FROZEN_EXE (wins when set; packagedEnv injects
+ *                    the payload path — resources\backend\jw\frozen\...)
+ *   payload deploy:  <root>/frozen/sd-jw/sd-jw/sd-jw.exe  (P1-5 onedir:
+ *                    PyInstaller --distpath <root>/frozen/sd-jw produces
+ *                    sd-jw/sd-jw.exe — TWO levels; the single-level
+ *                    candidate below is the probe-era sandbox layout)
+ *   probe sandbox:   <root>/frozen/sd-jw/sd-jw.exe (dev probing one-level)
+ *   dev sandbox:     <root>/../../.tmp-freeze-dist/sd-jw/sd-jw.exe */
 function frozenJwExeCandidates(cfg) {
   const explicit = process.env.SD_JW_FROZEN_EXE;
   if (explicit && existsSync(explicit)) return explicit;
-  for (const rel of ["frozen/sd-jw/sd-jw.exe", "../../.tmp-freeze-dist/sd-jw/sd-jw.exe"]) {
+  const rels = [
+    "frozen/sd-jw/sd-jw/sd-jw.exe", // payload onedir (2-level, the shipped shape)
+    "frozen/sd-jw/sd-jw.exe",       // probe-era sandbox shape (1-level)
+    "../../.tmp-freeze-dist/sd-jw/sd-jw.exe",
+  ];
+  for (const rel of rels) {
     const cand = resolve(cfg.root, rel);
+    if (existsSync(cand)) return cand;
+  }
+  // [W12 twin] packaged fallback: the payload onedir also resolves off the
+  // jw SRC tree the shell injects (JIUWENSWARM_SRC=resources\backend\jw and
+  // frozen/ sits inside it) — covers a shell version predating the
+  // SD_JW_FROZEN_EXE injection.
+  const src = process.env.JIUWENSWARM_SRC;
+  if (src) {
+    const cand = join(src, "frozen", "sd-jw", "sd-jw", "sd-jw.exe");
     if (existsSync(cand)) return cand;
   }
   return undefined;

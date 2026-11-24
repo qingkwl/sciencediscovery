@@ -75,6 +75,9 @@ test("packagedEnv injects the packaged-mode contract (win32)", () => {
   // [D3 P3-4 early retirement] the frozen dispatcher exe IS the sidecar
   // runtime; PAPER and the MCP resolver get it straight from the payload.
   assert.equal(env.SCIENCE_AGENT_SD_SERVICES_EXE, join("C:\\res", "envs-template", "frozen", "sd-services", "sd-services", "sd-services.exe"));
+  // [W12 twin] the jw onedir is handed over explicitly too — the stack's
+  // candidate scan must not guess between dataDir and payload layouts.
+  assert.equal(env.SD_JW_FROZEN_EXE, join("C:\\res", "backend", "jw", "frozen", "sd-jw", "sd-jw", "sd-jw.exe"));
   assert.equal(env.SCIENCE_AGENT_PAPER_PYTHON_PATH, env.SCIENCE_AGENT_SD_SERVICES_EXE);
   // The Windows-only unisolated opt-in (Seatbelt exists nowhere on win32).
   assert.equal(env.SCIENCE_AGENT_EVOLVE_UNISOLATED, "1");
