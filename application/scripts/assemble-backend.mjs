@@ -1311,7 +1311,14 @@ try {
   say("payload runtime probe OK: package table swept as the rules intend, jw venv store write+query, default-EF fallback readable, HTML compressor on trafilatura");
 } catch (error) {
   const detail = (error.stdout?.toString?.() ?? "") + (error.stderr?.toString?.() ?? error.message);
-  fail(`payload runtime probe FAILED (jw venv):\n${detail}`);
+  // W8 (problems/W8): the build machine's chromadb Rust add segfaults
+  // (machine-level). If the probe died mid-run with the store-write marker
+  // missing, point at the documented escape instead of a bare wall.
+  const sawStoreLeg = /store write\+query|DEGRADED/.test(detail);
+  const segvHint = /store add|probe_items|collection OK/.test(detail) && !sawStoreLeg
+    ? `\n[W8] output stops at the store write leg — consistent with the build machine's chromadb Rust add segfault (problems/W8, machine-level, NOT a payload defect). Temporary unblock: SD_PROBE_SKIP_STORE_WRITE=1 (degrades ONLY the store add/query leg; the sweep table, EF guards and import faces stay fully gated). The skipped leg MUST be hand-verified on the install-smoke machine (P4-1 checklist).`
+    : "";
+  fail(`payload runtime probe FAILED (jw venv):\n${detail}${segvHint}`);
 }
 
 // A1b+ probe COLLECTION (D3 P0-3): the single probe above stays the
