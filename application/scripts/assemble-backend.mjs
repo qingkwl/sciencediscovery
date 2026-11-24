@@ -1385,19 +1385,67 @@ runProbeCollection("jw venv", jwVenvPython, "jw");
 runProbeCollection("sd-services venv", sdServicesVenvPython, "services");
 
 
+// ---------------------------------------------------------------------------
+// 6b. [D3 P3-4 EARLY RETIREMENT — venv rail removed from the PAYLOAD]
+// Ordered after the probe collection on purpose: the staged sd-services
+// venv and backend/jw/.venv are the FREEZE BUILD SOURCE (5.5/5.5b) and
+// the probe target (A1b+), so they must exist until the last consumer
+// has run. From here on the frozen onedirs are the ONLY Python runtime
+// shipped; deleting the venv trees here (rather than never staging
+// them) keeps 5.5/5.5b/A1b+ byte-identical to the verified dual-rail
+// build — the retirement is a pure SUBTRACTION at the payload end.
+//
+// Decision (user, 2026-11-24): skip the two-clean-releases window
+// (W7/P3-4's original plan) and retire the venv rail now; the product
+// decision record lives in the KB (versions d3-freeze-rc3). The frozen
+// exe gate below makes the step refuse to run on a tree where either
+// onedir is missing, so a venv rail cannot be silently dropped while
+// its frozen replacement is absent.
+{
+  const jwFrozenExe = join(jwPayload, "frozen", "sd-jw", "sd-jw", "sd-jw.exe");
+  const servicesFrozenExe = join(out, "envs-template", "frozen", "sd-services", "sd-services", "sd-services.exe");
+  if (dialect.family === "win32" && !existsSync(jwFrozenExe)) {
+    fail(`venv retirement refused: jw frozen exe missing (${relative(out, jwFrozenExe)}) — 5.5 must run first`);
+  }
+  if (dialect.family === "win32" && !existsSync(servicesFrozenExe)) {
+    fail(`venv retirement refused: sd-services frozen exe missing (${relative(out, servicesFrozenExe)}) — 5.5b must run first`);
+  }
+  const retired = [
+    join(out, "envs-template", "sd-services"),
+    join(jwPayload, ".venv"),
+  ];
+  for (const dir of retired) {
+    if (!existsSync(dir)) continue;
+    await rm(dir, { recursive: true, force: true });
+    say(`venv rail retired from payload: ${relative(out, dir)}`);
+  }
+  // The venv trees are gone, so nothing can normalize/compile them anymore —
+  // A2/pyc gates below already degrade correctly on missing dirs
+  // (launcher normalize skips absent dirs; compileTargets `continue`s on
+  // missing paths), but 7b/7c run BEFORE 6b in this file, so no reorder is
+  // needed. Keep the entries listed so a future reorder fails LOUDLY here
+  // instead of silently re-adding a venv to the payload.
+  say("venv retirement complete: frozen onedirs are the only Python runtime shipped");
+}
+
+
 // A2 RequiredFiles manifest: every file an installer must contain, checked
 // before the build is accepted (field history: a missing patch directory
 // killed the stack cold start in a shipped installer).
 const requiredFiles = [
   join(jwPayload, ".sciencediscovery-patches.json"),
-  join(jwPayload, ".venv", dialect.venvBin, dialect.family === "darwin" ? "jiuwenswarm-start" : "jiuwenswarm-start.exe"),
+  // [D3 P3-4 early retirement] jiuwenswarm-start.exe lived in the jw venv's
+  // Scripts/ — that venv is retired from the payload (6b); the frozen exe
+  // below is the spawn entry the stack resolves now.
   // [D3 P1-5] the frozen exe the P1-3 spawn rail resolves; required because
   // the manifest is what the INSTALLER verifies — a missing onedir must
   // fail the build here, not the first spawn on a user machine.
   join(jwPayload, "frozen", "sd-jw", "sd-jw", "sd-jw.exe"),
+  // [D3 P2-2] same contract for the services onedir (MCP/evolve/memory-graph
+  // spawn rail after 6b retired the sd-services venv from the payload).
+  join(out, "envs-template", "frozen", "sd-services", "sd-services", "sd-services.exe"),
   join(out, "backend", "services", "api", "dist", "server.js"),
   join(out, "backend", "services", "runner", "dist", "server.js"),
-  join(out, "envs-template", "sd-services", ...dialect.sitePackages(PYTHON_MINOR).split("/"), "_editable_impl_sciencediscovery_gateway.pth"),
   join(out, "micromamba", dialect.micromambaName),
   join(out, "python", ...dialect.bundledBasePythonPath.split("/")),
 ];
