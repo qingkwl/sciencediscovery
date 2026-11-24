@@ -279,13 +279,20 @@ const FROZEN_SERVICES_EXE = (() => {
   // a rail choice. Dev mode keeps SD_SD_SERVICES_FREEZE=0 as an escape hatch
   // for probing the old rail against a locally provisioned venv.
   if (packaged) {
+    // The shell injects SCIENCE_AGENT_SD_SERVICES_EXE (packagedEnv, pointing
+    // into the payload's resources tree) — trust it first. The fallbacks
+    // cover a shell version predating that injection: the payload layout
+    // (resources\envs-template\frozen\...) resolved off the repository root
+    // this script runs from, then the historical dataDir copy.
     const explicit = process.env.SCIENCE_AGENT_SD_SERVICES_EXE?.trim();
-    const found = explicit && existsSync(resolve(explicit))
-      ? resolve(explicit)
-      : [join(dataDir, "frozen", "sd-services", "sd-services", "sd-services.exe")]
-        .find((cand) => existsSync(cand));
+    const candidates = [
+      ...(explicit ? [resolve(explicit)] : []),
+      join(repositoryRoot, "resources", "envs-template", "frozen", "sd-services", "sd-services", "sd-services.exe"),
+      join(dataDir, "frozen", "sd-services", "sd-services", "sd-services.exe"),
+    ];
+    const found = candidates.find((cand) => existsSync(cand));
     if (!found) {
-      fail("packaged mode requires the frozen sd-services onedir (dataDir\frozen\sd-services) — the venv rail no longer ships; reinstall ScienceDiscovery.");
+      fail("packaged mode requires the frozen sd-services onedir — the venv rail no longer ships; reinstall ScienceDiscovery. (looked in: " + candidates.join("; ") + ")");
     }
     return found;
   }

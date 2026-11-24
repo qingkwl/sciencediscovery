@@ -72,7 +72,10 @@ test("packagedEnv injects the packaged-mode contract (win32)", () => {
   // .jiuwenswarm-instances never lands in the real %USERPROFILE%.
   assert.equal(env.JIUWENSWARM_HOME, join("D:\\data", "jiuwenswarm-home"));
   assert.equal(env.JIUWENSWARM_SRC, join("C:\\res", "backend", "jw"));
-  assert.equal(env.SCIENCE_AGENT_PAPER_PYTHON_PATH, join("D:\\data", "envs", "sd-services", "Scripts", "python.exe"));
+  // [D3 P3-4 early retirement] the frozen dispatcher exe IS the sidecar
+  // runtime; PAPER and the MCP resolver get it straight from the payload.
+  assert.equal(env.SCIENCE_AGENT_SD_SERVICES_EXE, join("C:\\res", "envs-template", "frozen", "sd-services", "sd-services", "sd-services.exe"));
+  assert.equal(env.SCIENCE_AGENT_PAPER_PYTHON_PATH, env.SCIENCE_AGENT_SD_SERVICES_EXE);
   // The Windows-only unisolated opt-in (Seatbelt exists nowhere on win32).
   assert.equal(env.SCIENCE_AGENT_EVOLVE_UNISOLATED, "1");
 });
@@ -85,7 +88,10 @@ test("packagedEnv: darwin uses POSIX venv paths and NEVER opts into unisolated",
   // win32 where python.exe sits at the payload-python root.
   assert.equal(env.SCIENCE_AGENT_PYTHON_PATH, join("/res", "python", "bin", "python3"));
   assert.equal(env.SCIENCE_AGENT_PROVISIONER_PATH, join("/res", "micromamba", "micromamba"));
-  assert.equal(env.SCIENCE_AGENT_PAPER_PYTHON_PATH, join("/data", "envs", "sd-services", "bin", "python3"));
+  // [D3 P3-4 early retirement] darwin ships the frozen rail too — paper and
+  // the services dispatcher point into the bundle's envs-template.
+  assert.equal(env.SCIENCE_AGENT_SD_SERVICES_EXE, join("/res", "envs-template", "frozen", "sd-services", "sd-services", "sd-services.exe"));
+  assert.equal(env.SCIENCE_AGENT_PAPER_PYTHON_PATH, env.SCIENCE_AGENT_SD_SERVICES_EXE);
   // Same W1 fix on darwin: never fall back to process.env.HOME (~ on macOS).
   assert.equal(env.JIUWENSWARM_HOME, join("/data", "jiuwenswarm-home"));
   // Seatbelt answers on darwin without any opt-in; the unisolated escape
@@ -775,8 +781,11 @@ test("packagedEnv uses in-place venv paths when SCIENCE_AGENT_IN_PLACE_ENVS=1", 
   const paths = packagedPaths(join(root, "resources"));
   const env = packagedEnv(paths, join(root, "data"));
   assert.equal(env.SCIENCE_AGENT_ENVS_DIR, join(root, "resources", "envs-template"));
-  assert.equal(env.SCIENCE_AGENT_PAPER_PYTHON_PATH,
-    join(root, "resources", "envs-template", "sd-services", layout.venvBin, layout.venvPython));
+  // [D3 P3-4 early retirement] in-place or not, the sidecar runtime is the
+  // frozen dispatcher exe from the payload's envs-template.
+  assert.equal(env.SCIENCE_AGENT_SD_SERVICES_EXE,
+    join(root, "resources", "envs-template", "frozen", "sd-services", "sd-services", "sd-services.exe"));
+  assert.equal(env.SCIENCE_AGENT_PAPER_PYTHON_PATH, env.SCIENCE_AGENT_SD_SERVICES_EXE);
 });
 
 // --- countBytecode / readPayloadBytecodeManifest: the first-launch IO --------

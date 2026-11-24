@@ -115,10 +115,21 @@ export function packagedEnv(paths: PackagedPaths, dataDir: string, platform: She
     // deployment modes put the dot-dirs under the same subdirectory.
     JIUWENSWARM_HOME: join(dataDir, "jiuwenswarm-home"),
     JIUWENSWARM_SRC: paths.jwSrc,
+    // [D3 P3-4 early retirement] The frozen onedirs are the only Python
+    // runtime shipped: hand the stack and the API the services dispatcher
+    // exe straight from the payload (resources\envs-template\frozen\...,
+    // the P2-5 assemble layout) so no consumer has to guess where the
+    // onedir lives. The dataDir copy of the onedir (the probe layout) does
+    // not exist on a clean install — the exe the payload carries IS the
+    // runtime. Field incident (rc3 first install): start-stack resolved
+    // <dataDir>\frozen\... only and hard-failed "packaged mode requires the
+    // frozen sd-services onedir" on a healthy install.
+    SCIENCE_AGENT_SD_SERVICES_EXE: join(paths.envsTemplate, "frozen", "sd-services", "sd-services", "sd-services.exe"),
     // The api defaults paper's interpreter to a POSIX-style venv path that
-    // never exists on Windows; point it at the shared sidecar venv
-    // (SIZEOPT W2: one "sd-services" venv for all five Python sidecars).
-    SCIENCE_AGENT_PAPER_PYTHON_PATH: join(envsRoot, "sd-services", layout.venvBin, layout.venvPython),
+    // never exists on Windows; the frozen dispatcher carries paper as the
+    // loose-file entry (`<exe> paper <worker.py> ...`, the -I contract is
+    // satisfied by the dispatcher's cwd isolation) since the venv retired.
+    SCIENCE_AGENT_PAPER_PYTHON_PATH: join(paths.envsTemplate, "frozen", "sd-services", "sd-services", "sd-services.exe"),
     // Tell the stack where to find the sidecar venvs (in-place or copied).
     SCIENCE_AGENT_ENVS_DIR: envsRoot,
     // Ship the new desktop UI as the renderer payload.
