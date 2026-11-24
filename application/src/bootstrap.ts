@@ -462,17 +462,24 @@ interface PayloadBytecodeManifest {
 }
 
 /**
- * Read the build's own bytecode count for the region bootstrap unpacks
- * (envs-template -> <dataDir>\envs). Returns null when version.json is missing,
- * unreadable, or predates the `bytecode` field, so the caller degrades to the
- * absolute coverage limit rather than passing blind on a missing input
- * (lesson L51). Synchronous and tiny (the manifest is ~300 bytes), matching
- * needsUnpack's stamp read.
+ * Read the build's own bytecode count for the PRECOMPILE FACE — the regions
+ * the A6 gate judges (assemble PYC_FACE_REGIONS, same allowlist). Returns
+ * null when version.json is missing, unreadable, or predates the `bytecode`
+ * field, so the caller degrades to the absolute coverage limit rather than
+ * passing blind on a missing input (lesson L51). Synchronous and tiny (the
+ * manifest is ~300 bytes), matching needsUnpack's stamp read.
+ *
+ * [D3 P3-4 early retirement] The face is the bundled stdlib ("python") —
+ * since 6b removed the venv trees from the payload the envs-template region
+ * carries only the frozen onedir (loose .py there are package DATA; their
+ * bytecode lives in the PYZ archives), so counting THAT region would judge a
+ * tree that has no precompile semantics and fail every launch. Keep the
+ * byRegion audit object intact — only the READ moves.
  */
 export function readPayloadBytecodeManifest(resourcesPath: string): { py: number; pyc: number } | null {
   try {
     const manifest = JSON.parse(readFileSync(join(resourcesPath, "version.json"), "utf8")) as { bytecode?: PayloadBytecodeManifest };
-    const region = manifest.bytecode?.byRegion?.["envs-template"];
+    const region = manifest.bytecode?.byRegion?.["python"];
     if (region && Number.isFinite(region.py) && Number.isFinite(region.pyc)) {
       return { py: region.py, pyc: region.pyc };
     }
@@ -544,7 +551,15 @@ async function judgeBytecodeCoverage(
   resourcesPath: string,
   log: (line: string) => void,
 ): Promise<{ ok: boolean; ratio: number; reason: string; expectedPyc: number | null; kind: string | null }> {
-  const counts = await countBytecode(envsDir);
+  // [D3 P3-4 early retirement] The judged tree is the PRECOMPILE FACE (the
+  // bundled stdlib, paths.python), not the unpacked envs: since the venv
+  // retirement the envs-template region carries only the frozen onedir,
+  // whose loose .py files have no __pycache__ semantics (bytecode lives in
+  // the PYZ archives). Judging that tree would compare apples to the build's
+  // oranges and fail every first launch. The stdlib IS the region the build
+  // precompiles (assemble 7c) and the region A6 gates — same tree on both
+  // sides of the comparison.
+  const counts = await countBytecode(join(resourcesPath, "python"));
   const expectedRegion = readPayloadBytecodeManifest(resourcesPath);
   const verdict = unpackedBytecodeVerdict(counts, expectedRegion);
   // Name BOTH recorded counts. The suffix used to report only the .pyc, which

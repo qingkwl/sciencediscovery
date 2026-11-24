@@ -825,8 +825,8 @@ test("readPayloadBytecodeManifest reads the envs-template region and tolerates a
       byRegion: { "envs-template": { py: 6124, pyc: 6119 }, python: { py: 1095, pyc: 1094 } },
     },
   }), "utf8");
-  assert.deepEqual(readPayloadBytecodeManifest(root), { py: 6124, pyc: 6119 },
-    "must return the envs-template region bootstrap unpacks");
+  assert.deepEqual(readPayloadBytecodeManifest(root), { py: 1095, pyc: 1094 },
+    "must return the precompile-face region (python) the A6 gate judges");
 
   // A manifest predating the bytecode field -> null, not a crash.
   await writeFile(join(root, "version.json"), JSON.stringify({ repoCommit: "x", piecesMB: {} }), "utf8");
@@ -854,16 +854,23 @@ test("readPayloadBytecodeManifest reads the envs-template region and tolerates a
  *  with a sibling .pyc, plus the venv scaffolding the fix passes touch. Returns
  *  the resources root. This is the SOURCE both branches run from — in-place uses
  *  it directly, copy mode unpacks it into <dataDir>\envs. No Scripts\python.exe,
- *  so precompileTargets() yields [] and no real compileall is spawned. */
+ *  so precompileTargets() yields [] and no real compileall is spawned.
+ *  [D3 P3-4 early retirement] the precompile face lives under resources/python
+ *  (the bundled stdlib region the A6 gate judges) — the .py/.pyc set is written
+ *  there; envs-template stays as the venv-shape scaffolding the fix passes and
+ *  the copy branch still exercise. */
 async function makePayloadFixture(root: string, files: number, caches: number): Promise<string> {
   const resources = join(root, "resources");
   const sp = join(resources, "envs-template", "sd-services", "Lib", "site-packages", "pkg");
   await mkdir(join(sp, "__pycache__"), { recursive: true });
   await writeFile(join(resources, "envs-template", "sd-services", "pyvenv.cfg"), "home = C:\\builder\\python\n", "utf8");
+  const face = join(resources, "python", "Lib");
+  const faceCache = join(face, "__pycache__");
+  await mkdir(faceCache, { recursive: true });
   for (let i = 0; i < files; i += 1) {
-    await writeFile(join(sp, `m${i}.py`), "", "utf8");
+    await writeFile(join(face, `m${i}.py`), "", "utf8");
     if (i < caches) {
-      await writeFile(join(sp, "__pycache__", `m${i}.cpython-312.pyc`), "", "utf8");
+      await writeFile(join(faceCache, `m${i}.cpython-312.pyc`), "", "utf8");
     }
   }
   return resources;
@@ -877,9 +884,13 @@ async function writeManifest(
   region: { py: number; pyc: number },
   identity?: { repoCommit: string; builtAt: string },
 ): Promise<void> {
+  // [D3 P3-4 early retirement] the precompile face moved to the "python"
+  // region (the bundled stdlib) — judgeBytecodeCoverage counts
+  // resources/python and readPayloadBytecodeManifest reads the same key, so
+  // the fixture writes both the face and the byRegion audit entry.
   await writeFile(join(resources, "version.json"), JSON.stringify({
     ...(identity ?? {}),
-    bytecode: { py: region.py, pyc: region.pyc, byRegion: { "envs-template": region } },
+    bytecode: { py: region.py, pyc: region.pyc, byRegion: { python: region, "envs-template": { py: 0, pyc: 0 } } },
   }), "utf8");
 }
 
@@ -1061,7 +1072,9 @@ test("in-place mode names a tree that lost sources but kept their caches", async
   // (PEP 3147 resolves a .pyc against a source that is no longer present).
   const resources = await makePayloadFixture(root, 20, 20);
   await writeManifest(resources, { py: 20, pyc: 20 });
-  const sp = join(resources, "envs-template", "sd-services", "Lib", "site-packages", "pkg");
+  // [P3-4 early retirement] the sources live in the precompile face now —
+  // the antivirus scenario deletes stdlib .py files.
+  const sp = join(resources, "python", "Lib");
   for (let i = 0; i < 16; i += 1) await rm(join(sp, `m${i}.py`));
 
   const lines: string[] = [];
@@ -1143,7 +1156,8 @@ test("copy mode names a copy that lost sources but kept their caches", async (t)
   // .py limit is live on both paths rather than only where it was added.
   const resources = await makePayloadFixture(root, 20, 20);
   await writeManifest(resources, { py: 20, pyc: 20 });
-  const sp = join(resources, "envs-template", "sd-services", "Lib", "site-packages", "pkg");
+  // [P3-4 early retirement] sources live in the precompile face (python).
+  const sp = join(resources, "python", "Lib");
   for (let i = 0; i < 16; i += 1) await rm(join(sp, `m${i}.py`));
 
   const dataDir = join(root, "data");

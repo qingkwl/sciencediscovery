@@ -1686,11 +1686,27 @@ if (!dialect.hasTrampolines) {
 // eroding is a budget that fails all at once. The ratio and its calibration
 // live in scripts/lib/pyc-budget.mjs, pinned against both release6 trees by
 // test/pyc-budget.test.ts — change the limit there, not here.
+//
+// [D3 P3-4 early retirement] SCOPE CHANGE: with the venv rail gone from the
+// payload (6b), the only region a first-launch compileall can still tax is
+// the bundled stdlib. The frozen onedirs carry their bytecode inside the PYZ
+// archives — the loose .py files there are package DATA, imports never touch
+// them — and backend/jw's loose .py tree is the jw source-of-record the
+// patch-verify chain fingerprints (swarm-patches.py), not an import surface.
+// The gate therefore judges the PRECOMPILE FACE (region allowlist below)
+// instead of the whole tree; frozen/jw-src .py files drop out of BOTH the
+// ratio and the advisory. version.json's bytecode.byRegion keeps every
+// region (audit trail) but the gate and bootstrap's unpacked-verdict read
+// the same allowlist.
+const PYC_FACE_REGIONS = ["python"];
 {
-  const verdict = pycBudgetVerdict(pyCount, pycCount);
+  const facePy = PYC_FACE_REGIONS.reduce((n, r) => n + (pycByRegion[r]?.py ?? 0), 0);
+  const facePyc = PYC_FACE_REGIONS.reduce((n, r) => n + (pycByRegion[r]?.pyc ?? 0), 0);
+  const verdict = pycBudgetVerdict(facePy, facePyc);
   const pct = (n) => `${(n * 100).toFixed(1)}%`;
-  say(`A6 bytecode budget: ${pycCount} .pyc for ${pyCount} .py = ${pct(verdict.ratio)} (limit ${pct(PYC_MIN_RATIO)})`);
-  const weak = regionsBelowRatio(pycByRegion);
+  say(`A6 bytecode budget (precompile face ${JSON.stringify(PYC_FACE_REGIONS)}): ${facePyc} .pyc for ${facePy} .py = ${pct(verdict.ratio)} (limit ${pct(PYC_MIN_RATIO)})`);
+  const faceRegions = Object.fromEntries(PYC_FACE_REGIONS.map((r) => [r, pycByRegion[r]]).filter(([, v]) => v));
+  const weak = regionsBelowRatio(faceRegions);
   if (weak.length > 0) {
     // Advisory, not a failure: the gate is whole-tree, and a whole-tree ratio
     // has a blind spot proportional to a region's size — a SMALL target losing
