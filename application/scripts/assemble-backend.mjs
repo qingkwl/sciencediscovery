@@ -1341,6 +1341,28 @@ function runProbeCollection(label, pythonExe, envFilter) {
   delete collectionEnv.SD_PROBE_DEV_TREE;
   delete collectionEnv.SD_VERIFY_TARGET;
   collectionEnv.SD_VERIFY_TARGET = "venv";
+  // Placeholder semantics vs build-time probes: the services env's editable
+  // .pth files were rewritten to @@SD_BACKEND_ROOT@@\services\<name>\src in §6 —
+  // a token the INSTALL-time bootstrap resolves on the user machine. At build
+  // time that token is inert, so a staged-venv probe importing
+  // sciencediscovery_evolve (vendored-runner probe, A3 of the P0 inventory)
+  // would die with ModuleNotFoundError even though the payload itself is
+  // complete (backend/services/<name>/src IS in the payload tree — verified
+  // by A2 RequiredFiles). Mirror the bootstrap's replacement here by
+  // prepending the REAL build-time source roots onto PYTHONPATH: the probes
+  // then exercise the exact package trees the installer ships.
+  if (envFilter === "services") {
+    const editableSrcs = ["adapter", "evolve", "gateway", "memory-graph"].map(
+      (n) => join(backendOut, "services", n, "src"),
+    );
+    for (const src of editableSrcs) {
+      if (!existsSync(src)) fail(`probe collection PYTHONPATH entry missing: ${relative(out, src)}`);
+    }
+    const injected = editableSrcs.join(dialect.pthSeparator === "\\" ? ";" : ":");
+    collectionEnv.PYTHONPATH = collectionEnv.PYTHONPATH
+      ? `${injected}${dialect.pthSeparator === "\\" ? ";" : ":"}${collectionEnv.PYTHONPATH}`
+      : injected;
+  }
   try {
     const out2 = execFileSync(pythonExe, [runVerify, "--env", envFilter], {
       env: collectionEnv, windowsHide: true, encoding: "utf8",
