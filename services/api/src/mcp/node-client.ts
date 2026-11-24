@@ -197,7 +197,11 @@ export function resolveMcpPython(env: NodeJS.ProcessEnv = process.env, dataDir?:
   // P2-5 assemble layout) or an explicit env override spawns the MCP
   // servers through the dispatcher exe; its -m channel carries
   // `python -m sciencediscovery_gateway.*` args unchanged, so the spawn
-  // site needs no edit. SD_SD_SERVICES_FREEZE=0 forces the venv rail.
+  // site needs no edit. SD_SD_SERVICES_FREEZE=0 forces the venv rail
+  // (dev escape hatch only — the packaged payload ships no venv since the
+  // P3-4 early retirement, and start-stack's resolver hard-fails there
+  // before the API is up, so this branch cannot silently fall through in
+  // a packaged install).
   if (env.SD_SD_SERVICES_FREEZE !== "0") {
     const frozen = env.SCIENCE_AGENT_SD_SERVICES_EXE?.trim();
     const roots = [

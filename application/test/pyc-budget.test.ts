@@ -251,14 +251,20 @@ test("the compile environment reaches compileall", () => {
 });
 
 test("the A6 gate judges the walked counts and fails the build", () => {
-  assert.match(assemble, /pycBudgetVerdict\(pyCount, pycCount\)/, "A6 must judge the counts from the payload walk");
+  // [D3 P3-4 early retirement] the gate judges the PRECOMPILE FACE (region
+  // allowlist) instead of the whole tree — the frozen onedirs' loose .py are
+  // package data (bytecode in the PYZ), backend/jw's loose .py are the
+  // patch-verify chain's source-of-record. facePy/facePyc derive from the
+  // same walk counters the gate has always read.
+  assert.match(assemble, /pycBudgetVerdict\(facePy, facePyc\)/, "A6 must judge the precompile-face counts from the payload walk");
   assert.match(assemble, /if \(!verdict\.ok\) \{\s*\n\s*fail\(/, "A6 must fail() the build when the verdict is not ok");
-  assert.match(assemble, /A6 bytecode budget:/, "A6 must print on every build (a trend quantity nobody sees eroding fails all at once)");
+  assert.match(assemble, /A6 bytecode budget \(precompile face/, "A6 must print on every build (a trend quantity nobody sees eroding fails all at once)");
   // The counts must actually be accumulated by the walk, not left at zero — a
   // gate fed 0/0 would take the "broken measurement" branch forever and could
   // be mistaken for working.
   assert.match(assemble, /if \(e\.name\.endsWith\("\.py"\)\) \{\s*\n\s*pyCount \+= 1;/, "the walk must count .py files");
   assert.match(assemble, /pycCount \+= 1;/, "the walk must count .pyc files");
+  assert.match(assemble, /const PYC_FACE_REGIONS = \["python"\];/, "the face allowlist must name the stdlib region explicitly");
 });
 
 test("the A6 threshold is imported from the library, not restated", () => {
@@ -519,7 +525,11 @@ test("both bootstrap branches judge coverage through the shared helper", () => {
   // The helper must actually count and judge, not just log.
   const helper = /async function judgeBytecodeCoverage\([\s\S]*?\n\}/.exec(bootstrap)?.[0] ?? "";
   assert.ok(helper, "the judgeBytecodeCoverage definition anchor no longer matches");
-  assert.match(helper, /await countBytecode\(envsDir\)/, "the tree must be counted, not probed for a first hit");
+  // [D3 P3-4 early retirement] the judged tree is the PRECOMPILE FACE (the
+  // bundled stdlib at resources/python) — envs-template carries only the
+  // frozen onedir since the venv retirement, and counting THAT tree would
+  // judge .py files whose bytecode lives in the PYZ archives.
+  assert.match(helper, /await countBytecode\(join\(resourcesPath, "python"\)\)/, "the face must be counted, not probed for a first hit");
   assert.match(helper, /readPayloadBytecodeManifest\(resourcesPath\)/, "the build's manifest count must be read");
   assert.match(helper, /unpackedBytecodeVerdict\(counts, expectedRegion\)/, "the count must be judged by the shared verdict");
   assert.match(helper, /first run: WARNING .* incomplete bytecode:/,

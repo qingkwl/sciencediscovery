@@ -88,12 +88,28 @@ const jwEntryCache = new Map();
  * the env var is read once per process, never inherited by spawns).
  */
 export function frozenJwExe(cfg) {
+  // [D3 P3-4 early retirement] packaged mode REQUIRES the frozen rail — the
+  // jw venv no longer ships, so a missing onedir is a broken install. Dev
+  // mode keeps SD_JW_FREEZE=0 as the old-rail escape hatch.
+  const packaged = process.env.SCIENCE_AGENT_PACKAGED === "1";
+  if (packaged) {
+    const found = frozenJwExeCandidates(cfg);
+    if (!found) {
+      throw new Error(
+        "packaged mode requires the frozen sd-jw onedir (<root>/frozen/sd-jw/sd-jw.exe) — "
+        + "the venv rail no longer ships; reinstall ScienceDiscovery.");
+    }
+    return found;
+  }
   if (process.env.SD_JW_FREEZE === "0") return undefined;
-  // root = .sciencediscovery-data/jiuwenswarm (payload: <data>/jiuwenswarm;
-  // dev: same layout) — the frozen onedir candidates:
-  //   payload deploy:  <root>/frozen/sd-jw/sd-jw.exe      (P1-5 layout)
-  //   dev sandbox:     <root>/../../.tmp-freeze-dist/sd-jw/sd-jw.exe
-  //   explicit:        SD_JW_FROZEN_EXE (wins when set)
+  return frozenJwExeCandidates(cfg);
+}
+
+/** The frozen-onedir candidate scan shared by both modes:
+ *   payload deploy:  <root>/frozen/sd-jw/sd-jw.exe      (P1-5 layout)
+ *   dev sandbox:     <root>/../../.tmp-freeze-dist/sd-jw/sd-jw.exe
+ *   explicit:        SD_JW_FROZEN_EXE (wins when set) */
+function frozenJwExeCandidates(cfg) {
   const explicit = process.env.SD_JW_FROZEN_EXE;
   if (explicit && existsSync(explicit)) return explicit;
   for (const rel of ["frozen/sd-jw/sd-jw.exe", "../../.tmp-freeze-dist/sd-jw/sd-jw.exe"]) {
