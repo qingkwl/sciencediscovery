@@ -87,7 +87,10 @@ _first_party_srcs = [
 for _p in _first_party_srcs:
     if not os.path.isdir(_p):
         raise SystemExit(f"SD-D3: first-party src tree missing for freeze: {_p}")
-sys.path.insert(0, *_first_party_srcs)
+# slice-assign keeps list.insert's 2-arg contract while prepending the whole
+# set in order (insert(0, *paths) is a TypeError — caught by the first full
+# assemble run).
+sys.path[:0] = _first_party_srcs
 for pkg in (
     "sciencediscovery_evolve",
     "sciencediscovery_gateway",
