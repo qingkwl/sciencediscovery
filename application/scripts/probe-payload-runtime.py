@@ -310,24 +310,16 @@ def check_packages(present):
 
 
 def probe_store_with_w8_escape():
-    """W8 escape hatch (problems/W8): chromadb's Rust `add` segfaults on the
-    current build machine (machine-level runtime damage — a clean venv with a
-    fresh wheel reproduces it; NOT a payload defect). SD_PROBE_SKIP_STORE_WRITE=1
-    skips the add/query leg and reports a DEGRADED line instead, so the rest
-    of the gate (sweep table, EF guards, import faces) keeps its full value on
-    this machine. The store write leg MUST be re-verified by hand on the
-    install-smoke machine (P4-1 checklist item); removing this escape requires
-    the W8 fix (sfc/DISM/VC++ or OS-level repair) plus a green full run.
+    """The store add+query leg. The W8 escape hatch
+    (SD_PROBE_SKIP_STORE_WRITE=1) was REMOVED after the build machine's
+    chromadb Rust add segfault (problems/W8, machine-level VC++ runtime damage)
+    was fixed by reinstalling the VC++ x64 redistributable - verified green
+    twice: dev-venv retest AND a full assemble probe run, both 2026-11-25.
+    The leg is now mandatory again: a segfault here fails the build loudly
+    instead of shipping with a hand-verify note.
     """
     import asyncio
 
-    if os.environ.get("SD_PROBE_SKIP_STORE_WRITE", "") == "1":
-        print(
-            "DEGRADED: store write+query SKIPPED via SD_PROBE_SKIP_STORE_WRITE=1 "
-            "(W8 machine-level chromadb add segfault; see problems/W8; "
-            "re-verify store add/query by hand on the install-smoke machine)"
-        )
-        return "DEGRAVED_STORE", "skipped", "skipped"
     return asyncio.run(probe_store())
 
 
