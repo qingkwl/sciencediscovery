@@ -1168,12 +1168,22 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
   // short-lived test server is — would otherwise leave this loop running against a server that no longer
   // exists, one more concurrent caller hammering the shared adapter for no reason. Tied to the server's
   // own close event below, not a bare setTimeout chain.
+  // [rc3 field fix] The flat 5x3s window races the stack's own startup: the
+  // adapter answers as soon as IT is up, but JiuwenSwarm's gateway (whose
+  // config.set the adapter forwards to) lands ~13s+ later on a cold start,
+  // so the whole retry budget expired on HTTP 502 before the target endpoint
+  // existed - the install log showed exactly five sync failures inside the
+  // startup window, then silence. Widen to a two-phase ladder: fast attempts
+  // first (adapter still warming), then slow ones spanning the gateway's
+  // cold-start tail. Still bounded and abortable so a test server that
+  // closes early kills the chain.
+  const WEB_SYNC_RETRY_DELAYS_MS = [3_000, 3_000, 5_000, 10_000, 20_000];
   const jiuwenSwarmWebSyncAbort = new AbortController();
   if (jiuwenSwarm) {
     void ready.then(async () => {
-      for (let attempt = 0; attempt < 5 && !jiuwenSwarmWebSyncAbort.signal.aborted; attempt += 1) {
+      for (let attempt = 0; attempt < WEB_SYNC_RETRY_DELAYS_MS.length && !jiuwenSwarmWebSyncAbort.signal.aborted; attempt += 1) {
         if ((await syncJiuwenSwarmWeb()).ok) return;
-        await delay(3_000, undefined, { signal: jiuwenSwarmWebSyncAbort.signal }).catch(() => undefined);
+        await delay(WEB_SYNC_RETRY_DELAYS_MS[attempt]!, undefined, { signal: jiuwenSwarmWebSyncAbort.signal }).catch(() => undefined);
       }
     }).catch(() => undefined);
   }
