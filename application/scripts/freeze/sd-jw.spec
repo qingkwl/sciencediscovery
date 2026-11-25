@@ -227,6 +227,32 @@ http2_submodules = [
     *collect_submodules("hpack"),
     *collect_submodules("hyperframe"),
 ]
+# [SD-D3 5, W14 — the lazy-__init__ import surfaces] Four packages expose
+# their contents through module __getattr__ + importlib.import_module
+# (PEP 562 lazy exports): gateway, gateway.cron, gateway.channel_manager,
+# agents.harness.common.tools. PyInstaller's static analysis cannot follow
+# a name that is only resolved at attribute-lookup time — the rc3 field
+# run died at gateway startup with ModuleNotFoundError: No module named
+# 'jiuwenswarm.gateway.cron.controller' (the cron package scored zero
+# archive entries while its __init__ sat green in the PYZ). Sweep each
+# lazy package's FULL submodule tree so every lazy target and everything
+# those targets import statically rides along; a zero-module sweep for a
+# package that exists on disk is breakage, not an answer (W13's lesson).
+lazy_packages = [
+    "jiuwenswarm.gateway",
+    "jiuwenswarm.gateway.cron",
+    "jiuwenswarm.gateway.channel_manager",
+    "jiuwenswarm.agents.harness.common.tools",
+]
+lazy_submodules = []
+for _lazy_pkg in lazy_packages:
+    _mods = collect_submodules(_lazy_pkg)
+    if not _mods:
+        raise SystemExit(
+            f"SD-D3: collect_submodules({_lazy_pkg!r}) returned ZERO modules — "
+            "a lazy-__init__ package vanished from the freeze source; refusing to build a hollow exe (W13/W14)"
+        )
+    lazy_submodules += _mods
 
 hiddenimports = webview_hiddenimports + http2_submodules + [
     "matplotlib",
@@ -263,7 +289,7 @@ hiddenimports = webview_hiddenimports + http2_submodules + [
     "jiuwenswarm.channels.web.app_web",
     "jiuwenswarm.server.app_agentserver",
     "jiuwenswarm.gateway.app_gateway",
-] + openjiuwen_submodules + symphony_submodules + team_kv_cache_hiddenimports + dispatch_submodules
+] + openjiuwen_submodules + symphony_submodules + team_kv_cache_hiddenimports + dispatch_submodules + lazy_submodules
 
 # [SD-D3 3] runtime hook: sitecustomize chain + CREATE_NO_WINDOW.
 _sd_runtime_hook = os.path.join(SPEC_DIR, "sd_runtime_hook.py")
