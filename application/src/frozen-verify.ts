@@ -9,17 +9,32 @@
 // quarantine, a disk error) fails HERE with a readable message instead
 // of surfacing as a loader traceback deep inside the frozen exe.
 //
-// Returns null when the payload ships no manifest (pre-D3 builds, or a
-// dual-rail payload without frozen onedirs) — absence is not an error
-// there. The verify shares the sha256 implementation shape with
+// Returns a mode:"none" verdict when the payload ships no manifest
+// (pre-D3 builds, or a dual-rail payload without frozen onedirs) —
+// absence is not an error there. The verify shares the sha256
+// implementation shape with
 // scripts/lib/frozen-manifest.mjs (kept separate: the bootstrap must
 // not import from the build scripts' module graph).
+//
+// [W17] Verify-tier demotion (2026-11-26). The full pass reads all
+// 839.5MB (14,071 files) serially — 147.7s measured warm on the field
+// machine — and it ran on EVERY launch (it sits before the
+// needsUnpack short-circuit, so no path could skip it). That turned
+// every frozen-rail start into a ~2.5min stall: the A/B experiment
+// (D:/CodeFile/sd-perf-ab, W17) isolated it as the dominant cost of
+// the frozen rail vs the venv rail. Fix: a verify stamp keyed on the
+// payload identity (same shape bootstrap's unpack stamp uses). First
+// launch (or a changed payload — upgrade/reinstall/identity shift)
+// runs the full hash and writes the stamp; every later launch runs a
+// stat+size pass only (<1s warm) and falls back to the full hash when
+// a size disagrees (tamper/corruption/drift). Deleting the stamp
+// simply re-triggers the full pass: the mechanism fails safe, never
+// open.
 
 import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { existsSync } from "node:fs";
+import { createReadStream, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 export interface FrozenVerifyProblem {
   path: string;
@@ -32,6 +47,10 @@ export interface FrozenVerifyResult {
   ok: boolean;
   problems: FrozenVerifyProblem[];
   checked: number;
+  /** [W17] Which tier actually ran: "full" hashed every file, "fast"
+   *  checked sizes only (stamp hit), "none" skipped everything (no
+   *  manifest). Lets the perf log answer "why was this start fast". */
+  mode: "full" | "fast" | "none";
 }
 
 interface FrozenManifestEntry {
@@ -44,6 +63,47 @@ interface FrozenManifest {
   schemaVersion: number;
   onedirs: Record<string, { fileCount: number; totalBytes: number }>;
   files: FrozenManifestEntry[];
+}
+
+/** [W17] The stamp record: "this payload was fully verified here".
+ *  `identity` must be the caller's payloadIdentity() string (see
+ *  bootstrap.payloadIdentity — commit@builtAt); the manifest's own
+ *  generatedAt/fileCount/totalBytes ride along as a second factor so
+ *  two builds that somehow share a version.json identity but ship
+ *  different payloads still split the stamp. */
+export interface FrozenVerifyStamp {
+  schemaVersion: 1;
+  identity: string;
+  manifestFingerprint: string;
+  verifiedFileCount: number;
+  verifiedBytes: number;
+  verifiedAt: string;
+}
+
+/** Manifest-derived second factor for the stamp (identity alone keys on
+ *  version.json; the fingerprint keys on the manifest content). */
+function manifestFingerprint(manifest: FrozenManifest): string {
+  const { generatedAt = "", fileCount, totalBytes } = summarize(manifest);
+  return `${generatedAt}:${fileCount}:${totalBytes}`;
+}
+
+function summarize(manifest: FrozenManifest): {
+  generatedAt?: string;
+  fileCount: number;
+  totalBytes: number;
+} {
+  // onedirs is the authoritative aggregate the assembler writes; fall
+  // back to counting the files array when a future schema drops it.
+  let fileCount = 0;
+  let totalBytes = 0;
+  for (const v of Object.values(manifest.onedirs ?? {})) {
+    fileCount += v.fileCount;
+    totalBytes += v.totalBytes;
+  }
+  if (fileCount === 0 && Array.isArray(manifest.files)) {
+    for (const f of manifest.files) { fileCount += 1; totalBytes += f.size; }
+  }
+  return { generatedAt: (manifest as { generatedAt?: unknown }).generatedAt as string | undefined, fileCount, totalBytes };
 }
 
 /** The manifest's entry paths are `<rootKey>/<rel>`; the payload maps
@@ -69,20 +129,56 @@ async function sha256File(path: string): Promise<string> {
   return hash.digest("hex");
 }
 
-/** Verify the frozen payload against its build-time manifest.
- *  Returns null when no manifest ships (nothing to verify). */
-export async function verifyFrozenPayload(
-  resourcesPath: string,
-  log: (line: string) => void,
-): Promise<FrozenVerifyResult | null> {
-  const manifestPath = join(resourcesPath, "frozen-manifest.json");
-  if (!existsSync(manifestPath)) return null;
-  const manifest: FrozenManifest = JSON.parse(await readFile(manifestPath, "utf8"));
-  if (manifest.schemaVersion !== 1) {
-    throw new Error(`frozen-manifest.json schemaVersion ${manifest.schemaVersion} not understood (bootstrap is older than the payload; reinstall)`);
+/** [W17] Read the stamp; null when absent, unreadable, or schema-ahead
+ *  (all treated as "no stamp" → full pass; fail-safe, never open). */
+export function readFrozenVerifyStamp(stampPath: string): FrozenVerifyStamp | null {
+  try {
+    const raw = JSON.parse(readFileSync(stampPath, "utf8")) as Partial<FrozenVerifyStamp>;
+    if (raw.schemaVersion !== 1 || typeof raw.identity !== "string") return null;
+    return {
+      schemaVersion: 1,
+      identity: raw.identity,
+      manifestFingerprint: typeof raw.manifestFingerprint === "string" ? raw.manifestFingerprint : "",
+      verifiedFileCount: typeof raw.verifiedFileCount === "number" ? raw.verifiedFileCount : 0,
+      verifiedBytes: typeof raw.verifiedBytes === "number" ? raw.verifiedBytes : 0,
+      verifiedAt: typeof raw.verifiedAt === "string" ? raw.verifiedAt : "",
+    };
+  } catch {
+    return null;
   }
-  const started = Date.now();
+}
+
+/** [W17] Atomic stamp write (tmp + rename) — a half-written stamp must
+ *  never read as valid (worst case: the NEXT start falls back to the
+ *  full pass, which is exactly the safe direction). The stamp lives
+ *  under <dataDir>\envs, which does not exist yet on the very first
+ *  launch (verify runs at bootstrapPackaged entry, BEFORE the unpack
+ *  creates it) — so the write mkdirs the parent: without it every
+ *  first launch would fail the stamp write with ENOENT and never
+ *  demote, silently keeping the 147.7s pass on EVERY launch (the bug
+ *  W17 exists to fix). Best-effort: a read-only dataDir logs and moves
+ *  on; the next start re-verifies. */
+function writeFrozenVerifyStamp(stampPath: string, stamp: FrozenVerifyStamp, log: (line: string) => void): void {
+  try {
+    mkdirSync(dirname(stampPath), { recursive: true });
+    const tmp = `${stampPath}.tmp`;
+    writeFileSync(tmp, JSON.stringify(stamp, null, 2), "utf8");
+    renameSync(tmp, stampPath);
+  } catch (error) {
+    log(`frozen-verify stamp write failed (next start will re-verify in full): ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/** The full pass: stat + size + sha256 every manifest entry. Unchanged
+ *  in shape from the pre-W17 implementation; now reached only when the
+ *  stamp misses (first run, upgraded/reinstalled payload, stamp
+ *  deleted, or a size drift caught by the fast pass). */
+async function verifyFull(
+  resourcesPath: string,
+  manifest: FrozenManifest,
+): Promise<{ problems: FrozenVerifyProblem[]; bytes: number }> {
   const problems: FrozenVerifyProblem[] = [];
+  let bytes = 0;
   for (const entry of manifest.files) {
     const full = resolveEntry(resourcesPath, entry.path);
     let st;
@@ -103,10 +199,107 @@ export async function verifyFrozenPayload(
     const digest = await sha256File(full);
     if (digest !== entry.sha256) {
       problems.push({ path: entry.path, kind: "hash", expected: entry.sha256, actual: digest });
+      continue;
     }
+    bytes += st.size;
   }
-  const ok = problems.length === 0;
+  return { problems, bytes };
+}
+
+/** [W17] The fast pass: stat + size only (no reads). Warm, 14k entries
+ *  stat in well under a second. Any mismatch is reported as a problem
+ *  so the caller escalates to the full pass — a size mismatch means
+ *  tamper, corruption, or payload drift, and hashing decides which. */
+async function verifySizes(
+  resourcesPath: string,
+  manifest: FrozenManifest,
+): Promise<{ problems: FrozenVerifyProblem[]; bytes: number }> {
+  const problems: FrozenVerifyProblem[] = [];
+  let bytes = 0;
+  for (const entry of manifest.files) {
+    const full = resolveEntry(resourcesPath, entry.path);
+    let st;
+    try {
+      st = await stat(full);
+    } catch {
+      problems.push({ path: entry.path, kind: "missing" });
+      continue;
+    }
+    if (!st.isFile()) {
+      problems.push({ path: entry.path, kind: "not-a-file" });
+      continue;
+    }
+    if (st.size !== entry.size) {
+      problems.push({ path: entry.path, kind: "size", expected: entry.size, actual: st.size });
+      continue;
+    }
+    bytes += st.size;
+  }
+  return { problems, bytes };
+}
+
+/** Verify the frozen payload against its build-time manifest.
+ *  Returns a mode:"none" verdict when no manifest ships (nothing to
+ *  verify).
+ *
+ *  [W17] `stampPath` + `identity` demote repeat launches to a
+ *  stat+size fast pass (write the stamp after a successful full pass;
+ *  hit the fast pass while identity+fingerprint both match). Both are
+ *  optional: legacy callers passing no stamp keep the always-full
+ *  behaviour, and a null identity (no version.json) simply never
+ *  stamps — degraded but correct. */
+export async function verifyFrozenPayload(
+  resourcesPath: string,
+  log: (line: string) => void,
+  options?: { stampPath?: string; identity?: string | null },
+): Promise<FrozenVerifyResult> {
+  const manifestPath = join(resourcesPath, "frozen-manifest.json");
+  if (!existsSync(manifestPath)) {
+    log("[perf] frozen integrity: no manifest (non-frozen payload) — skipped");
+    return { ok: true, problems: [], checked: 0, mode: "none" };
+  }
+  const manifest: FrozenManifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  if (manifest.schemaVersion !== 1) {
+    throw new Error(`frozen-manifest.json schemaVersion ${manifest.schemaVersion} not understood (bootstrap is older than the payload; reinstall)`);
+  }
+  const started = Date.now();
+  const fingerprint = manifestFingerprint(manifest);
   const faces = Object.entries(manifest.onedirs).map(([k, v]) => `${k}=${v.fileCount}`).join(", ");
+
+  // [W17] Tier 1: stamp hit → sizes-only fast pass.
+  const stampPath = options?.stampPath;
+  const identity = options?.identity ?? null;
+  const stamp = stampPath ? readFrozenVerifyStamp(stampPath) : null;
+  const stampValid = stamp !== null
+    && identity !== null
+    && stamp.identity === identity
+    && stamp.manifestFingerprint === fingerprint;
+
+  if (stampValid && stamp) {
+    const { problems, bytes } = await verifySizes(resourcesPath, manifest);
+    if (problems.length === 0) {
+      log(`[perf] frozen integrity: OK (fast) — ${manifest.files.length} files, ${(bytes / 1e6).toFixed(1)}MB size-checked in ${Date.now() - started}ms (full pass stamped ${stamp.verifiedAt})`);
+      return { ok: true, problems: [], checked: manifest.files.length, mode: "fast" };
+    }
+    // Size drift on a stamped payload: escalate — hash the full tree to
+    // distinguish corruption/tamper from benign drift, then the stamp
+    // refresh below keeps the next launch fast again.
+    log(`[perf] frozen integrity: stamp hit but ${problems.length} size mismatch(es) — escalating to full pass`);
+  }
+
+  // [W17] Tier 2: the full pass (first run / changed payload / drift).
+  const { problems, bytes } = await verifyFull(resourcesPath, manifest);
+  const ok = problems.length === 0;
   log(`[perf] frozen integrity: ${ok ? "OK" : "FAILED"} — ${manifest.files.length} files (${faces}) in ${Date.now() - started}ms`);
-  return { ok, problems, checked: manifest.files.length };
+  if (ok && stampPath && identity !== null) {
+    writeFrozenVerifyStamp(stampPath, {
+      schemaVersion: 1,
+      identity,
+      manifestFingerprint: fingerprint,
+      verifiedFileCount: manifest.files.length,
+      verifiedBytes: bytes,
+      verifiedAt: new Date().toISOString(),
+    }, log);
+  }
+  return { ok, problems, checked: manifest.files.length, mode: "full" };
 }

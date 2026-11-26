@@ -85,6 +85,15 @@ export function stampPath(dataDir: string): string {
   return join(dataDir, "envs", ".shell-unpacked");
 }
 
+/** [W17] The frozen-verify stamp: "this payload was fully hashed here
+ *  already". Sibling of .shell-unpacked (same directory, same
+ *  lifecycle: delete dataDir/envs and both regenerate). Written
+ *  atomically after a successful full pass; read on every launch to
+ *  demote the integrity check to a stat+size fast pass. */
+export function frozenVerifyStampPath(dataDir: string): string {
+  return join(dataDir, "envs", ".frozen-verified");
+}
+
 /** Env vars the packaged shell injects into every stack spawn. */
 export function packagedEnv(paths: PackagedPaths, dataDir: string, platform: ShellPlatform = CURRENT_SHELL_PLATFORM): NodeJS.ProcessEnv {
   const layout = venvLayoutFor(platform);
@@ -735,12 +744,21 @@ export async function bootstrapPackaged(
   // verify them against the build-time manifest (frozen-manifest.json,
   // assemble 5.5c) BEFORE any spawn. A missing/corrupted file surfaces
   // here as a readable error instead of a cryptic loader traceback on
-  // the first spawn. 14k files hash in a few seconds (cold disk); the
-  // venv rails stay unverified (their gates are A1/A6's).
+  // the first spawn.
+  // [W17] The pass is now tiered: the first launch (or a changed
+  // payload — upgrade/reinstall) hashes everything and writes a stamp
+  // keyed on payloadIdentity; every later launch stat+size-checks only
+  // (<1s warm) and escalates back to the full hash on any drift. The
+  // full pass measured 147.7s warm on the field machine (839.5MB /
+  // 14,071 files, serial), which ran on EVERY launch pre-W17 — the
+  // dominant frozen-vs-venv startup gap (D:/CodeFile/sd-perf-ab, W17).
   {
     const { verifyFrozenPayload } = await import("./frozen-verify.ts");
-    const verdict = await verifyFrozenPayload(paths.resourcesPath, log);
-    if (verdict !== null && !verdict.ok) {
+    const verdict = await verifyFrozenPayload(paths.resourcesPath, log, {
+      stampPath: frozenVerifyStampPath(dataDir),
+      identity: payloadIdentity(paths.resourcesPath),
+    });
+    if (!verdict.ok) {
       // Hard error: a broken frozen rail cannot be worked around.
       throw new Error(
         `frozen payload integrity check FAILED: ${verdict.problems[0]?.kind} ${verdict.problems[0]?.path}`
