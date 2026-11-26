@@ -882,7 +882,16 @@ try {
           say("JiuwenSwarm is not running; starting it (node scripts/jiuwenswarm.mjs start)...");
           await jwStart(cfg);
           jwRunning = true; // W20: cleanup() must stop the detached group
-          Object.assign(process.env, await jwEnv(cfg));
+          // PAB-6: a bare await here let one flaky jwEnv() read (half-written
+          // instance file right after start, transient fs error) reject the
+          // whole sidecar promise with no fallback — the process env would
+          // miss the jw URLs and every later spawn derailed. Degrade to a
+          // warning + keep whatever the pre-start probe above established.
+          const startedEnv = await jwEnv(cfg).catch(error => {
+            say(`WARNING: JiuwenSwarm env read-back failed after start (${error instanceof Error ? error.message : String(error)}); keeping previously detected URLs`);
+            return null;
+          });
+          if (startedEnv) Object.assign(process.env, startedEnv);
         }
       })());
     }
