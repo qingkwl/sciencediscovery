@@ -1188,7 +1188,15 @@ const compileTargets = [
   // dead weight that shipped in every installer). -x skips path
   // components named tests so the bytecode is never generated in the first
   // place; the post-compile sweep below is the belt-and-suspenders net.
-  { label: "jiuwenswarm src", python: jwVenvPython, path: jwPayload, exclude: "[/\\\\]tests[/\\\\]" },
+  // [W26] frozen/ is excluded for the opposite reason: the onedir's datas
+  // pyc files were snapshotted by the 5.5c manifest BEFORE this step runs.
+  // compileall with checked-hash would rewrite any pyc whose source-hash
+  // mismatches (the skills __pycache__ shipped in the jw source tree does
+  // not match what this venv's python regenerates — 140 files, +31B each),
+  // silently invalidating the manifest we just wrote. The frozen onedirs
+  // need NO precompile anyway (bytecode lives in the PYZ archives; the
+  // comment above this section says exactly that) — keep compileall out.
+  { label: "jiuwenswarm src", python: jwVenvPython, path: jwPayload, exclude: "[/\\\\](?:tests|frozen)[/\\\\]" },
 ];
 for (const { label, python, path: target, exclude } of compileTargets) {
   if (!existsSync(target)) continue;
