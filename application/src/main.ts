@@ -350,7 +350,15 @@ async function loadUi(endpoints: Endpoints, token: string | null): Promise<void>
   const reachable = await waitForUiOrigin(endpoints.ui, 30_000, fetch, (ms) => new Promise((r) => setTimeout(r, ms)), Date.now);
   if (!reachable) log(`loadUi: ui origin not answering within 30s; loading anyway (did-fail-load retry is the backstop)`);
   if (!mainWindow || quitConfirmed) return;
-  log(`[perf] loadUi elapsed=${Date.now() - appStartAt}ms`);
+  // [perf base fix] elapsed used appStartAt (module-load clock), so a wizard
+  // session parked on the data-dir step for hours inflated "loadUi" into a
+  // meaningless number (34216661ms observed) and made fresh installs look
+  // "slow" by the user-wait seconds the wizard itself added. The startup
+  // clock starts when the user CONFIRMS the data dir (startupFlow entry) —
+  // that is the moment the machine starts working. appStartAt stays as the
+  // session-wide anchor for non-loadUi lines.
+  const perfBase = startupFlowEnteredAt ?? appStartAt;
+  log(`[perf] loadUi elapsed=${Date.now() - perfBase}ms${startupFlowEnteredAt ? " base=startupFlow" : ""}`);
   SD_PERF("loadUi-loadURL", `ui=${endpoints.ui}`);
   attachAuthFallback(endpoints);
   // Preload consumes the fragment before page JS runs.
@@ -1001,8 +1009,15 @@ async function surfaceBackendDead(code: number | null): Promise<void> {
 
 let startupProxyEnv: NodeJS.ProcessEnv | null = null;
 let startupFlowInFlight = false;
+// [perf base fix] the wall-clock moment the user confirmed the data dir (or
+// the non-wizard boot reached startupFlow). loadUi reports against this when
+// set so wizard think-time never counts as "startup time" (see loadUi).
+let startupFlowEnteredAt: number | null = null;
 
 async function startupFlow(proxyEnv: NodeJS.ProcessEnv | null): Promise<void> {
+  // [perf base fix] stamp the moment the startup work actually begins; the
+  // wizard park-time before this moment is user think-time, not startup.
+  startupFlowEnteredAt ??= Date.now();
   SD_PERF("startupFlow-enter");
   // The window shows the local loading page while we probe and (if needed)
   // cold-start the stack; loadUi replaces it once healthy.
