@@ -567,9 +567,64 @@
     ${If} ${FileExists} "$APPDATA\sd-shell"
       !insertmacro DeleteFastThenHelper "$APPDATA\sd-shell"
     ${EndIf}
-    RMDir /r "$R5"
-    ${If} ${FileExists} "$R5"
-      !insertmacro DeleteFastThenHelper "$R5"
+    ; [W28] Ownership guard for the mirrored data dir. data-dir.txt is a
+    ; plain-text mirror the shell writes next to its wizard state; a stale
+    ; or hand-edited file once named a directory that was NOT this
+    ; product's data (2026-11-27: an unrelated directory was deleted while
+    ; the user's real data lived elsewhere, because a test install had
+    ; repointed the mirror). The uninstaller must not act on a path it
+    ; cannot recognize as its own: the target has to be a real
+    ; subdirectory (not a drive root, not a Windows system directory,
+    ; not the install dir) AND carry at least one marker this product's
+    ; backend creates (envs/, secrets/, jiuwenswarm/, catalog.sqlite,
+    ; model-secrets.key). Anything else is skipped, with the reason in
+    ; %TEMP%\sd-data-delete.log — a missed deletion is recoverable by
+    ; hand; a wrong deletion is not. $R6 verdict / $R7 scratch / $R8
+    ; unused here (GetTime below writes $1-$7; $R5 carries the dir).
+    ${IfNot} ${FileExists} "$R5"
+      DetailPrint "user-data delete: $R5 does not exist — nothing to remove"
+    ${Else}
+      StrCpy $R6 "ok"
+      StrLen $R7 $R5
+      ${If} $R7 <= 3
+        StrCpy $R6 "refused"
+      ${EndIf}
+      ${If} $R5 == $WINDIR
+      ${OrIf} $R5 == $PROGRAMFILES
+      ${OrIf} $R5 == $PROGRAMFILES32
+      ${OrIf} $R5 == $PROGRAMFILES64
+      ${OrIf} $R5 == $PROFILE
+      ${OrIf} $R5 == $APPDATA
+      ${OrIf} $R5 == $LOCALAPPDATA
+      ${OrIf} $R5 == $TEMP
+      ${OrIf} $R5 == $DESKTOP
+      ${OrIf} $R5 == $INSTDIR
+        StrCpy $R6 "refused"
+      ${EndIf}
+      ${If} ${FileExists} "$R5\envs"
+      ${OrIf} ${FileExists} "$R5\secrets"
+      ${OrIf} ${FileExists} "$R5\jiuwenswarm"
+      ${OrIf} ${FileExists} "$R5\catalog.sqlite"
+      ${OrIf} ${FileExists} "$R5\model-secrets.key"
+        ; recognized data dir
+      ${Else}
+        StrCpy $R6 "refused"
+      ${EndIf}
+      ${If} $R6 == "ok"
+        RMDir /r "$R5"
+        ${If} ${FileExists} "$R5"
+          !insertmacro DeleteFastThenHelper "$R5"
+        ${EndIf}
+      ${Else}
+        ClearErrors
+        FileOpen $9 "$TEMP\sd-data-delete.log" a
+        ${IfNot} ${Errors}
+          ${GetTime} "" "L" $1 $2 $3 $4 $5 $6 $7
+          FileWrite $9 "[$3-$2-$1 $5:$6:$7] user-data delete SKIPPED: $R5 failed the ownership guard (not a recognized ScienceDiscovery data dir)$\r$\n"
+          FileClose $9
+        ${EndIf}
+        DetailPrint "user-data delete: $R5 failed the ownership guard — kept (see %TEMP%\sd-data-delete.log)"
+      ${EndIf}
     ${EndIf}
     RMDir /r "$PROFILE\.jiuwenswarm-instances"
     ${If} ${FileExists} "$PROFILE\.jiuwenswarm-instances"

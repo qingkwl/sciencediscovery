@@ -30,7 +30,7 @@ import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { copyFile, cp, mkdir, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync, lstatSync, readdirSync, readFileSync, readlinkSync } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   copyVenvRuntimeDlls, greenletRuntimeProblem, greenletVersionAtLeast,
@@ -554,6 +554,39 @@ say("copying backend static tree (scripts/api/runner/paper/sidecars/web/skills)"
 for (const { src, dest } of copySet) {
   await mkdir(dirname(dest), { recursive: true });
   await cp(src, dest, { recursive: true, force: true });
+}
+
+// [W27] The desktop SPA's HUAWEI sign-in URL is baked at build time from
+// VITE_ACCOUNTS_API (apps/desktop/.env.production is the production default).
+// A bundle built with NO value anywhere compiles buildEnv() to "" — "same
+// origin" — and the sign-in button then navigates to a path the local API's
+// static fallback answers with index.html: a reload loop that looks like a
+// crash (2026-11-27, 78 navigations observed on one install). The same
+// check covers apps/web, whose browser deployment needs the same absolute
+// origin. Content check, not a re-run of vite: the compiled buildEnv object
+// literal carries the URL verbatim, so its absence in the bundle is the
+// defect itself. Dev/e2e bundles (mode=development) never reach this copy.
+for (const appDir of ["apps/desktop", "apps/web"]) {
+  const distDir = join(backendOut, appDir.replace("/", sep), "dist", "assets");
+  let baked = false;
+  if (existsSync(distDir)) {
+    for (const f of await readdir(distDir)) {
+      if (!f.endsWith(".js")) continue;
+      const text = await readFile(join(distDir, f), "utf8");
+      if (text.includes("https://sciencediscovery.openjiuwen.com/accounts")) { baked = true; break; }
+    }
+  }
+  if (!baked) {
+    fail(
+      `[W27] ${appDir} bundle does not carry the accounts origin. `
+      + "The HUAWEI sign-in URL is compiled from VITE_ACCOUNTS_API; with no "
+      + "value the button navigates to a same-origin path the SPA fallback "
+      + "swallows (reload loop, see problems/W27). Build the bundle with the "
+      + "env set (apps/*/.env.production is the default) — pnpm --filter "
+      + `${appDir === "apps/desktop" ? "@sciencediscovery/desktop" : "@sciencediscovery/web"} build.`,
+    );
+  }
+  say(`${appDir}: accounts origin baked into the bundle (W27 guard)`);
 }
 // If a prepared SEA directory was staged under services/runner/dist, remove
 // that duplicate after copying it to the node_modules layout above.

@@ -19,6 +19,20 @@ import { loadLocalAccessToken } from "./local-access-token.js";
 import { applyDocumentLanguage } from "./text.js";
 import "./styles/index.css";
 
+// [W27] Misroute guard. The HUAWEI sign-in button builds its URL from
+// build-time `VITE_ACCOUNTS_API`; a bundle built with no value anywhere
+// compiles it to "" — "same origin" — so the button navigated to
+// /v1/auth/huawei/start on the SPA's own origin, where the static server's
+// fallback answered with index.html (a 200). The SPA booted on that path and
+// rendered the sign-in page again: an in-place reload loop that looked like
+// a crash (78 navigations observed in the field). The build now bakes the
+// accounts origin in (.env.production); this guard is the belt to that
+// suspenders — if the bundle ever regresses, the address is corrected back
+// to the app root instead of letting the loop run.
+if (window.location.pathname.startsWith("/v1/")) {
+  window.history.replaceState(null, "", "/");
+}
+
 const root = document.getElementById("root");
 if (!root) throw new Error("#root is missing from index.html");
 

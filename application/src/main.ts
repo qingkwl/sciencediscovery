@@ -1542,6 +1542,27 @@ function createWindow(): void {
     exportStreams.abortAll();
   });
   mainWindow.webContents.on("destroyed", () => { exportStreams.abortAll(); });
+  // [W27] window.open from the SPA: MCP OAuth (McpServers.tsx opens a sized
+  // popup and navigates it to the provider) and the feedback dialog
+  // (about:blank tab, then location.replace) both depend on the call returning
+  // a real window — a blanket deny would break them. Allow the popup but
+  // confine it to a plain browser window (no node integration), and send
+  // everything that is not the popup-placeholder itself to the system
+  // browser. Note the main window's own full-page navigations are
+  // deliberately NOT guarded: the HUAWEI sign-in flow navigates the main
+  // window to the accounts service and back via returnUrl — that is the
+  // product design, and the W27 reload loop (a mis-built bundle navigating
+  // to a same-origin path the SPA fallback swallowed) is caught one layer
+  // up, by the App's /v1 misroute guard + the assemble-time bundle check.
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (url === "about:blank") {
+      const options: Electron.BrowserWindowConstructorOptions = { webPreferences: { nodeIntegration: false, contextIsolation: true, sandbox: true } };
+      return { action: "allow", overrideBrowserWindowOptions: options };
+    }
+    log(`[nav-guard] refusing window.open to ${url}; opening externally`);
+    void electronShell.openExternal(url).catch(() => undefined);
+    return { action: "deny" };
+  });
   // First-run race: the health gate watches the control API (4410), but the
   // ui origin (4310 adapter) binds several seconds later on cold machines —
   // the first loadURL died with ERR_CONNECTION_REFUSED and the window sat
