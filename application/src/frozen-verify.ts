@@ -34,6 +34,8 @@
 import { createHash } from "node:crypto";
 import { createReadStream, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
+import { Worker } from "node:worker_threads";
+import { availableParallelism, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 export interface FrozenVerifyProblem {
@@ -169,39 +171,217 @@ function writeFrozenVerifyStamp(stampPath: string, stamp: FrozenVerifyStamp, log
   }
 }
 
-/** The full pass: stat + size + sha256 every manifest entry. Unchanged
- *  in shape from the pre-W17 implementation; now reached only when the
- *  stamp misses (first run, upgraded/reinstalled payload, stamp
- *  deleted, or a size drift caught by the fast pass). */
+/** The full pass: stat + size + sha256 every manifest entry.
+ *
+ *  [W29] Parallelized (2026-11-27). The pre-W29 serial loop measured
+ *  3.8s warm / 147.7s on the field machine's first cold run (839.5MB,
+ *  14,071 files) — pure IO-latency bound on a mountain of ~60KB files.
+ *  A worker_threads pool overlaps the reads: measured on the same
+ *  payload, serial 3792ms → 4 workers 1592ms → 8 workers 1058ms →
+ *  12 workers 905ms (diminishing past 8). 8 is the pool size (matches
+ *  os.availableParallelism/2 clamped to [4,8] — small machines keep
+ *  headroom, big ones stop at the knee). Workers are plain JS (the
+ *  bootstrap must not import from the build graph — same discipline as
+ *  the manifest helpers): written once to tmpdir and reused for the
+ *  whole pass; each worker owns one file at a time (stat → size gate →
+ *  stream+hash), so problem classification stays identical to the
+ *  serial shape. Worker spawn failure falls back to the serial path —
+ *  verification must never fail because the pool could not be created. */
 async function verifyFull(
+  resourcesPath: string,
+  manifest: FrozenManifest,
+  poolSize = defaultWorkerPoolSize(),
+): Promise<{ problems: FrozenVerifyProblem[]; bytes: number }> {
+  const tasks = manifest.files.map(entry => ({ entry, full: resolveEntry(resourcesPath, entry.path) }));
+  // Small manifests (or a pool of 1) are not worth the worker spawn:
+  // the serial path has lower fixed cost.
+  if (poolSize <= 1 || tasks.length < 64) {
+    return verifyFullSerial(resourcesPath, manifest);
+  }
+  const workerFile = writeVerifyWorker();
+  if (workerFile === null) {
+    return verifyFullSerial(resourcesPath, manifest);
+  }
+  const problems: FrozenVerifyProblem[] = [];
+  let bytes = 0;
+  let next = 0;
+  let settled = 0;
+  const pool: Worker[] = [];
+  const terminatePool = (): void => {
+    for (const w of pool) {
+      try { void w.terminate(); } catch { /* already gone */ }
+    }
+  };
+  try {
+    await new Promise<void>(resolvePass => {
+      const feed = (worker: Worker): void => {
+        const i = next++;
+        if (i >= tasks.length) {
+          // No more work: a live worker keeps the event loop alive (its
+          // message port never closes on its own) and would hang the
+          // caller after the last task settles — terminate it.
+          try { void worker.terminate(); } catch { /* already gone */ }
+          if (settled === tasks.length) resolvePass();
+          return;
+        }
+        const { entry, full } = tasks[i];
+        worker.once("message", (m: {
+          kind: "ok" | "missing" | "not-a-file" | "size" | "hash";
+          expected?: number | string;
+          actual?: number | string;
+          bytes?: number;
+        }) => {
+          settled += 1;
+          switch (m.kind) {
+            case "ok":
+              bytes += m.bytes ?? 0;
+              break;
+            case "missing":
+              problems.push({ path: entry.path, kind: "missing" });
+              break;
+            case "not-a-file":
+              problems.push({ path: entry.path, kind: "not-a-file" });
+              break;
+            case "size":
+              problems.push({ path: entry.path, kind: "size", expected: m.expected, actual: m.actual });
+              break;
+            case "hash":
+              problems.push({ path: entry.path, kind: "hash", expected: m.expected, actual: m.actual });
+              break;
+          }
+          if (settled === tasks.length) {
+            terminatePool();
+            resolvePass();
+          } else {
+            feed(worker);
+          }
+        });
+        worker.once("error", () => {
+          // A crashed worker must not stall the pass: its task falls back
+          // to inline verification on the main thread.
+          settled += 1;
+          void verifyOneSerial(full, entry).then(({ problem, size }) => {
+            if (problem) problems.push(problem);
+            bytes += size;
+            if (settled === tasks.length) {
+              terminatePool();
+              resolvePass();
+            }
+          });
+          // The pool shrank; remaining tasks still stream through the
+          // other workers (feed() keeps being called by their messages).
+        });
+        worker.postMessage({ path: full, size: entry.size, sha256: entry.sha256 });
+      };
+      for (let i = 0; i < poolSize && i < tasks.length; i++) {
+        const w = new Worker(workerFile);
+        pool.push(w);
+        feed(w);
+      }
+    });
+  } finally {
+    terminatePool();
+    try { rmSyncQuiet(workerFile); } catch { /* best-effort */ }
+  }
+  return { problems, bytes };
+}
+
+/** [W29] Pool size: half the logical cores (hashing is CPU-light, the
+ *  bottleneck is IO latency), clamped to [4, 8] — the measured knee of
+ *  the curve. Fewer than 4 cores → still 4 (overlap is the point). */
+function defaultWorkerPoolSize(): number {
+  const cores = availableParallelismSafe();
+  if (cores <= 0) return 1;
+  return Math.max(4, Math.min(8, Math.ceil(cores / 2)));
+}
+
+function availableParallelismSafe(): number {
+  try {
+    return availableParallelism();
+  } catch {
+    return 0;
+  }
+}
+
+/** [W29] Best-effort rm without importing rm (keep the import surface of
+ *  this module tight; bootstrap pays for every module). */
+function rmSyncQuiet(file: string): void {
+  try { unlinkSyncWorkerSafe(file); } catch { /* ignore */ }
+}
+function unlinkSyncWorkerSafe(file: string): void {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const fs = require("node:fs") as typeof import("node:fs");
+  fs.rmSync(file, { force: true });
+}
+
+/** [W29] The worker script (plain JS, CommonJS — worker_threads runs it
+ *  outside the TS module graph). One task per message; classification
+ *  mirrors verifyOneSerial exactly. Returns null when the scratch file
+ *  cannot be written (tmpdir full/readonly) — caller falls back serial. */
+function writeVerifyWorker(): string | null {
+  const source = `
+const { parentPort } = require("node:worker_threads");
+const { createHash } = require("node:crypto");
+const { createReadStream, statSync } = require("node:fs");
+parentPort.on("message", ({ path, size, sha256 }) => {
+  let st;
+  try { st = statSync(path); } catch { parentPort.postMessage({ kind: "missing" }); return; }
+  if (!st.isFile()) { parentPort.postMessage({ kind: "not-a-file" }); return; }
+  if (st.size !== size) { parentPort.postMessage({ kind: "size", expected: size, actual: st.size }); return; }
+  const h = createHash("sha256");
+  const s = createReadStream(path);
+  s.on("data", c => h.update(c));
+  s.on("error", () => parentPort.postMessage({ kind: "missing" }));
+  s.on("end", () => {
+    const digest = h.digest("hex");
+    if (digest === sha256) parentPort.postMessage({ kind: "ok", bytes: st.size });
+    else parentPort.postMessage({ kind: "hash", expected: sha256, actual: digest });
+  });
+});
+`;
+  try {
+    const file = join(tmpdir(), `sd-frozen-verify-${process.pid}.cjs`);
+    writeFileSync(file, source, "utf8");
+    return file;
+  } catch {
+    return null;
+  }
+}
+
+/** [W29] Single-file serial verification (the fallback for crashed
+ *  workers and small passes). Same classification as the worker. */
+async function verifyOneSerial(full: string, entry: FrozenManifestEntry): Promise<{ problem: FrozenVerifyProblem | null; size: number }> {
+  let st;
+  try {
+    st = await stat(full);
+  } catch {
+    return { problem: { path: entry.path, kind: "missing" }, size: 0 };
+  }
+  if (!st.isFile()) {
+    return { problem: { path: entry.path, kind: "not-a-file" }, size: 0 };
+  }
+  if (st.size !== entry.size) {
+    return { problem: { path: entry.path, kind: "size", expected: entry.size, actual: st.size }, size: 0 };
+  }
+  const digest = await sha256File(full);
+  if (digest !== entry.sha256) {
+    return { problem: { path: entry.path, kind: "hash", expected: entry.sha256, actual: digest }, size: 0 };
+  }
+  return { problem: null, size: st.size };
+}
+
+/** [W29] The serial full pass — pre-W29 behaviour, kept as the fallback
+ *  (worker pool unavailable) and the small-manifest path. */
+async function verifyFullSerial(
   resourcesPath: string,
   manifest: FrozenManifest,
 ): Promise<{ problems: FrozenVerifyProblem[]; bytes: number }> {
   const problems: FrozenVerifyProblem[] = [];
   let bytes = 0;
   for (const entry of manifest.files) {
-    const full = resolveEntry(resourcesPath, entry.path);
-    let st;
-    try {
-      st = await stat(full);
-    } catch {
-      problems.push({ path: entry.path, kind: "missing" });
-      continue;
-    }
-    if (!st.isFile()) {
-      problems.push({ path: entry.path, kind: "not-a-file" });
-      continue;
-    }
-    if (st.size !== entry.size) {
-      problems.push({ path: entry.path, kind: "size", expected: entry.size, actual: st.size });
-      continue;
-    }
-    const digest = await sha256File(full);
-    if (digest !== entry.sha256) {
-      problems.push({ path: entry.path, kind: "hash", expected: entry.sha256, actual: digest });
-      continue;
-    }
-    bytes += st.size;
+    const { problem, size } = await verifyOneSerial(resolveEntry(resourcesPath, entry.path), entry);
+    if (problem) problems.push(problem);
+    else bytes += size;
   }
   return { problems, bytes };
 }
