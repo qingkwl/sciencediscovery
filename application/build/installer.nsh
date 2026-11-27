@@ -453,6 +453,59 @@
   ${IfNot} ${Errors}
     ${GetTime} "" "L" $1 $2 $3 $4 $5 $6 $7
     FileWrite $9 "[$3-$2-$1 $5:$6:$7] install section end: extraction+tail done$\r$\n"
+
+    ; -----------------------------------------------------------------------
+    ; [W30] Install-time AV warm-up for the two frozen exes.
+    ;
+    ; Same-machine A/B logs (2026-11-27): the frozen rail's cold start pays
+    ; a one-time Defender image scan INSIDE CreateProcess, synchronously on
+    ; the stack thread — sd-services.exe +5.24s (memory-graph→evolve spawn
+    ; gap, one bare spawn() between two adjacent perf marks) and sd-jw.exe
+    ; +9.24s (first status run: ~7s image scan + ~2s cold import). The venv
+    ; rail pays the same class of tax in CHILD threads (its python.exe is
+    ; 0.1MB, CreateProcess returns instantly), which is why venv never shows
+    ; these gaps. Proof it is a first-touch cost: the SECOND spawn of the
+    ; same exe is 12ms (image cached by Defender).
+    ;
+    ; Fix: pay it HERE, at the tail of the install section, while the
+    ; progress page still says "installing". The probe is a bare
+    ; `<exe>` with no arguments: sd_exec_entry.py loads its full static
+    ; import surface at module top (PyInstaller Analysis requires it),
+    ; then dies with usage exit code 2 — so ONE probe warms three
+    ; layers: the image scan, the import chain's file reads, and the
+    ; OS file cache. Expected cold-start effect: spawn gap 5.24s→~50ms,
+    ; status gap 9.24s→~1.3s; install grows by the same ~15s ONCE.
+    ;
+    ; Best-effort discipline: a missing exe skips the probe entirely
+    ; (venv-rail payloads and partial installs no-op), the timeout
+    ; caps locked-down machines where AV scans take minutes (kill +
+    ; continue — a failed warm-up is NOT a failed install), and the
+    ; exit code is LOGGED, never judged: usage probes legitimately
+    ; exit 2, and quarantines/AV blocks surface at first start exactly
+    ; as they did before W30. nsExec::ExecToLog eats the probe's
+    ; stderr (usage line) into the collapsed details log.
+    ;
+    ; Registers: $9 is the log handle (open since the FileOpen above,
+    ; closed once at the macro tail — one handle per file, no
+    ; interleaving). ${GetTime} clobbers $1-$7; nsExec's exit code
+    ; goes to $R0. Both are this file's established scratch registers.
+    ${If} ${FileExists} "$INSTDIR\resources\envs-template\frozen\sd-services\sd-services\sd-services.exe"
+    ${AndIf} ${FileExists} "$INSTDIR\resources\backend\jw\frozen\sd-jw\sd-jw\sd-jw.exe"
+      ; --- probe 1: sd-services.exe (evolve/memory-graph/adapter dispatcher) ---
+      ${GetTime} "" "L" $1 $2 $3 $4 $5 $6 $7
+      FileWrite $9 "[$3-$2-$1 $5:$6:$7] warmup sd-services: start$\r$\n"
+      nsExec::ExecToLog /TIMEOUT=60000 '"$INSTDIR\resources\envs-template\frozen\sd-services\sd-services\sd-services.exe"'
+      Pop $R0
+      ${GetTime} "" "L" $1 $2 $3 $4 $5 $6 $7
+      FileWrite $9 "[$3-$2-$1 $5:$6:$7] warmup sd-services: exit=$R0$\r$\n"
+      ; --- probe 2: sd-jw.exe (jiuwenswarm dispatcher, the 90.8MB one) ---
+      FileWrite $9 "[$3-$2-$1 $5:$6:$7] warmup sd-jw: start$\r$\n"
+      nsExec::ExecToLog /TIMEOUT=60000 '"$INSTDIR\resources\backend\jw\frozen\sd-jw\sd-jw\sd-jw.exe"'
+      Pop $R0
+      ${GetTime} "" "L" $1 $2 $3 $4 $5 $6 $7
+      FileWrite $9 "[$3-$2-$1 $5:$6:$7] warmup sd-jw: exit=$R0$\r$\n"
+    ${EndIf}
+
     FileClose $9
   ${EndIf}
 !macroend

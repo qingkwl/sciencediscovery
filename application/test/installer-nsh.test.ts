@@ -345,3 +345,74 @@ test("every guard Quit sets a non-zero error level first", () => {
       + "button's code is 1");
   }
 });
+
+// ---------------------------------------------------------------------------
+// [W30] Install-time AV warm-up contract. The warm-up moves a measured
+// one-time Defender image scan (sd-services.exe +5.24s, sd-jw.exe +9.24s on
+// the same-machine A/B logs, 2026-11-27) out of first start and into the
+// install tail. These assertions pin the coupling the comment block relies
+// on; a drifted warm-up that silently stops warming is worse than none —
+// it costs install time AND the cold-start gap stays.
+test("W30 warm-up probes BOTH frozen exes with the exact payload paths", () => {
+  // The payload onedir shapes come from assemble-backend.mjs's PyInstaller
+  // --distpath layout (frozen/sd-jw/sd-jw/sd-jw.exe, TWO levels) and
+  // jiuwenswarm.mjs frozenJwExeCandidates' payload-deploy rel. If assemble
+  // ever moves them, both files change together — this catches the third.
+  assert.ok(installerNsh.includes('resources\\envs-template\\frozen\\sd-services\\sd-services\\sd-services.exe'),
+    "sd-services.exe probe path drifted from the payload onedir shape");
+  assert.ok(installerNsh.includes('resources\\backend\\jw\\frozen\\sd-jw\\sd-jw\\sd-jw.exe'),
+    "sd-jw.exe probe path drifted from the payload onedir shape");
+  const probes = installerNsh.match(/nsExec::ExecToLog \/TIMEOUT=60000/g) ?? [];
+  assert.equal(probes.length, 2,
+    `expected exactly 2 warm-up probes, found ${probes.length}`);
+});
+
+test("W30 warm-up is best-effort: FileExists-gated, never judges the exit code", () => {
+  // The probes sit inside an ${If} ${FileExists}...${AndIf} ${FileExists}
+  // gate (venv-rail payloads no-op) — extract the customInstall macro and
+  // assert the gate wraps both probes.
+  const m = /!macro customInstall([\s\S]*?)!macroend/.exec(installerNsh);
+  assert.ok(m, "customInstall macro not found");
+  const body = m![1];
+  const gateIdx = body.indexOf("${FileExists}");
+  const probeIdx = body.indexOf("nsExec::ExecToLog");
+  // The W30 comment block inside the macro MENTIONS nsExec::ExecToLog, so a
+  // bare indexOf finds prose before code. Judge the executable lines only.
+  const codeOnly = body.split("\n").filter(l => !l.trim().startsWith(";")).join("\n");
+  const gateIdxCode = codeOnly.indexOf("${FileExists}");
+  const probeIdxCode = codeOnly.indexOf("nsExec::ExecToLog");
+  assert.ok(gateIdxCode >= 0 && gateIdxCode < probeIdxCode,
+    "warm-up probes must sit after the FileExists gate (a venv-rail payload "
+    + "with no frozen exes must skip the whole block); got gate="
+    + gateIdxCode + " probe=" + probeIdxCode);
+  // Usage probes legitimately exit 2; AV blocks/quarantines exit their own
+  // ways. The macro must LOG $R0, never branch on it — a judged exit code
+  // would turn a locked-down machine's slow AV into a failed install.
+  assert.ok(!/\$\{If\} \$R0/.test(body),
+    "customInstall branches on the probe exit code — warm-up must be "
+    + "best-effort (log-only), a failed warm-up is not a failed install");
+  // TIMEOUT is the locked-down-machine escape: nsExec kills the probe and
+  // moves on. Without it a 5-minute enterprise AV scan hangs the installer.
+  assert.ok(/\/TIMEOUT=60000/.test(body),
+    "warm-up probes lost their TIMEOUT — locked-down machines would hang "
+    + "the install section indefinitely");
+});
+
+test("W30 warm-up logs to install-diagnostics.log through ONE handle", () => {
+  // Interleaving guard: NSIS FileOpen "a" on one file from two live handles
+  // risks torn lines in the diagnostic log. The macro must open $9 once and
+  // close it once, with every warm-up FileWrite going through $9.
+  const m = /!macro customInstall([\s\S]*?)!macroend/.exec(installerNsh);
+  assert.ok(m, "customInstall macro not found");
+  const body = m![1];
+  const opens = (body.match(/FileOpen \$9/g) ?? []).length;
+  const closes = (body.match(/FileClose \$9/g) ?? []).length;
+  assert.equal(opens, 1, `expected exactly one FileOpen $9, found ${opens}`);
+  assert.equal(closes, 1, `expected exactly one FileClose $9, found ${closes}`);
+  assert.ok(!/FileOpen \$[0-8]/.test(body),
+    "customInstall opens a second log handle — two live handles on one file "
+    + "interleave partial lines");
+  const warmupWrites = (body.match(/FileWrite \$9 "[^"]*warmup/g) ?? []).length;
+  assert.equal(warmupWrites, 4,
+    `expected 4 warm-up log lines (start+exit per probe), found ${warmupWrites}`);
+});
