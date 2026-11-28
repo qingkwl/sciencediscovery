@@ -1,0 +1,95 @@
+// Copyright (C) 2026-2026 Huawei Technologies Co., Ltd
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+import { setTimeout as delay } from "node:timers/promises";
+export { PermissionDecisionQueue } from "@sciencediscovery/governance";
+export async function waitForPermissionDecision(store, request, timeoutMs, signal, runWait) {
+    const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : undefined;
+    let blocked = false;
+    let resolvedEmitted = false;
+    const resumeBlockedRun = async (reason) => {
+        if (!blocked || !runWait)
+            return;
+        const running = await store.updateSessionRunStatusIfCurrent(runWait.sessionId, runWait.runId, "blocked", "running");
+        if (running)
+            await runWait.emit({ reason, run: running, status: "running", type: "run.status" });
+        blocked = false;
+    };
+    const cancelAbandonedWait = async (reason) => {
+        const cancelled = await store.cancelPendingPermissionRequest(request.id);
+        if (cancelled && runWait)
+            await runWait.emit({ request: cancelled, type: "permission.resolved" });
+        await resumeBlockedRun(reason);
+    };
+    try {
+        while (deadline === undefined || Date.now() < deadline) {
+            const current = store.getPermissionRequest(request.id);
+            if (!current)
+                throw new Error("Permission request disappeared before it was decided");
+            if (current.state !== "pending") {
+                if (runWait && !resolvedEmitted) {
+                    await runWait.emit({ request: current, type: "permission.resolved" });
+                    resolvedEmitted = true;
+                }
+                await resumeBlockedRun("Permission decision received");
+                if (current.state === "cancelled" || current.state === "denied")
+                    return current;
+                if (current.decisionEpochId && store.getPermissionEpoch(current.decisionEpochId))
+                    return current;
+            }
+            if (!blocked && runWait) {
+                const blockedRun = await store.updateSessionRunStatusIfCurrent(runWait.sessionId, runWait.runId, "running", "blocked");
+                if (blockedRun) {
+                    blocked = true;
+                    await runWait.emit({ reason: "Waiting for permission decision", run: blockedRun, status: "blocked", type: "run.status" });
+                }
+            }
+            await delay(100, undefined, signal ? { signal } : undefined);
+        }
+    }
+    catch (error) {
+        await cancelAbandonedWait("Permission wait ended");
+        throw error;
+    }
+    await cancelAbandonedWait("Permission wait timed out");
+    throw new Error(`Permission wait timed out after ${timeoutMs} ms: ${request.summary}`);
+}
+export async function startApprovedRemoteJob(job, store, remoteCompute, provenanceRecorder) {
+    // Old pending permission cards may survive an upgrade. Resolving one must
+    // never revive the removed bare-SSH execution path.
+    if (job.state !== "approved")
+        return job;
+    return await store.updateRemoteJob({
+        ...job,
+        state: "failed",
+        error: "Independent SSH/SLURM jobs were retired; use a sandboxed Runner.",
+        finishedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+    });
+}
+export async function advanceResolvedPermissionRequests(requests, store, artifactManager, remoteCompute, provenanceRecorder) {
+    const artifactApprovals = [];
+    const remoteJobs = [];
+    for (const permissionRequest of requests) {
+        if (permissionRequest.action === "artifact_download" && permissionRequest.state === "allowed") {
+            artifactApprovals.push(...await artifactManager.approveByPermissionRequest(permissionRequest.id));
+        }
+        if (permissionRequest.action === "remote_job") {
+            const remoteJob = await store.applyRemoteJobPermissionDecision(permissionRequest.id);
+            if (remoteJob) {
+                remoteJobs.push(await startApprovedRemoteJob(remoteJob, store, remoteCompute, provenanceRecorder));
+            }
+        }
+    }
+    return { artifactApprovals, remoteJobs };
+}
