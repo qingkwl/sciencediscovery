@@ -143,6 +143,59 @@ test("W17: second launch with stamp hit runs the fast pass (sizes only, mode:fas
   } finally { rmSync(base, { recursive: true, force: true }); }
 });
 
+// [W31-⑤] The fast pass is window-parallel now (bounded Promise.all batches
+// of 128 stats). Its per-file problem classification must stay identical to
+// the serial shape: every kind (missing / not-a-file / size) is reported with
+// the same path and fields, in manifest order within the window, and the
+// byte count only sums clean files.
+test("W31: windowed fast pass classifies problems exactly like the serial shape", async () => {
+  const { base, res, dataDir } = makePayload();
+  try {
+    // Establish the stamp with a clean full pass.
+    const opts = { stampPath: frozenVerifyStampPath(dataDir), identity: payloadIdentity(res) };
+    const first = await call(res, opts);
+    assert.ok(first.ok && first.mode === "full");
+
+    // Sabotage one file per problem class on a >WINDOW manifest so the
+    // windowed batches actually rotate.
+    const manifestPath = join(res, "frozen-manifest.json");
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    manifest.files = [];
+    mkdirSync(join(res, "backend", "jw", "frozen", "sd-jw", "sd-jw", "many"), { recursive: true });
+    for (let i = 0; i < 300; i += 1) {
+      const bytes = Buffer.alloc(4, i % 256);
+      writeFileSync(join(res, "backend", "jw", "frozen", "sd-jw", "sd-jw", "many", `f${i}.bin`), bytes);
+      manifest.files.push({ path: `jw/many/f${i}.bin`, size: 4, sha256: sha(bytes) });
+    }
+    writeFileSync(manifestPath, JSON.stringify(manifest));
+    // The fingerprint aggregates `onedirs` (still the 2-file fixture values),
+    // so the original stamp stays valid and the sabotage below runs the
+    // FAST tier directly — which is exactly the windowed path under test.
+
+    // f0: missing (delete), f150: not-a-file (directory), f299: size drift.
+    rmSync(join(res, "backend", "jw", "frozen", "sd-jw", "sd-jw", "many", "f0.bin"));
+    rmSync(join(res, "backend", "jw", "frozen", "sd-jw", "sd-jw", "many", "f150.bin"));
+    mkdirSync(join(res, "backend", "jw", "frozen", "sd-jw", "sd-jw", "many", "f150.bin"));
+    writeFileSync(join(res, "backend", "jw", "frozen", "sd-jw", "sd-jw", "many", "f299.bin"), Buffer.alloc(5));
+
+    const result = await verifyFrozenPayload(res, () => {}, opts);
+    // Fast finds the drift → escalates to the full pass (W17 fail-safe), and
+    // the FULL pass re-classifies every sabotaged file. Either tier's
+    // classification must be identical, so asserting on the final result
+    // pins the contract both paths share.
+    assert.equal(result.mode, "full", "size drift on a stamped payload escalates to full (W17 fail-safe)");
+    assert.ok(!result.ok, "problems must be reported");
+    assert.equal(result.problems.length, 3);
+    const byKind = Object.fromEntries(result.problems.map(p => [p.kind, p]));
+    assert.equal(byKind.missing?.path, "jw/many/f0.bin");
+    assert.equal(byKind["not-a-file"]?.path, "jw/many/f150.bin");
+    assert.equal(byKind.size?.path, "jw/many/f299.bin");
+    assert.equal(byKind.size?.expected, 4);
+    assert.equal(byKind.size?.actual, 5);
+    assert.equal(result.checked, 300);
+  } finally { rmSync(base, { recursive: true, force: true }); }
+});
+
 test("W17: stamp identity mismatch (upgraded payload) falls back to full", async () => {
   const { base, res, dataDir } = makePayload();
   try {

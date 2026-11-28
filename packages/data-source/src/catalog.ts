@@ -136,11 +136,35 @@ export class McpSourceCatalog {
     return this.applyCurrent(await this.gateway.reload(this.proxyMapProvider?.(), signal), revision);
   }
 
+  /** [W31-④] Reset-and-reconnect only when something actually changed.
+   *
+   * The first-chat warmup used to call `reload()` unconditionally: the
+   * boot-time refresh had just connected every stdio server (three child
+   * processes, ~1.3s), and the warmup's `reload` closed all of them and
+   * re-spawned the full set — the "pre-warm" was pure reset. This variant
+   * compares the configuration revision that produced the current catalog
+   * with the live one: unchanged (and a catalog present) returns the
+   * current snapshot with zero reconnects. A revision mismatch or a missing
+   * catalog falls through to the full `reload`, so a real configuration
+   * change still rebuilds everything exactly as before. */
+  async reloadIfChanged(signal?: AbortSignal): Promise<McpCatalog> {
+    const liveRevision = this.configurationRevision?.();
+    if (this.catalog && liveRevision !== undefined && this.catalogRevision === liveRevision) {
+      return this.getCatalog()!;
+    }
+    return this.reload(signal);
+  }
+
+  /** Revision of the configuration that produced the CURRENT catalog snapshot
+   * (undefined until the first refresh/reload lands). [W31-④] */
+  private catalogRevision?: string;
+
   /** Leave the current registry untouched when an in-flight snapshot expired. */
   private applyCurrent(catalog: McpCatalog, revision: string | undefined): McpCatalog {
     if (revision !== this.configurationRevision?.()) {
       return { ...catalog, revision: createHash("sha256").update("[]").digest("hex"), servers: [] };
     }
+    this.catalogRevision = revision;
     return this.apply(catalog);
   }
 

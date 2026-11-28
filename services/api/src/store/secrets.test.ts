@@ -23,7 +23,7 @@ import type { TestContext } from "node:test";
 // injected fake protector (the real DPAPI round trip is covered by
 // platform/os/win32.test.ts), keeping these tests host-platform-agnostic.
 import type { SecretProtector } from "../platform/os/types.js";
-import { loadOrCreateModelSecretKey } from "./secrets.js";
+import { loadOrCreateModelSecretKey, modelSecretKey, warmModelSecretKey } from "./secrets.js";
 
 const MAGIC = Buffer.from([0xde, 0xad, 0xbe, 0xef]);
 const RAW_KEY = Buffer.alloc(32, 7);
@@ -108,4 +108,48 @@ test("an identity protector keeps raw bytes on disk, with no migration", async (
   assert.deepEqual(await readFile(path), key, "the file stores the raw key bytes");
   assert.deepEqual(await loadOrCreateModelSecretKey(path, protector), key);
   assert.deepEqual(await readFile(path), key, "raw files stay raw on identity platforms");
+});
+
+// [W31-①] The process-wide memo: two consumers of the same key path (the
+// session store and the custom-MCP-servers loader share one data dir) must
+// pay the protector exactly once per process, and a rejected unwrap must not
+// be cached — the next call retries (fail-fast stays observable).
+test("modelSecretKey memo resolves once per path and does not cache rejections", async (context) => {
+  const path = await keyFileFixture(context, "secrets-memo");
+  let unwrapCalls = 0;
+  const countingProtector = fakeProtector(true);
+  const originalUnwrap = countingProtector.unwrap.bind(countingProtector);
+  countingProtector.unwrap = async (wrapped: Buffer) => {
+    unwrapCalls += 1;
+    return originalUnwrap(wrapped);
+  };
+
+  await writeFile(path, Buffer.concat([MAGIC, RAW_KEY]), { mode: 0o600 });
+
+  const [first, second] = await Promise.all([modelSecretKey(path, countingProtector), modelSecretKey(path, countingProtector)]);
+  assert.deepEqual(first, RAW_KEY);
+  assert.deepEqual(second, RAW_KEY);
+  assert.equal(unwrapCalls, 1, "concurrent loads of the same path must unwrap once");
+
+  // A second sequential load (the "restart in the same process" shape of
+  // store.close() then store.load()) still hits the memo.
+  assert.deepEqual(await modelSecretKey(path, countingProtector), RAW_KEY);
+  assert.equal(unwrapCalls, 1, "the memo serves later loads from memory");
+
+  // warmModelSecretKey must not throw and must populate the memo.
+  const warmPath = await keyFileFixture(context, "secrets-memo-warm");
+  warmModelSecretKey(warmPath, countingProtector);
+  assert.deepEqual(await modelSecretKey(warmPath, countingProtector), await modelSecretKey(warmPath, countingProtector));
+});
+
+test("modelSecretKey memo rejection is not cached", async (context) => {
+  const path = await keyFileFixture(context, "secrets-memo-reject");
+  const garbage = Buffer.concat([MAGIC, Buffer.alloc(10, 9)]);
+  await writeFile(path, garbage, { mode: 0o600 });
+
+  await assert.rejects(modelSecretKey(path, fakeProtector(true)), /cannot be decrypted/);
+  // The failed promise must not be memoized: fixing the underlying file (or
+  // any later retry) observes the current state, not the sticky rejection.
+  await writeFile(path, Buffer.concat([MAGIC, RAW_KEY]), { mode: 0o600 });
+  assert.deepEqual(await modelSecretKey(path, fakeProtector(true)), RAW_KEY);
 });

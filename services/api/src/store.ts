@@ -251,7 +251,7 @@ import {
   decryptSecretValue,
   encryptModelApiToken,
   encryptSecretValue,
-  loadOrCreateModelSecretKey,
+  modelSecretKey,
   normalizeApiToken,
   normalizeModelFactOverrides,
   validateLiveModel,
@@ -807,7 +807,11 @@ export class SessionStore {
   }
 
   private async loadOrCreateSecretKey(): Promise<Buffer> {
-    return loadOrCreateModelSecretKey(this.modelSecretKeyPath);
+    // [W31-①] shared process-wide memo: the DPAPI unwrap (a powershell.exe
+    // child on Windows) runs once per data dir per process even when store
+    // and custom-servers both load — CustomMcpServers resolves through the
+    // same `modelSecretKey()` helper in store/secrets.ts.
+    return modelSecretKey(this.modelSecretKeyPath);
   }
 
   private encryptModelApiToken(modelId: string, apiToken: string): string {

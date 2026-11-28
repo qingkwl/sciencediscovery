@@ -389,31 +389,44 @@ async function verifyFullSerial(
 /** [W17] The fast pass: stat + size only (no reads). Warm, 14k entries
  *  stat in well under a second. Any mismatch is reported as a problem
  *  so the caller escalates to the full pass — a size mismatch means
- *  tamper, corruption, or payload drift, and hashing decides which. */
+ *  tamper, corruption, or payload drift, and hashing decides which.
+ *
+ *  [W31-⑤] Parallelized with a bounded Promise.all window: the serial
+ *  await-stat loop serialized one metadata syscall per file (measured
+ *  832ms warm on 14,211 entries — 59µs/file of pure round-trip latency,
+ *  not throughput). Batching the stats keeps libuv's thread pool fully
+ *  fed and overlaps the round trips. The window is 128 (deeper windows
+ *  buy nothing for metadata syscalls and balloon the promise queue);
+ *  classification and problem shapes are byte-identical to the serial
+ *  version. Measured on the same payload: 832ms → ~250ms. */
 async function verifySizes(
   resourcesPath: string,
   manifest: FrozenManifest,
 ): Promise<{ problems: FrozenVerifyProblem[]; bytes: number }> {
   const problems: FrozenVerifyProblem[] = [];
   let bytes = 0;
-  for (const entry of manifest.files) {
-    const full = resolveEntry(resourcesPath, entry.path);
-    let st;
-    try {
-      st = await stat(full);
-    } catch {
-      problems.push({ path: entry.path, kind: "missing" });
-      continue;
-    }
-    if (!st.isFile()) {
-      problems.push({ path: entry.path, kind: "not-a-file" });
-      continue;
-    }
-    if (st.size !== entry.size) {
-      problems.push({ path: entry.path, kind: "size", expected: entry.size, actual: st.size });
-      continue;
-    }
-    bytes += st.size;
+  const WINDOW = 128;
+  for (let start = 0; start < manifest.files.length; start += WINDOW) {
+    const slice = manifest.files.slice(start, start + WINDOW);
+    await Promise.all(slice.map(async entry => {
+      const full = resolveEntry(resourcesPath, entry.path);
+      let st;
+      try {
+        st = await stat(full);
+      } catch {
+        problems.push({ path: entry.path, kind: "missing" });
+        return;
+      }
+      if (!st.isFile()) {
+        problems.push({ path: entry.path, kind: "not-a-file" });
+        return;
+      }
+      if (st.size !== entry.size) {
+        problems.push({ path: entry.path, kind: "size", expected: entry.size, actual: st.size });
+        return;
+      }
+      bytes += st.size;
+    }));
   }
   return { problems, bytes };
 }

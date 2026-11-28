@@ -27,7 +27,7 @@ import type { McpSourceRegistry } from "@sciencediscovery/mcp-sources";
 import { shortErrorMessage } from "@sciencediscovery/operational-logging";
 
 import { apiLog } from "../logging.js";
-import { decryptSecretValue, encryptSecretValue, loadOrCreateModelSecretKey } from "../store/secrets.js";
+import { decryptSecretValue, encryptSecretValue, modelSecretKey } from "../store/secrets.js";
 import { canonicalMcpEnvironmentName, mcpEnvironmentRemovalEffect } from "./runtime-environment.js";
 import { isMcpCredentialHeader, isMcpHeaderCredentialValue } from "./header-credential-policy.js";
 import { customMcpAdapter } from "./custom-adapter.js";
@@ -159,7 +159,13 @@ export class CustomMcpServers {
 
   async load(): Promise<void> {
     await mkdir(this.dataDir, { recursive: true });
-    this.key = await loadOrCreateModelSecretKey(resolve(this.dataDir, "model-secrets.key"));
+    // [W31-①] the model-secret key resolves through the process-wide memo in
+    // store/secrets.ts: on Windows the DPAPI unwrap spawns a powershell.exe
+    // child, and this load() sits inside the health gate's critical path.
+    // Sharing the memo with SessionStore.load means one spawn per process,
+    // and the server entry's warmModelSecretKey() prefetch can overlap even
+    // that one with module loading.
+    this.key = await modelSecretKey(resolve(this.dataDir, "model-secrets.key"));
     try {
       const encrypted = await readFile(this.path, "utf8");
       const saved: unknown = JSON.parse(decryptSecretValue(this.key, "custom-mcp-servers", encrypted));

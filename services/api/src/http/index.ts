@@ -260,7 +260,7 @@ import {
 import { SessionStoreHttpError, SessionEvidenceLockedError } from "../store.js";
 import { providerBadgeLabel, type ExecutionBadge, type ExecutionCapability } from "@sciencediscovery/execution-router";
 import { validateLiveProvider } from "../store/providers.js";
-import { normalizeApiToken } from "../store/secrets.js";
+import { modelSecretKey, normalizeApiToken, warmModelSecretKey } from "../store/secrets.js";
 import { remoteWorkspaceKey, syncRemoteWorkspace } from "../remote-runner.js";
 import { normalizeRemoteHostEndpoint } from "../store/remote-hosts.js";
 import {
@@ -1880,8 +1880,12 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
         return;
       }
       if (request.method === "POST" && url.pathname === "/api/mcp/sources/reload") {
+        // [W31-④] reloadIfChanged: the shell's first-chat warmup fires this
+        // right after boot, and an unconditional reload reset the connections
+        // the boot refresh had just established (three stdio child processes
+        // re-spawned for nothing). Real configuration changes still rebuild.
         sendJson(response, 200, {
-          catalog: await mcpCatalog.reload(),
+          catalog: await mcpCatalog.reloadIfChanged(),
           sources: mcpCatalog.listStatuses(),
         });
         return;
@@ -5351,6 +5355,14 @@ export async function startApiServer(config = loadServerConfig()): Promise<Serve
   // SIGTERM handling or the memory watch (#1105 F1).
   const budget = heapBudget();
   const trajectoryEvents = trajectoryMaxEvents();
+  // [W31-①] Kick the model-secret key resolution off before the platform
+  // component chain reaches it. On Windows the DPAPI unwrap spawns a
+  // powershell.exe child (~0.4s bare, 2-5s under the startup contention
+  // window); starting it here overlaps that child's lifetime with the
+  // createApiServer work below instead of serializing it into the health
+  // gate's budget. Failure stays fail-fast: the error surfaces when the
+  // component chain awaits the same memoized promise.
+  warmModelSecretKey(resolve(config.dataDir, "model-secrets.key"));
   const server = createApiServer(config);
   await new Promise<void>((resolveListen, reject) => {
     server.once("error", reject);

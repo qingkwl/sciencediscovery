@@ -760,10 +760,14 @@ function stopConsoleSweep(): void {
 async function ensureBackend(
   endpoints: Endpoints, proxyEnv: NodeJS.ProcessEnv | null, dataDir: string | null,
 ): Promise<boolean> {
-  // 1s first probe — ECONNREFUSED returns instantly anyway, the poll
-  // interval means a 3s budget wasted ~2s before spawning the stack.
+  // 250ms first probe — a live loopback backend answers /api/health in
+  // single-digit ms; a dead port fails with ECONNREFUSED instantly. The old
+  // 1s budget only ever burned time on the "not up yet" path (W31-③: the
+  // comment's "ECONNREFUSED returns instantly" was true per fetch, but the
+  // poll loop then idled out the whole budget — measured 1.05s on every
+  // cold start before the stack was even spawned).
   SD_PERF("ensureBackend-enter");
-  if (await waitHealthy(endpoints.health, 1_000, fetch)) {
+  if (await waitHealthy(endpoints.health, 250, fetch)) {
     log("backend already healthy; reusing running stack");
     SD_PERF("backend-reused-healthy");
     // F9: a reused stack is a LIVE backend this shell did not spawn, but
