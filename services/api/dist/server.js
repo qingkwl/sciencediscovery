@@ -13,6 +13,16 @@
 // limitations under the License.
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+// [W33-0] Boot timeline anchor for the api Node process. ESM hoists and
+// resolves every import below before any statement here runs, so the only
+// way to timestamp "before the heavy module graph loads" is to make the
+// timestamp itself the FIRST import: this side-effect module stamps
+// process.env + console the moment ESM starts resolving, before
+// `./http/index.js` (the heavy graph) is even fetched. The 13th package's
+// install logs left a ~5.2s dark segment between the stack's spawn of this
+// process and `service_started`; entry0 + service_started brackets it into
+// (spawn→entry0: node + graph load) vs (entry0→service_started: boot logic).
+import "./boot-timeline-entry.js";
 import { shortErrorMessage } from "@sciencediscovery/operational-logging";
 import { closeApiServer, startApiServer } from "./http/index.js";
 import { apiLog } from "./logging.js";

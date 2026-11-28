@@ -159,15 +159,22 @@ export class CustomMcpServers {
 
   async load(): Promise<void> {
     await mkdir(this.dataDir, { recursive: true });
-    // [W31-①] the model-secret key resolves through the process-wide memo in
-    // store/secrets.ts: on Windows the DPAPI unwrap spawns a powershell.exe
-    // child, and this load() sits inside the health gate's critical path.
-    // Sharing the memo with SessionStore.load means one spawn per process,
-    // and the server entry's warmModelSecretKey() prefetch can overlap even
-    // that one with module loading.
+    // [W33-1] Lazy key resolution: only users who actually have a saved
+    // encrypted configuration pay the DPAPI unwrap (a powershell.exe child
+    // measured ~5s under the startup CPU-contention window — the 13th
+    // package's per-boot dark segment). A fresh install has no
+    // custom-mcp-servers.enc, so load() skips the key entirely; the write
+    // path resolves it on first use. The [W31-①] process-wide memo still
+    // dedupes the spawn when the key IS needed.
+    let encrypted: string | undefined;
+    try {
+      encrypted = await readFile(this.path, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    if (encrypted === undefined) return;
     this.key = await modelSecretKey(resolve(this.dataDir, "model-secrets.key"));
     try {
-      const encrypted = await readFile(this.path, "utf8");
       const saved: unknown = JSON.parse(decryptSecretValue(this.key, "custom-mcp-servers", encrypted));
       if (!object(saved)) throw new Error("Invalid saved MCP configuration");
       const envelope = ["sciencediscovery-custom-mcp-v2", "sciencediscovery-custom-mcp-v3"].includes(String(saved.format)) ? saved : undefined;
@@ -197,6 +204,8 @@ export class CustomMcpServers {
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      // [W33-1] Unreachable in practice (encrypted was read above); kept as
+      // belt-and-braces for the decrypt path's own ENOENT-class failures.
     }
     await this.oauth.load(this.key);
     this.sync();
@@ -328,7 +337,10 @@ export class CustomMcpServers {
   }
 
   private async persist(next: Record<string, CustomMcpServerConfig>, operations = this.configurationOperations, invalidateChecks: readonly string[] = [], pendingDeletions = this.pendingConfigurationDeletions): Promise<void> {
-    if (!this.key) throw new Error("MCP storage is not initialized");
+    // [W33-1] Lazy key: load() skipped it when no encrypted config existed;
+    // the first write resolves it here (the process-wide memo dedupes the
+    // DPAPI spawn when load() already resolved it).
+    if (!this.key) this.key = await modelSecretKey(resolve(this.dataDir, "model-secrets.key"));
     const temporary = `${this.path}.tmp`;
     const deletionJournal = this.deletionJournal || Object.keys(pendingDeletions).length > 0;
     const payload = Object.keys(operations).length ? { format: deletionJournal ? "sciencediscovery-custom-mcp-v3" : "sciencediscovery-custom-mcp-v2", servers: next, operations, ...(deletionJournal ? { pendingDeletions } : {}) } : next;

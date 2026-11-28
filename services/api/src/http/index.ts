@@ -1136,21 +1136,34 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
   // The catalog is installed before the store loads: saved thinking values are
   // narrowed against it while model profiles are read, so a later install
   // would constrain them against an empty catalog.
-  const ready = modelCatalog.load()
-    .then(() => skillLibraryCatalog.load())
-    .then(() => store.setConfigurationSkillLibrarySource(() => skillLibraryCatalog.list()))
-    .then(() => skillLibraryCatalog.seedBuiltInSkillLibrary(repositoryRoot))
-    .then(() => initializePlatformServices(platform, config, skillLibraryCatalog))
-    .then(() => conversationalConfiguration().service.recoverPendingVerifications())
-    .then(() => store.plugins.bindAssets(async (settings) => {
+  // [W33-0] Per-step timing on the ready chain: the 13th package's install
+  // logs showed a ~5.09s dark segment between `service_started` and the first
+  // `framework_component_*` line (12th package: 326ms for the same span),
+  // with zero log lines inside — the steps below were the only candidates.
+  // Each step now logs its own durationMs so the next boot pinpoints the
+  // slow one. Purely observational: same order, same semantics, same errors.
+  const readyStep = <T>(name: string, run: () => Promise<T>): Promise<T> => {
+    const startedAt = Date.now();
+    return run().then(
+      (value) => { apiLog.info("ready_step", { step: name, durationMs: Date.now() - startedAt }); return value; },
+      (error) => { apiLog.info("ready_step", { step: name, durationMs: Date.now() - startedAt, failed: true }); throw error; },
+    );
+  };
+  const ready = readyStep("model_catalog_load", () => modelCatalog.load())
+    .then(() => readyStep("skill_library_load", () => skillLibraryCatalog.load()))
+    .then(() => readyStep("set_configuration_skill_source", async () => { store.setConfigurationSkillLibrarySource(() => skillLibraryCatalog.list()); }))
+    .then(() => readyStep("seed_built_in_skill_library", () => skillLibraryCatalog.seedBuiltInSkillLibrary(repositoryRoot)))
+    .then(() => readyStep("initialize_platform_services", () => initializePlatformServices(platform, config, skillLibraryCatalog)))
+    .then(() => readyStep("recover_pending_verifications", () => conversationalConfiguration().service.recoverPendingVerifications()))
+    .then(() => readyStep("bind_assets", async () => { store.plugins.bindAssets(async (settings) => {
       const refs = await skillLibraryCatalog.resolveEnabledRefs(settings.enabledSkillLibraries);
       const skills = skillCatalog.resolve(settings.enabledSkillIds ?? []).map(({id,hash,revision,version}) => ({id,hash,revision:revision ?? null,version}));
       return {settings:{...settings,enabledSkillLibraries:settings.enabledSkillLibraries?.map((mount) => ({
         ...mount,versionId:refs.find((ref) => ref.libraryId===mount.libraryId && (!mount.versionId || mount.versionId==="head" || ref.versionId===mount.versionId))!.versionId,
       }))},assets:{skills,libraries:refs}};
-    }))
-    .then(() => recoverContinuations())
-    .then(() => reviewerAuditCoordinator.resume())
+    }); }))
+    .then(() => readyStep("recover_continuations", () => recoverContinuations()))
+    .then(() => readyStep("reviewer_audit_resume", () => reviewerAuditCoordinator.resume()))
     .then(() => undefined);
 
   // With the JiuwenSwarm backend its web search is configured from the web settings: pushed once the store has
@@ -1179,6 +1192,18 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
   // closes early kills the chain.
   const WEB_SYNC_RETRY_DELAYS_MS = [3_000, 3_000, 5_000, 10_000, 20_000];
   const jiuwenSwarmWebSyncAbort = new AbortController();
+  // [W33-1] The model-secret key is now resolved lazily ([W33-1] in
+  // store.ts / custom-servers.ts: fresh installs skip the DPAPI unwrap —
+  // a powershell.exe child measured ~5s inside the startup contention
+  // window — until ciphertext exists). Warm it in the background once the
+  // boot settles, so the first interactive credential write finds it ready
+  // instead of paying the spawn on a request. Best-effort: a failure here
+  // surfaces only when real usage hits the same memoized promise, and
+  // short-lived test servers simply never reach the 10s delay.
+  void ready.then(async () => {
+    await delay(10_000, undefined, undefined).catch(() => undefined);
+    await modelSecretKey(resolve(config.dataDir, "model-secrets.key")).catch(() => undefined);
+  }).catch(() => undefined);
   if (jiuwenSwarm) {
     void ready.then(async () => {
       for (let attempt = 0; attempt < WEB_SYNC_RETRY_DELAYS_MS.length && !jiuwenSwarmWebSyncAbort.signal.aborted; attempt += 1) {
@@ -5355,14 +5380,15 @@ export async function startApiServer(config = loadServerConfig()): Promise<Serve
   // SIGTERM handling or the memory watch (#1105 F1).
   const budget = heapBudget();
   const trajectoryEvents = trajectoryMaxEvents();
-  // [W31-①] Kick the model-secret key resolution off before the platform
-  // component chain reaches it. On Windows the DPAPI unwrap spawns a
-  // powershell.exe child (~0.4s bare, 2-5s under the startup contention
-  // window); starting it here overlaps that child's lifetime with the
-  // createApiServer work below instead of serializing it into the health
-  // gate's budget. Failure stays fail-fast: the error surfaces when the
-  // component chain awaits the same memoized promise.
-  warmModelSecretKey(resolve(config.dataDir, "model-secrets.key"));
+  // [W33-1] The early warmModelSecretKey() prefetch from [W31-①] is GONE:
+  // measurements on the 13th package showed the powershell.exe DPAPI spawn
+  // costs ~5s inside the startup CPU-contention window no matter where it
+  // is issued (as a prefetch it parked the cost on ready-chain fs calls —
+  // skill_library_load's mkdir queued 5012ms behind it; without it, the
+  // same 5s fell on the first memo consumer). The key is now lazy
+  // ([W33-1] in store.ts / custom-servers.ts: fresh installs skip it until
+  // ciphertext exists) and warms in the background after the boot settles
+  // (the ready.then hook above), outside the contention window entirely.
   const server = createApiServer(config);
   await new Promise<void>((resolveListen, reject) => {
     server.once("error", reject);

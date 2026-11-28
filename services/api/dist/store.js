@@ -644,7 +644,24 @@ export class SessionStore {
         });
         this.transferStore = new WorkspaceTransfers(this.database, new VersionStore(this.dataDir));
         this.shellExecutionStore = new ShellExecutions(this.database, new VersionStore(this.dataDir), this.notificationStore);
-        this.secretKey = await this.loadOrCreateSecretKey();
+        // [W33-1] Lazy key resolution: the DPAPI unwrap behind
+        // loadOrCreateSecretKey spawns a powershell.exe child that measures ~5s
+        // under the startup CPU-contention window (the 13th package's per-boot
+        // dark segment: skill_library_load's mkdir queued behind it for 5.01s).
+        // A fresh install has no rows in any secrets table, so the key resolves
+        // only when there is actual ciphertext to work with; the write paths
+        // resolve it on first use (see usageOfSecretKey / ensureSecretKey). The
+        // process-wide memo from [W31-①] still dedupes the spawn either way.
+        const hasAnySecret = this.database.prepare(`
+      SELECT EXISTS(SELECT 1 FROM model_secrets) OR EXISTS(SELECT 1 FROM specialist_runtime_secrets)
+        OR EXISTS(SELECT 1 FROM web_provider_secrets) OR EXISTS(SELECT 1 FROM web_proxy_secret)
+        OR EXISTS(SELECT 1 FROM proxy_server_secrets) OR EXISTS(SELECT 1 FROM memory_graph_secret)
+        OR EXISTS(SELECT 1 FROM remote_host_secrets) OR EXISTS(SELECT 1 FROM remote_host_credentials) AS has_secret
+    `).get();
+        if (hasAnySecret?.has_secret || this.initialNeo4jPassword) {
+            this.secretKey = await this.loadOrCreateSecretKey();
+        }
+        // No ciphertext at all — the key stays unresolved until first use.
         this.migrateRemoteHostTokens();
         const modelIdsWithSecrets = new Set(this.database.prepare("SELECT model_id FROM model_secrets").all().map((row) => row.model_id));
         const row = this.database.prepare("SELECT json FROM catalog_state WHERE id = 1").get();
