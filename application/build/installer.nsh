@@ -214,6 +214,51 @@
       DetailPrint "ghost uninstall registry key removed (uninstaller missing: $R1)"
     ${EndIf}
   ${EndIf}
+
+  ; -------------------------------------------------------------------------
+  ; [W34-③] Stage the Defender prewarm sentinel PS1 to $PLUGINSDIR and start
+  ; it detached — here, in .onInit, BEFORE extraction begins.
+  ;
+  ; The 14th package's real-user first start measured 27s between
+  ; Start-Process and the Electron main process's creation: Defender's
+  ; synchronous image scan of the freshly-installed 195MB ScienceDiscovery.exe
+  ; inside CreateProcess — app code never ran during it, so no in-app splash
+  ; can cover it. The sentinel watches the install directory via %TEMP%
+  ; markers (.onVerifyInstDir writes dir.txt the moment the directory page
+  ; has a usable $INSTDIR); the moment the main exe is fully written it fires
+  ; the exe in ELECTRON_RUN_AS_NODE mode with stdin from NUL, paying the scan
+  ; inside the remaining extraction window (the exe is written early in the
+  ; solid archive's unpack order). customInstall's tail keeps its own
+  ; background probes as the fail-open fallback when the sentinel could not
+  ; run (no PowerShell, marker lost, machine too slow).
+  ;
+  ; WHY STAGING USES A `File` INSTRUCTION: the PS1 is a build input, not an
+  ; extraction product. $INSTDIR\resources\ does not exist yet at .onInit
+  ; (extraction creates it), so the first version of this block pointed the
+  ; sentinel at $INSTDIR\resources\install_prewarm_sentinel.ps1 — a file that
+  ; did not exist at launch time, making the sentinel fail silently on every
+  ; install. $PLUGINSDIR is created by .onInit's own InitPluginsDir
+  ; (installer.nsi:84) and survives until the installer exits; staging to it
+  ; from ${BUILD_RESOURCES_DIR} is the addLicenseFiles pattern
+  ; (installer.nsi:83-86 does exactly this dance for license files).
+  ; The File path is RELATIVE to the build resources dir that NsisTarget.js
+  ; passes as -DBUILD_RESOURCES_DIR (out/targets/nsis/NsisTarget.js:170).
+  InitPluginsDir
+  SetOutPath "$PLUGINSDIR"
+  File "${BUILD_RESOURCES_DIR}\extra\install_prewarm_sentinel.ps1"
+  SetOutPath "$INSTDIR"
+  ;
+  ; Detached via cmd `start /b` — Exec would make the installer WAIT on the
+  ; sentinel (it sleeps in a poll loop for up to 180s), which is exactly the
+  ; serial "installer babysits the probe" antipattern W34 removes. The
+  ; sentinel itself exits immediately after firing the one probe; a hung or
+  ; missing sentinel costs nothing (customInstall's probes still cover it).
+  ; Starting here rather than in customPageAfterChangeDir covers silent
+  ; installs too (no directory page shown), and the sentinel's own 60s
+  ; marker wait absorbs the wizard's page-navigation delay; .onVerifyInstDir
+  ; fires even on the initial default directory.
+  nsExec::ExecToLog 'cmd /c start /b "" powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "$PLUGINSDIR\install_prewarm_sentinel.ps1"'
+  Pop $R0
 !macroend
 
 ; -----------------------------------------------------------------------------
@@ -440,6 +485,43 @@
   FunctionEnd
 !macroend
 
+; [W34-③] Directory confirmation for the sentinel — a NATIVE NSIS callback,
+; not a macro: electron-builder 26.15.3 has NO !macro onVerifyInstDir
+; expansion point (templates/nsis/ greps clean; only .onInit / .onVerifyInstDir
+; / customInstall / customPageAfterChangeDir / customHeader etc. exist), so a
+; `!macro onVerifyInstDir` here is dead code that never runs — the first
+; version of this block shipped exactly that and dir.txt was never written.
+; NSIS itself defines the .onVerifyInstDir callback: it fires on every
+; directory-page change (including the initial default), which is early
+; enough — the sentinel's 60s marker wait overlaps the user's page
+; navigation.
+;
+; The marker carries the BARE $INSTDIR, deliberately WITHOUT replicating
+; assistedInstaller's \${APP_FILENAME} append: the append decision
+; (StrContains at instFilesPre) runs LATER than this callback, so a faithful
+; replication HERE cannot know the answer any earlier — it would only
+; duplicate the guess the sentinel would have to make anyway. The sentinel
+; (install_prewarm_sentinel.ps1) resolves the final directory itself by
+; probing BOTH candidates (bare $INSTDIR and $INSTDIR\ScienceDiscovery.exe)
+; and watching whichever exe appears — the file itself is the ground truth.
+;
+; Top-level runtime instructions ARE legal inside a callback Function (unlike
+; macro bodies outside Functions, which expand at the page-declaration top
+; level — the compile error that shipped this block's first version proved
+; that too). $9 is free here: .onInit's diagnostic-log writer and this
+; callback run on the SAME thread (NSIS is single-threaded), never live at
+; the same time, and every reader between them assigns before use.
+Function .onVerifyInstDir
+  CreateDirectory "$TEMP\sd-sentinel"
+  ClearErrors
+  FileOpen $9 "$TEMP\sd-sentinel\dir.txt" w
+  ${IfNot} ${Errors}
+    FileWrite $9 "$INSTDIR"
+    FileClose $9
+  ${EndIf}
+  ClearErrors
+FunctionEnd
+
 !macro customInstall
 
   ; End marker — a log with "start" but no "end" means the install
@@ -491,19 +573,37 @@
     ; goes to $R0. Both are this file's established scratch registers.
     ${If} ${FileExists} "$INSTDIR\resources\envs-template\frozen\sd-services\sd-services\sd-services.exe"
     ${AndIf} ${FileExists} "$INSTDIR\resources\backend\jw\frozen\sd-jw\sd-jw\sd-jw.exe"
-      ; --- probe 1: sd-services.exe (evolve/memory-graph/adapter dispatcher) ---
+    ; --- [W34-②] probes run DETACHED; the installer never babysits them ----
+    ; The 14th package's real-user install showed the tail as a 12s
+    ; "frozen" window: two serial nsExec waits with zero UI feedback
+    ; (progress bar full, no text) — the classic dead-app impression.
+    ; cmd `start /b` detaches each probe; the exit code is logged by the
+    ; probe wrapper itself (echo to the log via cmd redirection is NOT
+    ; possible for an already-open NSIS handle, so the wrapper echoes to a
+    ; side file the next install reads — best-effort diagnostics, the
+    ; on-the-same-handle lines below record launches instead of exits).
+    ; Fail-open: a probe that never ran surfaces at first start exactly as
+    ; before W30. The main-exe probe is skipped when the [W34-③] sentinel
+    ; already fired it during extraction (dir marker + fired marker under
+    ; %TEMP%\sd-sentinel) — avoiding a second 27s scan of the same image.
       ${GetTime} "" "L" $1 $2 $3 $4 $5 $6 $7
-      FileWrite $9 "[$3-$2-$1 $5:$6:$7] warmup sd-services: start$\r$\n"
-      nsExec::ExecToLog /TIMEOUT=60000 '"$INSTDIR\resources\envs-template\frozen\sd-services\sd-services\sd-services.exe"'
+      FileWrite $9 "[$3-$2-$1 $5:$6:$7] warmup sd-services: bg-start$\r$\n"
+      nsExec::ExecToLog 'cmd /c start /b "" "$INSTDIR\resources\envs-template\frozen\sd-services\sd-services\sd-services.exe"'
       Pop $R0
-      ${GetTime} "" "L" $1 $2 $3 $4 $5 $6 $7
-      FileWrite $9 "[$3-$2-$1 $5:$6:$7] warmup sd-services: exit=$R0$\r$\n"
       ; --- probe 2: sd-jw.exe (jiuwenswarm dispatcher, the 90.8MB one) ---
-      FileWrite $9 "[$3-$2-$1 $5:$6:$7] warmup sd-jw: start$\r$\n"
-      nsExec::ExecToLog /TIMEOUT=60000 '"$INSTDIR\resources\backend\jw\frozen\sd-jw\sd-jw\sd-jw.exe"'
+      FileWrite $9 "[$3-$2-$1 $5:$6:$7] warmup sd-jw: bg-start$\r$\n"
+      nsExec::ExecToLog 'cmd /c start /b "" "$INSTDIR\resources\backend\jw\frozen\sd-jw\sd-jw\sd-jw.exe"'
       Pop $R0
-      ${GetTime} "" "L" $1 $2 $3 $4 $5 $6 $7
-      FileWrite $9 "[$3-$2-$1 $5:$6:$7] warmup sd-jw: exit=$R0$\r$\n"
+      ; --- probe 3: main exe in Node mode (scan warm) unless the sentinel
+      ; already fired it during extraction (check the fired marker). ---
+      IfFileExists "$TEMP\sd-sentinel\fired.txt" 0 w34_main_exe_probe
+        FileWrite $9 "[$3-$2-$1 $5:$6:$7] warmup main-exe: skipped (sentinel fired during extraction)$\r$\n"
+        Goto w34_main_exe_done
+      w34_main_exe_probe:
+        FileWrite $9 "[$3-$2-$1 $5:$6:$7] warmup main-exe: bg-start$\r$\n"
+        nsExec::ExecToLog 'cmd /c start /b "" cmd /c "set ELECTRON_RUN_AS_NODE=1&& "$INSTDIR\ScienceDiscovery.exe" < nul"'
+        Pop $R0
+      w34_main_exe_done:
     ${EndIf}
 
     FileClose $9

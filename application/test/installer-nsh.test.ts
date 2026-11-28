@@ -362,9 +362,6 @@ test("W30 warm-up probes BOTH frozen exes with the exact payload paths", () => {
     "sd-services.exe probe path drifted from the payload onedir shape");
   assert.ok(installerNsh.includes('resources\\backend\\jw\\frozen\\sd-jw\\sd-jw\\sd-jw.exe'),
     "sd-jw.exe probe path drifted from the payload onedir shape");
-  const probes = installerNsh.match(/nsExec::ExecToLog \/TIMEOUT=60000/g) ?? [];
-  assert.equal(probes.length, 2,
-    `expected exactly 2 warm-up probes, found ${probes.length}`);
 });
 
 test("W30 warm-up is best-effort: FileExists-gated, never judges the exit code", () => {
@@ -387,15 +384,22 @@ test("W30 warm-up is best-effort: FileExists-gated, never judges the exit code",
     + gateIdxCode + " probe=" + probeIdxCode);
   // Usage probes legitimately exit 2; AV blocks/quarantines exit their own
   // ways. The macro must LOG $R0, never branch on it — a judged exit code
-  // would turn a locked-down machine's slow AV into a failed install.
+  // would turn a moved probe's death into a failed install.
   assert.ok(!/\$\{If\} \$R0/.test(body),
     "customInstall branches on the probe exit code — warm-up must be "
     + "best-effort (log-only), a failed warm-up is not a failed install");
-  // TIMEOUT is the locked-down-machine escape: nsExec kills the probe and
-  // moves on. Without it a 5-minute enterprise AV scan hangs the installer.
-  assert.ok(/\/TIMEOUT=60000/.test(body),
-    "warm-up probes lost their TIMEOUT — locked-down machines would hang "
-    + "the install section indefinitely");
+  // Detachment is the W34-② contract: the 14th package's real install showed
+  // a 12s frozen tail (two serial nsExec waits, no UI feedback). Every
+  // warm-up probe line must go through cmd `start /b` — a probe that waits
+  // is the "installer babysits the probe" antipattern back.
+  const probeLines = codeOnly.match(/nsExec::ExecToLog[^\n]*/g) ?? [];
+  assert.ok(probeLines.length >= 3,
+    `expected at least 3 warm-up probe lines (sd-services/sd-jw/main-exe), found ${probeLines.length}`);
+  for (const line of probeLines) {
+    assert.ok(line.includes("cmd /c start /b"),
+      `warm-up probe is not detached: "${line.trim()}" — serial probes caused `
+      + "the 12s frozen install tail (W34-②)");
+  }
 });
 
 test("W30 warm-up logs to install-diagnostics.log through ONE handle", () => {
@@ -403,7 +407,7 @@ test("W30 warm-up logs to install-diagnostics.log through ONE handle", () => {
   // risks torn lines in the diagnostic log. The macro must open $9 once and
   // close it once, with every warm-up FileWrite going through $9.
   const m = /!macro customInstall([\s\S]*?)!macroend/.exec(installerNsh);
-  assert.ok(m, "customInstall macro not found");
+  assert.ok(m, "customInstall macro not moved");
   const body = m![1];
   const opens = (body.match(/FileOpen \$9/g) ?? []).length;
   const closes = (body.match(/FileClose \$9/g) ?? []).length;
@@ -413,6 +417,122 @@ test("W30 warm-up logs to install-diagnostics.log through ONE handle", () => {
     "customInstall opens a second log handle — two live handles on one file "
     + "interleave partial lines");
   const warmupWrites = (body.match(/FileWrite \$9 "[^"]*warmup/g) ?? []).length;
+  // W34-② backgrounded the probes: the log now records LAUNCHES, not
+  // exits — one line per probe (2 frozen + 1 main-exe with its fired-gate
+  // skip line) = 4 writes.
   assert.equal(warmupWrites, 4,
-    `expected 4 warm-up log lines (start+exit per probe), found ${warmupWrites}`);
+    `expected 4 warm-up log lines (bg-start ×2 + main-exe start/skip pair), found ${warmupWrites}`);
+});
+
+// ---------------------------------------------------------------------------
+// [W34] Install-time Defender prewarm sentinel contract.
+//
+// The sentinel moves the main exe's 27s Defender image scan (measured on the
+// 14th package's real-user first start, inside CreateProcess — before app
+// code runs) into the extraction window. Three coupling rules, each of which
+// the first implementation broke in the field:
+//   1. the PS1 must be STAGED before it is launched (launching from
+//      $INSTDIR\resources at .onInit points at a file extraction has not
+//      written yet);
+//   2. the dir marker must be writable from the directory page — the only
+//      NSIS hook that fires there is the NATIVE .onVerifyInstDir callback,
+//      not an electron-builder macro (26.15.3 has no onVerifyInstDir
+//      expansion point; a !macro of that name is dead code);
+//   3. the main-exe probe must not double-scan when the sentinel already
+//      fired (fired.txt gate in customInstall).
+test("W34 sentinel PS1 is staged to $PLUGINSDIR before launch, never from $INSTDIR", () => {
+  // Stage: customInit must `File` the PS1 from BUILD_RESOURCES_DIR into
+  // $PLUGINSDIR, then launch it FROM $PLUGINSDIR. The broken first version
+  // launched from $INSTDIR\resources — nonexistent at .onInit, so the
+  // sentinel never ran.
+  const init = /!macro customInit([\s\S]*?)!macroend/.exec(installerNsh);
+  assert.ok(init, "customInit macro not found");
+  const body = init![1];
+  const codeOnly = body.split("\n").filter(l => !l.trim().startsWith(";")).join("\n");
+  const stageIdx = codeOnly.indexOf("File \"${BUILD_RESOURCES_DIR}\\extra\\install_prewarm_sentinel.ps1\"");
+  const launchIdx = codeOnly.indexOf("nsExec::ExecToLog 'cmd /c start /b \"\" powershell");
+  assert.ok(stageIdx >= 0,
+    "customInit must stage install_prewarm_sentinel.ps1 via File from ${BUILD_RESOURCES_DIR}");
+  assert.ok(launchIdx > stageIdx,
+    "the sentinel launch must come after the File staging (launching before "
+    + "staging points at a file that does not exist yet)");
+  assert.ok(codeOnly.includes("-File \"$PLUGINSDIR\\install_prewarm_sentinel.ps1\""),
+    "the sentinel must be launched from $PLUGINSDIR — $INSTDIR\\resources is an "
+    + "extraction product and does not exist at .onInit");
+});
+
+test("W34 dir marker comes from the NATIVE .onVerifyInstDir callback", () => {
+  // electron-builder 26.15.3 has NO !macro onVerifyInstDir expansion point
+  // (verified: templates/nsis/ greps clean). The first version wrote a
+  // !macro of that name — dead code, dir.txt never written. The native
+  // NSIS callback is the only hook that fires on directory-page changes.
+  assert.ok(!/^!macro onVerifyInstDir/m.test(installerNsh),
+    "a !macro onVerifyInstDir is dead code — electron-builder 26.15.3 never "
+    + "expands it (no expansion point in templates/nsis/); use the native "
+    + "NSIS `Function .onVerifyInstDir` callback instead");
+  const fn = /Function \.onVerifyInstDir([\s\S]*?)FunctionEnd/.exec(installerNsh);
+  assert.ok(fn, "the native .onVerifyInstDir callback is missing");
+  const code = fn![1]
+    .split(/\r?\n/)
+    .filter((l) => !/^\s*;/.test(l))
+    .join("\n");
+  assert.ok(code.includes("sd-sentinel\\dir.txt"),
+    ".onVerifyInstDir must write the dir.txt marker under %TEMP%\\sd-sentinel");
+  // The marker carries the BARE $INSTDIR — the APP_FILENAME append decision
+  // (StrContains at instFilesPre) runs LATER than this callback, so a
+  // replication here would just be a guess the sentinel re-makes anyway;
+  // the sentinel PS1 probes BOTH candidate exe paths instead.
+  assert.ok(!/\$\{StrContains\}/.test(code),
+    ".onVerifyInstDir must NOT re-run the instFilesPre append logic — it runs "
+    + "later than this callback; the sentinel resolves both candidates itself");
+  assert.ok(/FileWrite \$9 "\$INSTDIR"/.test(code),
+    "the marker must carry the bare $INSTDIR for the sentinel's dual-candidate probe");
+});
+
+test("W34 customInstall main-exe probe defers to the sentinel's fired marker", () => {
+  // The sentinel fires the main-exe probe during extraction; customInstall's
+  // tail probe is the fail-open FALLBACK. Without the fired.txt gate the
+  // tail would re-scan the same 195MB image — a second 27s Defender scan
+  // hidden in the install tail (exactly the W34-② antipattern).
+  const m = /!macro customInstall([\s\S]*?)!macroend/.exec(installerNsh);
+  assert.ok(m, "customInstall macro not found");
+  const body = m![1];
+  assert.ok(body.includes('IfFileExists "$TEMP\\sd-sentinel\\fired.txt"'),
+    "customInstall must gate the main-exe probe on the sentinel's fired marker");
+  assert.ok(/ELECTRON_RUN_AS_NODE=1/.test(body),
+    "the main-exe probe must run in ELECTRON_RUN_AS_NODE mode (no app code, "
+    + "no single-instance lock, exits on stdin EOF)");
+  assert.ok(/< nul/.test(body),
+    "the main-exe probe must redirect stdin from NUL so the Node process "
+    + "exits immediately after the scan (REPL gets EOF)");
+});
+
+test("W34 sentinel PS1 exists in build/extra and carries the probe contract", () => {
+  // The PS1 is staged from ${BUILD_RESOURCES_DIR}\extra — if it moves or
+  // loses its core moves (dual-candidate poll, exclusive-read readiness,
+  // fired marker, detached probe), the sentinel silently no-ops. Static
+  // shape assertions, same discipline as the nsh ones.
+  const ps1 = read("build/extra/install_prewarm_sentinel.ps1");
+  assert.ok(ps1.includes("sd-sentinel"),
+    "the sentinel must key on the %TEMP%\\sd-sentinel marker directory");
+  assert.ok(ps1.includes('"dir.txt"'),
+    "the sentinel must read the .onVerifyInstDir dir marker");
+  assert.ok((ps1.match(/Join-Path \$dir/g) ?? []).length >= 2,
+    "the sentinel must probe BOTH exe landing spots (bare $INSTDIR and the "
+    + "instFilesPre-appended subdirectory) — the dir marker carries the bare "
+    + "path and the append decision runs later than the marker write");
+  assert.ok(ps1.includes('[IO.File]::Open($candidate, "Open", "Read", "None")'),
+    "the exclusive-read probe is what detects the exe is fully written (the "
+    + "writer's open handle blocks a Read-sharing-mode-None open)");
+  assert.ok(ps1.includes("-gt 100MB"),
+    "the size gate keeps a torn/placeholder file from being executed");
+  assert.ok(ps1.includes('"fired.txt"'),
+    "the fired marker is what lets customInstall skip a re-scan");
+  assert.ok(ps1.includes("ELECTRON_RUN_AS_NODE=1"),
+    "the probe must run the main exe in Node mode — zero app side effects");
+  assert.ok(ps1.includes("< nul"),
+    "stdin EOF from NUL makes the Node process self-exit after the scan");
+  assert.ok(ps1.includes("$ErrorActionPreference = \"SilentlyContinue\""),
+    "fail-open discipline: every failure path exits quietly, the sentinel "
+    + "never blocks or fails an install");
 });

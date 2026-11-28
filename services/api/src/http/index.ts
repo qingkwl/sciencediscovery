@@ -431,6 +431,34 @@ function closeHttpServer(server: Server): Promise<void> {
   });
 }
 
+/**
+ * [W34-①] Routes whose handlers read or write encrypted credentials
+ * (model tokens, provider keys, proxy URLs, memory-graph password, remote
+ * host credentials, runtime subagent keys). The dispatcher resolves the
+ * DPAPI model-secret key before these routes run, so the synchronous
+ * decrypt/encrypt helpers never see an unresolved key. Conservative on
+ * purpose: a route that only *lists* hosts or models is included when its
+ * handler touches `getModelApiToken`/`remoteHostSecret`-style reads — an
+ * extra route here costs nothing (the key resolution is memoized), a
+ * missing one costs a 500.
+ */
+const SECRET_SURFACE_PATH_PREFIXES = [
+  "/api/models",
+  "/api/providers",
+  "/api/settings",
+  "/api/proxy",
+  "/api/web",
+  "/api/memory",
+  "/api/remote-hosts",
+  "/api/runners",
+] as const;
+const SECRET_SURFACE_SUBSTRING = "/runtime-input"; // configureCodex / configureRuntime POSTs match /api/sessions/:id/runtime-input/:kind
+
+function secretSurfaceRoute(pathname: string): boolean {
+  if (pathname.includes(SECRET_SURFACE_SUBSTRING)) return true;
+  return SECRET_SURFACE_PATH_PREFIXES.some((prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`));
+}
+
 export function closeApiServer(server: Server): Promise<void> {
   const lifecycle = apiServerLifecycles.get(server);
   if (!lifecycle) {
@@ -1366,6 +1394,21 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
     const requestPath = (request.url ?? "/").split("?", 1)[0] || "/";
     try {
       const url = new URL(request.url ?? "/", "http://localhost");
+      // [W34-①] Secret-surface routes resolve the DPAPI model-secret key
+      // BEFORE dispatch. The 14th package measured 5371ms when the key
+      // resolved inside session_store during boot (data dir with one
+      // model_secrets row); now the boot path never resolves it, so these
+      // routes pay the one-time memoized cost at first interactive use
+      // instead — and the ready+10s background prewarm usually wins the
+      // race, making even this a no-op. Reads need the key for decryption
+      // (getModelApiToken and friends throw when it is unresolved); writes
+      // call ensureSecretKey themselves, but the dispatcher-side guard
+      // covers synchronous writer entry points (configureCodex et al.).
+      if (secretSurfaceRoute(url.pathname)) {
+        await store.ensureSecretKey().catch((error) => {
+          apiLog.warn("secret_key_resolution_failed", { requestId, error: String(error) });
+        });
+      }
       // The desktop shell has already authenticated the person through HUAWEI
       // ID. Its local control plane still needs the internal bearer token, but
       // asking a person to copy that token is a setup step, not a security
