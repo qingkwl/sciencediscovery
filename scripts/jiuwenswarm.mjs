@@ -72,6 +72,79 @@ const jwPython = cfg => venvEntry(venvDir(cfg), "python");
  */
 const jwEntryCache = new Map();
 
+/**
+ * [D3 P1-3] Frozen-exe spawn contract. When a frozen sd-jw onedir is
+ * deployed (payload layout: <root>/frozen/sd-jw/sd-jw.exe, and the
+ * dev sandbox .tmp-freeze-dist layout for local probing), the venv
+ * entry resolution -- entry_points.txt scans, trampoline fallbacks,
+ * burned-shebang dodges (F10.6k/W18) -- is RETIRED for the spawn
+ * itself: every jw console script maps to `<exe> <entry>` through the
+ * dispatcher (freeze/sd_exec_entry.py's table, which carries the real
+ * [project.scripts] names). The frozen exe already contains the
+ * patches (runtime hook), so PYTHONPATH-based sitecustomize transport
+ * is unnecessary too.
+ *
+ * SD_JW_FREEZE=0 forces the venv path (verification-window dual-rail;
+ * the env var is read once per process, never inherited by spawns).
+ */
+export function frozenJwExe(cfg) {
+  // [D3 P3-4 early retirement] packaged mode REQUIRES the frozen rail — the
+  // jw venv no longer ships, so a missing onedir is a broken install. Dev
+  // mode keeps SD_JW_FREEZE=0 as the old-rail escape hatch.
+  const packaged = process.env.SCIENCE_AGENT_PACKAGED === "1";
+  if (packaged) {
+    const found = frozenJwExeCandidates(cfg);
+    if (!found) {
+      throw new Error(
+        "packaged mode requires the frozen sd-jw onedir (<root>/frozen/sd-jw/sd-jw.exe) — "
+        + "the venv rail no longer ships; reinstall ScienceDiscovery.");
+    }
+    return found;
+  }
+  if (process.env.SD_JW_FREEZE === "0") return undefined;
+  return frozenJwExeCandidates(cfg);
+}
+
+/** The frozen-onedir candidate scan shared by both modes:
+ *   explicit:        SD_JW_FROZEN_EXE (wins when set; packagedEnv injects
+ *                    the payload path — resources\backend\jw\frozen\...)
+ *   payload deploy:  <root>/frozen/sd-jw/sd-jw/sd-jw.exe  (P1-5 onedir:
+ *                    PyInstaller --distpath <root>/frozen/sd-jw produces
+ *                    sd-jw/sd-jw.exe — TWO levels; the single-level
+ *                    candidate below is the probe-era sandbox layout)
+ *   probe sandbox:   <root>/frozen/sd-jw/sd-jw.exe (dev probing one-level)
+ *   dev sandbox:     <root>/../../.tmp-freeze-dist/sd-jw/sd-jw.exe */
+function frozenJwExeCandidates(cfg) {
+  const explicit = process.env.SD_JW_FROZEN_EXE;
+  if (explicit && existsSync(explicit)) return explicit;
+  const rels = [
+    "frozen/sd-jw/sd-jw/sd-jw.exe", // payload onedir (2-level, the shipped shape)
+    "frozen/sd-jw/sd-jw.exe",       // probe-era sandbox shape (1-level)
+    "../../.tmp-freeze-dist/sd-jw/sd-jw.exe",
+  ];
+  for (const rel of rels) {
+    const cand = resolve(cfg.root, rel);
+    if (existsSync(cand)) return cand;
+  }
+  // [W12 twin] packaged fallback: the payload onedir also resolves off the
+  // jw SRC tree the shell injects (JIUWENSWARM_SRC=resources\backend\jw and
+  // frozen/ sits inside it) — covers a shell version predating the
+  // SD_JW_FROZEN_EXE injection.
+  const src = process.env.JIUWENSWARM_SRC;
+  if (src) {
+    const cand = join(src, "frozen", "sd-jw", "sd-jw", "sd-jw.exe");
+    if (existsSync(cand)) return cand;
+  }
+  return undefined;
+}
+
+/** Map a venv console-script name to its frozen dispatch entry. The
+ *  dispatcher's table is the authority (freeze/sd_exec_entry.py); jw's
+ *  `jiuwenswarm-<x>` naming maps to the bare `<x>` entry directly. */
+function frozenEntryName(name) {
+  return name.replace(/^jiuwenswarm-/, "");
+}
+
 /** The site-packages directories of a venv, Windows and POSIX layouts
  * (W18: scan both — the resolver runs on the TARGET platform's payload). */
 function venvSitePackagesDirs(venvAbs) {
@@ -92,6 +165,17 @@ function venvSitePackagesDirs(venvAbs) {
 export function resolveVenvEntry(venvAbs, name) {
   const key = `${venvAbs}::${name}`;
   if (jwEntryCache.has(key)) return jwEntryCache.get(key);
+
+  // [D3 P1-3] Frozen layout short-circuit: if the frozen exe exists for
+  // this tree, EVERY entry spawns through it — the venv scan below is
+  // the venv-layout rail only (SD_JW_FREEZE=0 or no frozen payload).
+  const frozenExe = frozenJwExe({ root: resolve(venvAbs, "..", "..") });
+  if (frozenExe) {
+    const spec = { exe: frozenExe, args: [frozenEntryName(name)], frozen: true };
+    jwEntryCache.set(key, spec);
+    return spec;
+  }
+
   let spec = null;
   for (const sitePackages of venvSitePackagesDirs(venvAbs)) {
     try {
@@ -386,10 +470,22 @@ async function verifyCompatibilityPatches(cfg) {
     process.stderr.write("JiuwenSwarm: compatibility patches already verified (fingerprint match); skipping.\n");
     return;
   }
-  const { stdout } = await runLogged(cfg, "verify-locate", jwPython(cfg), [
-    "-c", "import importlib.util,pathlib; print(pathlib.Path(importlib.util.find_spec('jiuwenswarm').origin).parent.parent)",
-  ]);
-  await runLogged(cfg, "verify", jwPython(cfg), [join(scriptDir, "swarm-patches.py"), "verify", stdout.trim().split(/\r?\n/).pop(), cfg.tag]);
+  // [D3 P3-4 early retirement] the verify chain no longer spawns the jw venv
+  // python (the venv rail is retired from the payload; jwPython(cfg) resolves
+  // to the frozen dispatcher exe, which takes ENTRY names / -m / paper — NOT
+  // -c). The locate step's whole purpose was "the directory containing the
+  // jiuwenswarm package" — that is cfg.src by construction, so the -c probe
+  // is replaced by the known path. The verify itself runs on the BUNDLED base
+  // interpreter (SCIENCE_AGENT_PYTHON_PATH, injected by the packaged shell;
+  // dev falls back to findHostPython) — swarm-patches.py is pure stdlib,
+  // which the base python fully covers.
+  const verifierPython = process.env.SCIENCE_AGENT_PYTHON_PATH && existsSync(process.env.SCIENCE_AGENT_PYTHON_PATH)
+    ? process.env.SCIENCE_AGENT_PYTHON_PATH
+    : findHostPython();
+  if (!verifierPython) {
+    throw new Error("python3/python is required to verify the jw compatibility patches (set SCIENCE_AGENT_PYTHON_PATH).");
+  }
+  await runLogged(cfg, "verify", verifierPython, [join(scriptDir, "swarm-patches.py"), "verify", cfg.src, cfg.tag]);
   // fingerprint 为 null（补丁目录缺失等异常态）时不落 marker：verify 虽然过了，
   // 但下次仍应重新校验——缓存只覆盖"指纹可计算且匹配"这一种可信状态。
   if (fingerprint !== null) recordVerified(cfg, fingerprint);

@@ -34,6 +34,8 @@ import type {
   EvolveRunStatus,
 } from "@sciencediscovery/schema";
 
+import { TITLE_COLUMNS, truncateColumns } from "../text/columns.js";
+
 export interface EvolveCandidateView {
   accepted?: boolean;
   changeSummary?: string;
@@ -305,24 +307,22 @@ export function headlineScore(view: EvolveRunView): number | null {
     ?? view.baselineScore;
 }
 
-export type Verdict = "accepted" | "failed" | "rejected" | "violated";
+export type Verdict = "accepted" | "cancelled" | "failed" | "rejected" | "violated";
 
-/** Which of the four outcomes a candidate row is showing.
+/** Which of the five outcomes a candidate row is showing.
  *
- *  Four, not two, because they send the reader somewhere different: accepted
+ *  Five, not two, because they send the reader somewhere different: accepted
  *  means it is now the best; a failed candidate never ran; a constraint
- *  violation is illegal rather than worse; and "rejected" simply lost. */
+ *  violation is illegal rather than worse; "rejected" simply lost; and a
+ *  cancelled candidate was never measured at all — which is not the same claim
+ *  as a program that would not run, and is fixed by more budget rather than by
+ *  a different program. */
 export function verdictOf(candidate: EvolveCandidateView): Verdict {
   if (candidate.accepted) return "accepted";
+  if (candidate.category === "cancelled") return "cancelled";
   if (!candidate.valid) return candidate.category === "constraint-violated" ? "violated" : "failed";
   return candidate.category === "constraint-violated" ? "violated" : "rejected";
 }
-
-/** Longest title, in columns: a CJK character is two columns wide. */
-const TITLE_COLUMNS = 64;
-
-const columnsOf = (char: string): number =>
-  (/[ᄀ-ᅟ⺀-꓏가-힣豈-﫿︰-﹯＀-｠￠-￦]/.test(char) ? 2 : 1);
 
 /**
  * A one-line title for a run whose goal is the user's whole brief.
@@ -339,14 +339,7 @@ export function evolveShortTitle(statement: string): string {
   const title = /[\p{L}\p{N}]/u.test(firstSentence)
     ? firstSentence
     : /[\p{L}\p{N}]/u.test(unlabelled) ? unlabelled : flat;
-  let width = 0;
-  let out = "";
-  for (const char of title) {
-    width += columnsOf(char);
-    if (width > TITLE_COLUMNS) return `${out.trimEnd()}…`;
-    out += char;
-  }
-  return out;
+  return truncateColumns(title, TITLE_COLUMNS);
 }
 
 /** Whether a goal predates the conversational designer. Runs written before

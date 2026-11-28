@@ -85,6 +85,15 @@ export function stampPath(dataDir: string): string {
   return join(dataDir, "envs", ".shell-unpacked");
 }
 
+/** [W17] The frozen-verify stamp: "this payload was fully hashed here
+ *  already". Sibling of .shell-unpacked (same directory, same
+ *  lifecycle: delete dataDir/envs and both regenerate). Written
+ *  atomically after a successful full pass; read on every launch to
+ *  demote the integrity check to a stat+size fast pass. */
+export function frozenVerifyStampPath(dataDir: string): string {
+  return join(dataDir, "envs", ".frozen-verified");
+}
+
 /** Env vars the packaged shell injects into every stack spawn. */
 export function packagedEnv(paths: PackagedPaths, dataDir: string, platform: ShellPlatform = CURRENT_SHELL_PLATFORM): NodeJS.ProcessEnv {
   const layout = venvLayoutFor(platform);
@@ -115,10 +124,27 @@ export function packagedEnv(paths: PackagedPaths, dataDir: string, platform: She
     // deployment modes put the dot-dirs under the same subdirectory.
     JIUWENSWARM_HOME: join(dataDir, "jiuwenswarm-home"),
     JIUWENSWARM_SRC: paths.jwSrc,
+    // [D3 P3-4 early retirement, W12 twin] The jw onedir ships inside the
+    // payload's jw src tree (backend\jw\frozen\sd-jw\sd-jw\sd-jw.exe — the
+    // PyInstaller 2-level onedir shape). Hand it to the stack explicitly so
+    // jiuwenswarm.mjs's candidate scan does not have to guess between the
+    // dataDir and payload layouts on a clean install.
+    SD_JW_FROZEN_EXE: join(paths.jwSrc, "frozen", "sd-jw", "sd-jw", "sd-jw.exe"),
+    // [D3 P3-4 early retirement] The frozen onedirs are the only Python
+    // runtime shipped: hand the stack and the API the services dispatcher
+    // exe straight from the payload (resources\envs-template\frozen\...,
+    // the P2-5 assemble layout) so no consumer has to guess where the
+    // onedir lives. The dataDir copy of the onedir (the probe layout) does
+    // not exist on a clean install — the exe the payload carries IS the
+    // runtime. Field incident (rc3 first install): start-stack resolved
+    // <dataDir>\frozen\... only and hard-failed "packaged mode requires the
+    // frozen sd-services onedir" on a healthy install.
+    SCIENCE_AGENT_SD_SERVICES_EXE: join(paths.envsTemplate, "frozen", "sd-services", "sd-services", "sd-services.exe"),
     // The api defaults paper's interpreter to a POSIX-style venv path that
-    // never exists on Windows; point it at the shared sidecar venv
-    // (SIZEOPT W2: one "sd-services" venv for all five Python sidecars).
-    SCIENCE_AGENT_PAPER_PYTHON_PATH: join(envsRoot, "sd-services", layout.venvBin, layout.venvPython),
+    // never exists on Windows; the frozen dispatcher carries paper as the
+    // loose-file entry (`<exe> paper <worker.py> ...`, the -I contract is
+    // satisfied by the dispatcher's cwd isolation) since the venv retired.
+    SCIENCE_AGENT_PAPER_PYTHON_PATH: join(paths.envsTemplate, "frozen", "sd-services", "sd-services", "sd-services.exe"),
     // Tell the stack where to find the sidecar venvs (in-place or copied).
     SCIENCE_AGENT_ENVS_DIR: envsRoot,
     // Ship the new desktop UI as the renderer payload.
@@ -462,17 +488,24 @@ interface PayloadBytecodeManifest {
 }
 
 /**
- * Read the build's own bytecode count for the region bootstrap unpacks
- * (envs-template -> <dataDir>\envs). Returns null when version.json is missing,
- * unreadable, or predates the `bytecode` field, so the caller degrades to the
- * absolute coverage limit rather than passing blind on a missing input
- * (lesson L51). Synchronous and tiny (the manifest is ~300 bytes), matching
- * needsUnpack's stamp read.
+ * Read the build's own bytecode count for the PRECOMPILE FACE — the regions
+ * the A6 gate judges (assemble PYC_FACE_REGIONS, same allowlist). Returns
+ * null when version.json is missing, unreadable, or predates the `bytecode`
+ * field, so the caller degrades to the absolute coverage limit rather than
+ * passing blind on a missing input (lesson L51). Synchronous and tiny (the
+ * manifest is ~300 bytes), matching needsUnpack's stamp read.
+ *
+ * [D3 P3-4 early retirement] The face is the bundled stdlib ("python") —
+ * since 6b removed the venv trees from the payload the envs-template region
+ * carries only the frozen onedir (loose .py there are package DATA; their
+ * bytecode lives in the PYZ archives), so counting THAT region would judge a
+ * tree that has no precompile semantics and fail every launch. Keep the
+ * byRegion audit object intact — only the READ moves.
  */
 export function readPayloadBytecodeManifest(resourcesPath: string): { py: number; pyc: number } | null {
   try {
     const manifest = JSON.parse(readFileSync(join(resourcesPath, "version.json"), "utf8")) as { bytecode?: PayloadBytecodeManifest };
-    const region = manifest.bytecode?.byRegion?.["envs-template"];
+    const region = manifest.bytecode?.byRegion?.["python"];
     if (region && Number.isFinite(region.py) && Number.isFinite(region.pyc)) {
       return { py: region.py, pyc: region.pyc };
     }
@@ -544,7 +577,15 @@ async function judgeBytecodeCoverage(
   resourcesPath: string,
   log: (line: string) => void,
 ): Promise<{ ok: boolean; ratio: number; reason: string; expectedPyc: number | null; kind: string | null }> {
-  const counts = await countBytecode(envsDir);
+  // [D3 P3-4 early retirement] The judged tree is the PRECOMPILE FACE (the
+  // bundled stdlib, paths.python), not the unpacked envs: since the venv
+  // retirement the envs-template region carries only the frozen onedir,
+  // whose loose .py files have no __pycache__ semantics (bytecode lives in
+  // the PYZ archives). Judging that tree would compare apples to the build's
+  // oranges and fail every first launch. The stdlib IS the region the build
+  // precompiles (assemble 7c) and the region A6 gates — same tree on both
+  // sides of the comparison.
+  const counts = await countBytecode(join(resourcesPath, "python"));
   const expectedRegion = readPayloadBytecodeManifest(resourcesPath);
   const verdict = unpackedBytecodeVerdict(counts, expectedRegion);
   // Name BOTH recorded counts. The suffix used to report only the .pyc, which
@@ -698,6 +739,34 @@ export async function bootstrapPackaged(
     log(`[perf] bootstrap ${event} +${Date.now() - bootstrapStarted}ms${extra ? ` ${extra}` : ""}`);
   };
   perfB("enter");
+
+  // [D3 P3-3] Frozen-payload integrity probe: when frozen onedirs ship,
+  // verify them against the build-time manifest (frozen-manifest.json,
+  // assemble 5.5c) BEFORE any spawn. A missing/corrupted file surfaces
+  // here as a readable error instead of a cryptic loader traceback on
+  // the first spawn.
+  // [W17] The pass is now tiered: the first launch (or a changed
+  // payload — upgrade/reinstall) hashes everything and writes a stamp
+  // keyed on payloadIdentity; every later launch stat+size-checks only
+  // (<1s warm) and escalates back to the full hash on any drift. The
+  // full pass measured 147.7s warm on the field machine (839.5MB /
+  // 14,071 files, serial), which ran on EVERY launch pre-W17 — the
+  // dominant frozen-vs-venv startup gap (D:/CodeFile/sd-perf-ab, W17).
+  {
+    const { verifyFrozenPayload } = await import("./frozen-verify.ts");
+    const verdict = await verifyFrozenPayload(paths.resourcesPath, log, {
+      stampPath: frozenVerifyStampPath(dataDir),
+      identity: payloadIdentity(paths.resourcesPath),
+    });
+    if (!verdict.ok) {
+      // Hard error: a broken frozen rail cannot be worked around.
+      throw new Error(
+        `frozen payload integrity check FAILED: ${verdict.problems[0]?.kind} ${verdict.problems[0]?.path}`
+        + ` (${verdict.problems.length} problem${verdict.problems.length === 1 ? "" : "s"}); reinstall ScienceDiscovery.`,
+      );
+    }
+  }
+
   // Optionally run venvs straight from the read-only payload.
   // Packaged mode never mutates venvs at runtime, so copying them into the
   // data directory is pure overhead on first start.

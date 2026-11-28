@@ -28,6 +28,8 @@ const copy = {
   delete: "删除",
   detail: "详情",
   detailFiles: "文件",
+  exit: "退出编辑",
+  content: "内容",
   edit: "编辑",
   export: "导出",
   importAction: "导入",
@@ -209,11 +211,15 @@ test.describe("Desktop Skill import and editing", { tag: ["@isolation:global", "
         async () => {
           await settings.getByRole("button", { name: copy.add, exact: true }).click();
           await page.getByRole("menuitem", { name: new RegExp(copy.upload) }).click();
-          await expect(settings.getByRole("heading", { name: copy.upload, exact: true })).toBeVisible();
-          await settings.locator('input[type="file"]').setInputFiles(skillFile);
-          await settings.getByRole("button", { name: copy.importAction, exact: true }).click();
-          await expect(settings.locator("small.row-note[role=status]")).toContainText(name);
-          await settings.getByRole("button", { name: copy.back, exact: true }).click();
+          const dialog = settings.getByRole("dialog", { name: copy.upload });
+          await expect(dialog).toBeVisible();
+          await dialog.locator('input[type="file"]').setInputFiles(skillFile);
+          await dialog.getByRole("button", { name: "确定", exact: true }).click();
+          // The dialog closes itself once the package lands, and a notice
+          // names it; the list is on screen again underneath.
+          await expect(dialog).toHaveCount(0);
+          await expect(settings.locator(".skill-toast")).toContainText(name);
+          await expect(settings.locator(".settings-list")).toBeVisible();
         },
       );
 
@@ -225,13 +231,14 @@ test.describe("Desktop Skill import and editing", { tag: ["@isolation:global", "
           await expect(card).toHaveCount(1, { timeout: 30_000 });
           await expect(card).toContainText(description);
           await card.locator(".settings-card-main").click();
-          // The way out names the page it leaves, in a bar across the pane's
-          // top rather than beside the title, as the settings shell does.
-          await expect(settings.locator(".skill-pane-bar .skill-breadcrumb")).toContainText(copy.skills);
-          await expect(settings.locator(".skill-pane-bar .skill-breadcrumb")).toContainText(name);
-          const subview = settings.locator(".skill-detail-head");
-          await expect(subview.getByRole("heading", { name, exact: true })).toBeVisible();
-          await expect(subview).toContainText(description);
+          // The page owns its way out: 返回 sits at the top of its column, and
+          // the name and its actions are the first line under it.
+          const pageHead = settings.locator(".skill-detail-page-head");
+          await expect(settings.locator(".skill-detail-back")).toBeVisible();
+          await expect(pageHead.getByRole("heading", { name, exact: true })).toBeVisible();
+          // 基本信息 opens on the body of SKILL.md, as the handoff draws it.
+          await expect(settings.getByRole("tab", { name: "基本信息", exact: true }))
+            .toHaveAttribute("aria-selected", "true");
           // The page is a document in the pane's own column. A wide table or a
           // long path inside a SKILL.md must scroll inside the prose; before
           // the column was measured, one such line pushed the whole page
@@ -240,38 +247,45 @@ test.describe("Desktop Skill import and editing", { tag: ["@isolation:global", "
             (element) => element.scrollWidth - element.clientWidth,
           );
           expect(overflow, "the Skill page overflows the settings pane horizontally").toBe(0);
-          await expect(settings.getByRole("heading", { name: copy.detailFiles, exact: true })).toBeVisible();
-          await expect(settings.locator(".skill-detail-file")).toContainText(firstInstructions);
-          await expect(settings.getByRole("heading", { name: copy.detail, exact: true })).toBeVisible();
-          await expect(settings.locator(".skill-detail-meta-card")).toContainText("MIT");
-          await settings.getByRole("button", { name: copy.back, exact: true }).click();
+          await expect(settings.locator(".skill-detail-doc")).toContainText(firstInstructions);
+          await expect(settings.locator(".skill-detail-facts")).toContainText("MIT");
+          // 技能详情 puts the package's files beside the open one; this
+          // package is SKILL.md alone, so the tree has one file.
+          await settings.getByRole("tab", { name: "技能详情", exact: true }).click();
+          await expect(settings.locator(".skill-file-tree")).toContainText("SKILL.md");
+          await expect(settings.locator(".skill-file-head")).toContainText("SKILL.md");
+          await settings.getByRole("tab", { name: "基本信息", exact: true }).click();
+          await settings.locator(".skill-detail-back").click();
         },
       );
 
       await journey.step(
         "从条目右侧的下三角菜单打开编辑",
-        "菜单列出导出、编辑、删除，编辑页以技能名命名。",
+        "菜单列出导出、编辑、删除；编辑页以技能名命名，头部给出退出编辑与保存。",
         async () => {
           await openRowMenu(settings, name);
           await expect(settings.getByRole("menuitem", { name: copy.delete, exact: true })).toBeVisible();
           await chooseMenuItem(settings, copy.edit);
-          // The trail bar names the editor; the page itself opens on 名称.
-          await expect(settings.locator(".skill-pane-bar .skill-breadcrumb"))
-            .toContainText(`编辑 ${name}`);
+          await expect(settings.locator(".skill-editor-page")).toBeVisible();
+          await expect(settings.getByRole("button", { name: copy.exit, exact: true })).toBeVisible();
           await expect(settings.getByRole("button", { name: copy.save, exact: true })).toBeVisible();
         },
       );
 
       await journey.step(
-        "改写指令并保存",
-        "编辑器报告已保存。",
+        "改写正文并保存",
+        "保存回到技能详情页，接口读到的正文就是改写后的内容。",
         async () => {
-          const instructions = settings.getByLabel(copy.instructions, { exact: true });
-          await expect(instructions).toHaveValue(new RegExp(firstInstructions.replace(/\./g, "\\.")));
-          await instructions.fill(editedInstructions);
+          const content = settings.getByLabel(copy.content, { exact: true });
+          const raw = await content.inputValue();
+          expect(raw).toContain(firstInstructions);
+          await content.fill(raw.replace(firstInstructions, editedInstructions));
           await settings.getByRole("button", { name: copy.save, exact: true }).click();
-          await expect(settings.locator("small.row-note[role=status]")).toContainText(copy.saved);
-          await settings.getByRole("button", { name: copy.back, exact: true }).click();
+          await expect(settings.locator(".skill-detail-page")).toBeVisible();
+          await expect(settings.getByRole("tab", { name: "技能详情", exact: true }))
+            .toHaveAttribute("aria-selected", "true");
+          await settings.locator(".skill-detail-back").click();
+          await expect(settings.locator(".settings-list")).toBeVisible();
         },
       );
 
@@ -304,7 +318,10 @@ test.describe("Desktop Skill import and editing", { tag: ["@isolation:global", "
           id = installed.find((skill) => skill.name === name)?.id;
           expect(id, "the imported Skill is readable through the API").toBeTruthy();
           const detail = await api<InstalledSkill>(page, `/api/skills/${encodeURIComponent(id!)}`);
-          expect(detail.instructions?.trim()).toBe(editedInstructions);
+          // The file editor writes the whole document, so the heading the
+          // package shipped stays above the rewritten paragraph.
+          expect(detail.instructions?.trim()).toContain(editedInstructions);
+          expect(detail.instructions?.trim()).toContain(`# ${name}`);
           expect(detail.frontmatter?.license).toBe("MIT");
         },
       );

@@ -1,13 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   comparePathKey, DATA_DIR_MAX_LENGTH, DATA_DIR_WARN_LENGTH, defaultDataDir,
   ensureWritableDir, evaluateDataDir, formatBytes, freeBytesForPath,
   installRootCollision, isFullyQualifiedPath, isPathWithin, MIN_FREE_BYTES,
-  probeDataDir,
+  nearestExistingDir, probeDataDir, probeWritableWithoutMkdir,
 } from "../src/wizard-data-dir.ts";
 
 // Two notes on the host-independence of this file. It ships in application, but
@@ -318,6 +318,134 @@ test("probeDataDir: a clear sibling dir is not blocked by the install-root gate"
     rmSync(install, { recursive: true, force: true });
   }
 });
+
+// The input-time probe runs on HALF-TYPED values (wizard.html debounces the
+// input event at 400ms). probeDataDir must therefore never mkdir the target:
+// typing `…\ai\sd\data` piece by piece used to leave `…\ai` and `…\ai\sd`
+// behind the moment the user retyped or picked another path — the same litter
+// class as problems W8, but on the user's own drives. Creation belongs to
+// confirm time only (wizard-confirm-dir → ensureWritableDir).
+test("probeDataDir: probing a half-typed path leaves no directories behind", () => {
+  const ud = mkdtempSync(join(tmpdir(), "sd-wizard-nomkdir-"));
+  try {
+    // Simulate the debounce firing on each intermediate value while the user
+    // types `<tmp>\ai\sd\data` — every call must be side-effect-free.
+    for (const partial of [join(ud, "ai"), join(ud, "ai", "sd"), join(ud, "ai", "sd", "data")]) {
+      const res = probeDataDir(partial);
+      assert.equal(res.writable, true, `${partial}: ancestor probe must succeed`);
+      assert.equal(existsSync(partial), false,
+        `${partial} must NOT exist after probing (mkdir leaked during input)`);
+    }
+    // The intermediate parents are still gone too…
+    assert.equal(existsSync(join(ud, "ai")), false);
+    assert.equal(existsSync(join(ud, "ai", "sd")), false);
+    // …and the anchor dir itself carries no probe leftovers.
+    assert.equal(existsSync(join(ud, `.sd-wizard-probe-${process.pid}`)), false);
+    // The probe name is pid-suffixed: the anchor is an arbitrary user folder,
+    // so a fixed name could clobber a user file that happens to carry it.
+    assert.equal(existsSync(join(ud, ".sd-wizard-probe")), false,
+      "no FIXED-name probe either — a user file with that name must be untouchable");
+  } finally {
+    rmSync(ud, { recursive: true, force: true });
+  }
+});
+
+test("probeDataDir: probing an EXISTING dir stays idempotent (no probe file left)", () => {
+  const ud = mkdtempSync(join(tmpdir(), "sd-wizard-existing-"));
+  try {
+    const res = probeDataDir(ud);
+    assert.equal(res.writable, true);
+    assert.equal(existsSync(join(ud, `.sd-wizard-probe-${process.pid}`)), false,
+      "probe file must be cleaned up in the probed dir");
+    // Pre-existing user content named like the OLD fixed probe survives: the
+    // pid suffix means the probe never writes over it (review follow-up).
+    const userFile = join(ud, ".sd-wizard-probe");
+    writeFileSync(userFile, "user data", "utf8");
+    const second = probeDataDir(ud);
+    assert.equal(second.writable, true);
+    assert.equal(readFileSync(userFile, "utf8"), "user data",
+      "a user file with the fixed probe name must not be clobbered or deleted");
+  } finally {
+    rmSync(ud, { recursive: true, force: true });
+  }
+});
+
+// The one case the mkdir-free probe cannot see: a FILE squatting on (or on
+// the way to) the target. nearestExistingDir anchors on the file itself, the
+// probe write into it fails, and the page truthfully reports 不可写 — the
+// precise error only surfaces at confirm time via ensureWritableDir.
+test("probeDataDir: a file occupying the target path reads as unwritable", () => {
+  const ud = mkdtempSync(join(tmpdir(), "sd-wizard-file-"));
+  try {
+    const squatter = join(ud, "occupied");
+    writeFileSync(squatter, "x", "utf8");
+    const res = probeDataDir(squatter);
+    assert.equal(res.ok, false);
+    assert.equal(res.writable, false, "a file cannot host the data dir");
+    assert.ok(res.reason?.includes("不可写"), res.reason);
+    // Same verdict one level deeper: `<file>\sub` anchors on the file too.
+    const deeper = probeDataDir(join(squatter, "sub"));
+    assert.equal(deeper.writable, false);
+    assert.equal(deeper.ok, false);
+  } finally {
+    rmSync(ud, { recursive: true, force: true });
+  }
+});
+
+test("nearestExistingDir: walks up to the first existing dir; null at a dead root", () => {
+  const ud = mkdtempSync(join(tmpdir(), "sd-wizard-nearest-"));
+  try {
+    const deep = join(ud, "a", "b", "c");
+    assert.equal(nearestExistingDir(deep), ud, "missing middle segments are walked past");
+    assert.equal(nearestExistingDir(ud), ud, "the dir itself when it exists");
+    // A file on the way anchors ON the file (ENOTDIR surfaces as a failed
+    // probe instead of a silently wrong verdict).
+    const f = join(ud, "f");
+    writeFileSync(f, "x", "utf8");
+    assert.equal(nearestExistingDir(join(f, "sub")), f);
+    // Drive roots that do not exist: with win32.dirname the walk bottoms out
+    // AT the root (Q:\ → Q:\) instead of collapsing to "." via the host
+    // dialect — a POSIX host has no drive Q:, so statSync("Q:\") fails and
+    // the walk returns null there too (review follow-up: the host-dialect
+    // walk statSync(".")'d the CWD and returned it on Linux/macOS).
+    assert.equal(nearestExistingDir("Q:\\no\\such\\root"), null);
+  } finally {
+    rmSync(ud, { recursive: true, force: true });
+  }
+});
+
+// Review follow-up (second pair of eyes): the walk pins win32.dirname to
+// match the dialect isFullyQualifiedPath pins — so POSIX-shaped paths must
+// still walk correctly under it. win32.dirname treats /-rooted paths as
+// absolute on every host; a single Windows-shaped dead-root assertion is
+// what let the host-dialect bug pass unnoticed in the first cut.
+test("nearestExistingDir: POSIX shapes stay walkable under the win32 dialect", () => {
+  // A /-rooted path whose segments do not exist bottoms out at "/" — never
+  // at "." (the CWD). On a POSIX host "/" is the real root; on win32 Node
+  // resolves "/" to the current drive root, which also stats as a dir.
+  assert.equal(nearestExistingDir("/sd-probe-no-such-root-xyz/child"), "/",
+    "POSIX shape bottoms out at /, not the CWD");
+  // And the ancestor walk lands on the real tmpdir whatever shape the host
+  // spells it in (/tmp/... on POSIX, C:\...\Temp on Windows).
+  assert.equal(nearestExistingDir(join(tmpdir(), "sd-no-such-ancestor", "deeper")), tmpdir());
+});
+
+test("probeWritableWithoutMkdir: guards and probe placement", () => {
+  // Same self-defence as ensureWritableDir: relative input must fail closed
+  // without touching the filesystem.
+  assert.equal(probeWritableWithoutMkdir("E"), false);
+  assert.equal(probeWritableWithoutMkdir("E:tmp"), false);
+  assert.equal(probeWritableWithoutMkdir("relative-path"), false);
+  // Positive case anchors on the nearest existing dir, not the target.
+  const ud = mkdtempSync(join(tmpdir(), "sd-wizard-pwmk-"));
+  try {
+    assert.equal(probeWritableWithoutMkdir(join(ud, "new", "leaf")), true);
+    assert.equal(existsSync(join(ud, "new")), false, "target chain must not be created");
+  } finally {
+    rmSync(ud, { recursive: true, force: true });
+  }
+});
+
 test("formatBytes renders human units", () => {
   assert.equal(formatBytes(5 * 1024 ** 3), "5.0GB");
   assert.equal(formatBytes(200 * 1024 ** 2), "200MB");

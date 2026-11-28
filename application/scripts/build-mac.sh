@@ -170,6 +170,44 @@ for venv in "$OUT_DIR/backend/jw/.venv" "$OUT_DIR/envs-template/sd-services"; do
 done
 echo "3c. jw deep file + venv python symlinks OK (relative bundled hops)"
 
+# 3d. [D3 P3-5] frozen onedir shape: when the frozen rails ship, their
+# exes must exist and the integrity manifest must cover them. The mac
+# freeze produces Mach-O sd-jw / sd-services (NOT .exe); both rails are
+# probed so a half-frozen payload (only jw built) fails LOUD here, on
+# the build machine, instead of falling back to the venv rail silently
+# — the frozen rail being the default spawn path is the whole point.
+FROZEN_MANIFEST="$OUT_DIR/frozen-manifest.json"
+if [ -f "$FROZEN_MANIFEST" ]; then
+  for key in jw services; do
+    if grep -q "\"$key\":" "$FROZEN_MANIFEST"; then
+      case "$key" in
+        jw)      exe="$OUT_DIR/backend/jw/frozen/sd-jw/sd-jw" ;;
+        services) exe="$OUT_DIR/envs-template/frozen/sd-services/sd-services" ;;
+      esac
+      [ -x "$exe" ] || die "3d: frozen rail '$key' in manifest but exe missing: $exe"
+      file "$exe" | grep -q "Mach-O" || die "3d: frozen '$key' exe is not Mach-O: $exe"
+    else
+      echo "3d. frozen rail '$key' absent from manifest (venv rail only) — OK for dual-rail builds"
+    fi
+  done
+  echo "3d. frozen onedir shape OK (manifest-covered rails carry Mach-O exes)"
+else
+  echo "3d. no frozen manifest — venv-only payload (pre-D3 or dual-rail skip); OK"
+fi
+
+# [D3 P3-5] codesign --deep timing note (mac full-chain day, see design D3):
+# the frozen onedirs are NEW bundle content under Contents/Resources —
+# codesign --deep --strict walks them like every other payload tree.
+# Two frozen-specific properties matter for the seal:
+#   1. the onedirs contain NO symlinks (PyInstaller COLLECT copies flat
+#      files), so the W15 "invalid destination for symbolic link" class
+#      cannot fire from them;
+#   2. the frozen exes are READ-ONLY payloads at runtime — PYTHONDONTWRITEBYTECODE
+#      forwarding (W26) is a venv-rail concern only; a frozen exe that
+#      wrote __pycache__ next to its _internal would break the seal, and
+#      the P1-1 acceptance proved none does (bootstrap's frozen-verify
+#      hash check would also catch it post-first-run).
+
 # --- 4. swarm-patches verify (f25 lesson: apply/verify double exit 0) --------
 step "4. swarm-patches verify (payload patch chain)"
 # Direct swarm-patches.py invocation (same as scripts/jiuwenswarm.mjs does):

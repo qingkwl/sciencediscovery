@@ -29,6 +29,7 @@ import { createInterface } from "node:readline";
 import { mergePluginSettings } from "@sciencediscovery/plugin-sdk";
 import { replaceFile } from "./atomic-file.js";
 import { installedPlugins } from "./plugins/catalog.js";
+import { apiLog } from "./logging.js";
 import { PluginControl } from "./plugins/control.js";
 import { canonicalize, type AgentStateRef, VersionStore, RefStore, workspaceHeadName, withWorkspaceMutation, withWorkspaceAdmission, withWorkspaceRetirement, checkpointRetiredWorkspace } from "@sciencediscovery/cas";
 import { dirname, relative, resolve } from "node:path";
@@ -251,7 +252,7 @@ import {
   decryptSecretValue,
   encryptModelApiToken,
   encryptSecretValue,
-  loadOrCreateModelSecretKey,
+  modelSecretKey,
   normalizeApiToken,
   normalizeModelFactOverrides,
   validateLiveModel,
@@ -735,6 +736,11 @@ export class SessionStore {
   private workspaceProvenanceCache?: WorkspaceProvenanceIndex;
   private settingsMutationQueue: Promise<void> = Promise.resolve();
   private secretKey?: Buffer;
+  /** [W34-①] Shared in-flight key resolution (telemetry fires once). */
+  private secretKeyResolution?: Promise<Buffer>;
+  /** [W34-①] `Date.now()` when `load()` began — the anchor for the
+   * model_secret_key_resolved telemetry's bootMs field. */
+  private loadStartedAtMs?: number;
   private skillIds = new Set<string>(BUNDLED_SKILL_IDS);
   private connectorIds = knownConnectorIdSet();
   // A shared JiuwenSwarm catalog cannot enforce a Project/Session Skill selection.
@@ -807,7 +813,52 @@ export class SessionStore {
   }
 
   private async loadOrCreateSecretKey(): Promise<Buffer> {
-    return loadOrCreateModelSecretKey(this.modelSecretKeyPath);
+    // [W31-①] shared process-wide memo: the DPAPI unwrap (a powershell.exe
+    // child on Windows) runs once per data dir per process even when store
+    // and custom-servers both load — CustomMcpServers resolves through the
+    // same `modelSecretKey()` helper in store/secrets.ts.
+    return modelSecretKey(this.modelSecretKeyPath);
+  }
+
+  /**
+   * [W34-①] Resolve the model-secret key on demand instead of during load().
+   *
+   * The DPAPI unwrap spawns a powershell.exe child that costs ~5s inside the
+   * startup CPU-contention window (the 14th package's session_store dark
+   * segment, measured 5371ms on a data dir with one model_secrets row).
+   * W33 already removed the tax for ciphertext-free data dirs; this removes
+   * it for data dirs WITH ciphertext too — the key resolves only when a
+   * caller actually touches a secrets surface (http secret routes call
+   * ensureSecretKey before dispatch; write paths call it before their first
+   * encrypt; the ready+10s background prewarm from W33 keeps the common case
+   * warm). Idempotent: concurrent callers share one in-flight resolution.
+   */
+  async ensureSecretKey(): Promise<void> {
+    if (this.secretKey) return;
+    // [W34-①] Resolution-time telemetry: the 14th package paid this tax
+    // INSIDE session_store during boot (5371ms, every launch for returning
+    // users); W34 moves it to the first secrets-surface touch. The boot-time
+    // mark in startup-diagnostics is what a package acceptance run greps to
+    // prove the tax actually left the startup path — without this line the
+    // session_store component's durationMs is indistinguishable between
+    // "lazy worked" and "lazy silently regressed".
+    // The in-flight promise is shared across concurrent callers (the 15th
+    // package's acceptance run logged one line per waiter); the telemetry
+    // fires inside the memoized promise exactly once, from whichever caller
+    // won the race.
+    if (!this.secretKeyResolution) {
+      const startedAt = Date.now();
+      const bootAnchor = this.loadStartedAtMs ?? startedAt;
+      this.secretKeyResolution = this.loadOrCreateSecretKey().then((key) => {
+        apiLog.info("model_secret_key_resolved", {
+          durationMs: Date.now() - startedAt,
+          trigger: new Error("resolution trigger").stack?.split("\n").slice(2, 5).join(" <- ") ?? "unknown",
+          bootMs: Date.now() - bootAnchor,
+        });
+        return key;
+      });
+    }
+    this.secretKey = await this.secretKeyResolution;
   }
 
   private encryptModelApiToken(modelId: string, apiToken: string): string {
@@ -833,6 +884,12 @@ export class SessionStore {
 
   async load(): Promise<void> {
     if (this.loaded) return;
+    // [W34-①] Boot-time anchor for the model_secret_key_resolved telemetry:
+    // how long after store-load began the key actually resolved. Negative or
+    // small values = resolved during load (regression, the 14th package's
+    // 5371ms in-session_store shape); large values = lazy resolution working
+    // (http route / write path / ready+10s prewarm).
+    this.loadStartedAtMs = Date.now();
     await mkdir(this.dataDir, { recursive: true });
     this.database = new DatabaseSync(this.catalogDatabasePath);
     this.database.exec(`
@@ -935,8 +992,33 @@ export class SessionStore {
     });
     this.transferStore = new WorkspaceTransfers(this.database, new VersionStore(this.dataDir));
     this.shellExecutionStore = new ShellExecutions(this.database, new VersionStore(this.dataDir), this.notificationStore);
-    this.secretKey = await this.loadOrCreateSecretKey();
-    this.migrateRemoteHostTokens();
+    // [W34-①] Fully lazy key resolution. W33-1 kept the DPAPI unwrap for
+    // data dirs WITH ciphertext rows (hasAnySecret gate) — measured 5371ms
+    // inside session_store on the 14th package's real-user first start
+    // (data dir with one model_secrets row), i.e. every returning user paid
+    // the tax on every launch. Now the key resolves ONLY when a caller
+    // actually touches a secrets surface:
+    //   - remote-host token migration below (runs when legacy rows exist);
+    //   - the legacy web-proxy import below (runs when a legacy row exists);
+    //   - http secret routes (http/index.ts dispatcher calls
+    //     store.ensureSecretKey() before the secret-route chain);
+    //   - write paths (they await ensureSecretKey() before first encrypt);
+    //   - the ready+10s background prewarm (W33) keeps the common case warm
+    //     so an interactive read usually finds the key already resolved.
+    // The process-wide memo from [W31-①] still dedupes
+    // the powershell spawn across all these callers.
+    if (this.initialNeo4jPassword) {
+      // Rare opt-in env seed: the neo4j row is written during load (see
+      // seedInitialNeo4jPassword below), so the key must exist up front.
+      // This path never happens for normal users.
+      await this.ensureSecretKey();
+    }
+    // Otherwise the key resolves on first use: remote-host token migration
+    // and the legacy web-proxy import below each probe their own row
+    // counts and resolve on demand; http secret routes and write paths call
+    // ensureSecretKey() before touching ciphertext; the ready+10s prewarm
+    // (W33) keeps the common case warm.
+    await this.migrateRemoteHostTokens();
     const modelIdsWithSecrets = new Set((this.database.prepare("SELECT model_id FROM model_secrets").all() as Array<{ model_id: string }>).map((row) => row.model_id));
     const row = this.database.prepare("SELECT json FROM catalog_state WHERE id = 1").get() as { json: string } | undefined;
     let saved: Partial<Catalog> & { delegationTracks?: Subagent[] } = {};
@@ -1005,6 +1087,10 @@ export class SessionStore {
       const legacyProxyRow = this.database.prepare("SELECT encrypted_url FROM web_proxy_secret WHERE id = 1")
         .get() as { encrypted_url: string } | undefined;
       if (legacyWebProxyMode === "custom" && legacyProxyRow) {
+        // [W34-①] A legacy encrypted proxy row only exists on data dirs from
+        // pre-proxy-registry builds — resolve the key on demand for this
+        // one-time import instead of during every load.
+        await this.ensureSecretKey();
         const importedId = randomUUID();
         const legacyUrl = this.decryptModelApiToken("web:proxy", legacyProxyRow.encrypted_url);
         this.database.prepare(
@@ -2600,6 +2686,13 @@ export class SessionStore {
 
   /** No awaits or network calls inside the SQLite boundary. Domain and audit roll back together. */
   async runConfigurationTransaction<T>(sessionId: string, action: () => T): Promise<T> {
+    // [W34-①] A configuration transaction may write ciphertext
+    // (setModelApiToken / setProviderApiToken run inside the synchronous
+    // action, where an await is forbidden), so the key must be resolved
+    // BEFORE the transaction opens. hasAnySecret-style probing cannot see
+    // the token the request itself is about to store, so resolve
+    // unconditionally — memoized, zero cost after the first call.
+    await this.ensureSecretKey();
     return this.withSettingsMutation(async () => {
       await this.saveQueue;
       const session = this.assertSessionWritable(sessionId);
@@ -3106,6 +3199,7 @@ export class SessionStore {
   }
 
   async updateWebSettings(input: UpdateWebSettingsRequest): Promise<WebSettingsDetails> {
+    await this.ensureSecretKey(); // [W34-①] applyWebSettingsSync may write provider ciphertext
     this.applyWebSettingsSync(input);
     await this.saveCatalog();
     return this.getWebSettings();
@@ -3255,6 +3349,7 @@ export class SessionStore {
   }
 
   async createProxyServer(input: CreateProxyServerRequest): Promise<ProxyServer> {
+    await this.ensureSecretKey(); // [W34-①] createProxyServerSync may write proxy ciphertext
     const server = this.createProxyServerSync(input);
     await this.saveCatalog();
     return this.proxyServerSettingsView(server);
@@ -3293,6 +3388,7 @@ export class SessionStore {
   }
 
   async updateProxyServer(serverId: string, input: UpdateProxyServerRequest): Promise<ProxyServer> {
+    await this.ensureSecretKey(); // [W34-①] updateProxyServerSync may write proxy ciphertext
     const server = this.updateProxyServerSync(serverId, input);
     await this.saveCatalog();
     return this.proxyServerSettingsView(server);
@@ -3399,6 +3495,7 @@ export class SessionStore {
   }
 
   async updateMemoryGraphSettings(input: UpdateMemoryGraphSettingsRequest): Promise<Omit<MemoryGraphSettingsDetails, "memoryGraphStatus">> {
+    await this.ensureSecretKey(); // [W34-①] the neo4j password write below encrypts with the key
     const { neo4jPassword, ...settingsInput } = input;
     // 2B: fields are independent — only the keys present in the payload move.
     // Overlay provided fields on the current settings, then normalize. The
@@ -3510,7 +3607,15 @@ export class SessionStore {
 
   /** Serialize inherited settings before reading or mutating the shared catalog. */
   private withSettingsMutation<T>(mutate: () => Promise<T>): Promise<T> {
-    const result = this.settingsMutationQueue.then(mutate);
+    // [W34-①] Every settings-surface mutation may write ciphertext
+    // (setModelApiToken / setProviderApiToken / provider web keys / proxy
+    // URLs run inside the synchronous mutate body, where an await is
+    // forbidden). Resolve the key BEFORE the mutation enters the queue —
+    // memoized, so this is free after the first call. Direct callers that
+    // already await ensureSecretKey() hit the memo here.
+    const result = this.settingsMutationQueue
+      .then(() => this.ensureSecretKey())
+      .then(mutate);
     // A rejected CAS or validation must not prevent subsequent settings writes.
     this.settingsMutationQueue = result.then(() => undefined, () => undefined);
     return result;
@@ -4091,6 +4196,7 @@ export class SessionStore {
   }
 
   async createModel(input: CreateModelProfileRequest): Promise<ModelProfile> {
+    await this.ensureSecretKey(); // [W34-①] an apiToken in the payload writes ciphertext
     const normalized = validateLiveModel(input);
     const now = new Date().toISOString();
     const profile: ModelProfile = {
@@ -4152,6 +4258,7 @@ export class SessionStore {
   }
 
   async updateModel(modelId: string, input: UpdateModelProfileRequest): Promise<ModelProfile> {
+    await this.ensureSecretKey(); // [W34-①] an apiToken in the payload writes ciphertext
     const profile = this.getModel(modelId);
     if (!profile) throw new Error("Model not found");
     const normalized = validateLiveModel(input);
@@ -4287,6 +4394,7 @@ export class SessionStore {
   }
 
   async createProvider(input: CreateModelProviderRequest): Promise<ModelProvider> {
+    await this.ensureSecretKey(); // [W34-①] an apiToken in the payload writes ciphertext
     const normalized = validateLiveProvider(input);
     const preset = input.presetId === undefined ? undefined : getModelProviderPreset(input.presetId);
     const now = new Date().toISOString();
@@ -4390,6 +4498,7 @@ export class SessionStore {
   }
 
   async updateProvider(providerId: string, input: UpdateModelProviderRequest): Promise<ModelProvider> {
+    await this.ensureSecretKey(); // [W34-①] an apiToken in the payload writes ciphertext via applyProviderCredentialSync
     const provider = this.applyProviderUpdateSync(providerId, input);
     await this.saveCatalog();
     return provider;
@@ -6147,6 +6256,7 @@ export class SessionStore {
    * process itself — it is never accepted from a browser.
    */
   async setRemoteHostPrivateKey(hostId: string, privateKey: string | null): Promise<RemoteHostTarget> {
+    await this.ensureSecretKey(); // [W34-①] setRemoteHostSecret encrypts with the key
     const host = this.catalog.remoteHosts.find((candidate) => candidate.id === hostId);
     if (!host) throw new Error("Remote host not found");
     this.setRemoteHostSecret(hostId, "privateKey", privateKey);
@@ -6193,6 +6303,7 @@ export class SessionStore {
     passphrase?: string | null;
     trustHostKey?: { algorithm: string; fingerprint: string };
   }): Promise<RemoteHostTarget> {
+    await this.ensureSecretKey(); // [W34-①] token/password/privateKey fields below write ciphertext
     if (input.id === "local") throw new Error("Runner ID local is reserved for the built-in Runner");
     const alias = input.alias.trim();
     if (!/^[A-Za-z0-9._-]{1,255}$/.test(alias)) {
@@ -6335,10 +6446,21 @@ export class SessionStore {
    * secrets all live in one table under one rule, rather than leaving a row
    * that would fail to decrypt.
    */
-  private migrateRemoteHostTokens(): void {
-    if (!this.database || !this.secretKey) return;
+  /**
+   * [W34-①] Migrate legacy remote_host_secrets rows into
+   * remote_host_credentials. Now async: it resolves the DPAPI key only when
+   * legacy rows actually exist (previously it silently no-op'd when
+   * secretKey was unresolved — a lazy-resolution regression risk), so a
+   * data dir without legacy rows pays zero key-resolution cost during load.
+   */
+  private async migrateRemoteHostTokens(): Promise<void> {
+    if (!this.database) return;
     const rows = this.database.prepare("SELECT host_id, encrypted_token FROM remote_host_secrets")
       .all() as Array<{ encrypted_token: string; host_id: string }>;
+    if (!rows.length) return;
+    // Legacy rows exist — the key is genuinely needed for this migration.
+    await this.ensureSecretKey();
+    if (!this.secretKey) return;
     for (const row of rows) {
       try {
         const token = decryptSecretValue(this.secretKey, `remote-host:${row.host_id}`, row.encrypted_token);
@@ -6348,7 +6470,7 @@ export class SessionStore {
         // re-enter the token instead of failing every later host read.
       }
     }
-    if (rows.length) this.database.exec("DELETE FROM remote_host_secrets");
+    this.database.exec("DELETE FROM remote_host_secrets");
   }
 
   private setRemoteHostSecret(hostId: string, kind: RemoteHostSecretKind, value: string | null): void {

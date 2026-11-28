@@ -28,6 +28,10 @@ coverage/
 .env.*
 !.env.example
 !.env.docker.example
+# Production build defaults are not secrets: the accounts origin is public and
+# MUST ship with the repo — a missing value silently compiles "same origin"
+# into the bundle (W27: the HUAWEI sign-in loop of 2026-11-27).
+!.env.production
 
 # Temporary files and logs
 .ci-retry/
@@ -103,3 +107,5 @@ data-*/
 
 # one-click packaging stamps/logs (scripts/package-sd-windows.sh)
 /.package-stamps/
+.tmp-freeze-dist/
+.tmp-freeze-work/

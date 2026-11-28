@@ -216,6 +216,8 @@ export const EN: Text = {
     verifying: "Confirming your session…",
     errorTitle: "Sign-in did not complete",
     errorBody: "HUAWEI ID returned an error, or the account service could not verify the code. Try again.",
+    accountServiceMissing:
+      "This build has no account service address, so HUAWEI ID sign-in is unavailable. Ask whoever built the app to set VITE_ACCOUNTS_API and rebuild.",
     localTokenMissing: "Sign-in completed, but this machine's access credential could not be issued. Check that the local service is running and try again, or sign out.",
     retry: "Try again",
     accountTab: "HUAWEI ID",
@@ -453,6 +455,10 @@ export const EN: Text = {
     } as Record<string, string>,
     summaryPass: "No issues found",
     summaryFindings: (count: number) => `${count} ${count === 1 ? "issue" : "issues"}`,
+    /** A warning is not a revision request; its row and badge say Warning. */
+    summaryWarnings: (count: number) => `${count} ${count === 1 ? "warning" : "warnings"}`,
+    summaryFindingsAndWarnings: (critical: number, warnings: number) =>
+      `${critical} ${critical === 1 ? "issue" : "issues"} · ${warnings} ${warnings === 1 ? "warning" : "warnings"}`,
     summaryContradicted: "Contradicted",
     summaryPartlySupported: "Partly supported",
     summaryIncomplete: "Delivery incomplete",
@@ -480,7 +486,7 @@ export const EN: Text = {
       citation: "Citation: checks the citation identifiers can be recognised and are well formed. It does not check whether the cited work supports the claim.",
       computation: "Computation: compares the numbers in the report with the evidence, checking the figures and the statistics agree.",
       completeness: "Completeness: checks every declared deliverable is present and not empty.",
-      semantics: "Semantics: the source service reads the cited text and decides whether the claim is supported. Deep reviews only.",
+      semantics: "Semantics: Deep review reads the cited source text and decides whether the claim is supported. Deep reviews only.",
       other: "General finding: not tied to one check, recorded during the review.",
       gaps: "Not checked: this review did not run this check, and the reason is below. Not checked is not a pass.",
       source: "Source verification: compares one claim with the source text and answers supported, partly supported, contradicted or inconclusive.",
@@ -509,10 +515,13 @@ export const EN: Text = {
       citation_identity: "This review did not check the papers' identity (authors, journal, year).",
       computation: "This review did not check the numbers against the computation evidence.",
     } as Record<string, string>,
+    /** The claim-support gap as a Deep review leaves it. Asking the reader to
+     *  run a Deep review again would contradict the level they just chose. */
+    deepGapBodies: {
+      inconclusive: "Deep review did try to check the claims against their sources but could not reach a verdict (enough source text may have been unavailable, or the excerpt may not clearly support or contradict the claim), so this check still counts as not performed. That does not mean the report is wrong.",
+      noComparison: "Deep review found no claim it could compare with a source, so this check still counts as not performed.",
+    },
     gapBodyUnknown: "This review did not run this check.",
-    /** A source check that could not conclude is not a report defect. */
-    inconclusive: "Source verification reached no conclusion",
-    inconclusiveBody: "The source service returned no verdict; this is not a problem with the report.",
     /** A citation-format-only Quick pass did not look at claim support. */
     citationOnlyNote: "This review checked citation format only; claim support was not checked.",
     /** Why a checkpoint produced nothing, by the server's reason code. */
@@ -553,11 +562,11 @@ export const EN: Text = {
     queued: (count: number) => `${count} queued`,
     /** A bounded passage in a locked source; "locator" and evidence levels
      *  are internal vocabulary, so the card says what was found instead. */
-    locators: (count: number) => `${count} source passage${count === 1 ? "" : "s"}`,
+    locators: (count: number) => `${count} source excerpt${count === 1 ? "" : "s"}`,
     sourceInconclusiveWith: (count: number) => count === 1
-      ? "Found 1 source passage, but it is not enough to support this claim."
-      : `Found ${count} source passages, but they are not enough to support this claim.`,
-    sourceInconclusiveNone: "No source passage was found to support this claim.",
+      ? "Found 1 source excerpt, but it is not enough to decide whether this claim holds."
+      : `Found ${count} source excerpts, but not enough to decide whether this claim holds.`,
+    sourceInconclusiveNone: "No source excerpt was found to judge this claim.",
     failedDetail: "The review reported an error.",
     empty: "This checkpoint produced no review record.",
     noReviews: "No reviews yet.",
@@ -565,10 +574,10 @@ export const EN: Text = {
     levelName: (level: string): string => (level === "quick" ? "Quick" : "Deep"),
     levelPill: (level: string): string => (level === "quick" ? "Quick" : "Deep"),
     /** The pill only names the level; the tip carries what the name claims.
-     *  The two levels differ in whether a source service is consulted. */
+     *  The two levels differ in whether the cited source text is read. */
     levelTip: (level: string): string => (level !== "quick"
-      ? "Deep review: on top of the Quick checks, calls the source service to verify each claim against its source."
-      : "Quick review: deterministic structure, citation-format and delivery checks on this machine; no source service is called."),
+      ? "Deep review: on top of the Quick checks, reads the cited source text and evidence to verify each claim against its source."
+      : "Quick review: deterministic structure, citation-format and delivery checks on this machine; no source text is read."),
   },
 
   /** The bottom-right banner while the JiuwenSwarm cluster is still starting
@@ -1091,6 +1100,8 @@ export const EN: Text = {
       empty: "No skills found.",
       search: "Search skills",
       searchPlaceholder: "Search skills…",
+      /** The × inside the search field that puts the whole list back. */
+      clearSearch: "Clear search",
       noMatches: "No skills match your search.",
 
       heading: "Skills",
@@ -1098,9 +1109,40 @@ export const EN: Text = {
       noProject: "No project is available, so skill choices cannot be read.",
       off: "Off",
       on: "On",
-      scope: "These switches control the global enabled state of skills in ScienceDiscovery. They apply to every task.",
       toggle: (name: string) => `Enable or disable "${name}"`,
       installedCount: (count: number) => `${count} installed`,
+      /** The three tabs above the list. The count is part of the label, as in
+       *  the handoff: every row the tab holds, not only those matching the
+       *  current search. */
+      tabs: {
+        label: "Skill categories",
+        all: (count: number) => `All skills (${count})`,
+        mine: (count: number) => `My skills (${count})`,
+        official: (count: number) => `Official skills (${count})`,
+        basic: "Overview",
+        files: "Files",
+      },
+      /** The way out of a package's own page. */
+      back: "Back",
+      /** 技能详情: the package's files on the left, one of them open on the right. */
+      fileTree: {
+        list: "Files",
+        reading: "Reading the file…",
+        copy: "Copy",
+        download: "Download",
+        copied: "Copied",
+      },
+      /** The tag on a card: a package that ships with the app, or one the user
+       *  brought in. */
+      cardTag: {
+        builtIn: "Built-in",
+        external: "External",
+      },
+      /** A category the user opened that holds no rows at all. */
+      emptyScope: "No skills in this category yet.",
+      /** The list's own subtitle. The directory's entry keeps the shorter line
+       *  it uses as a tooltip; this page says what the page itself does. */
+      listDescription: "Manage and install the skills agents can use",
       /** The native save dialog a Skill export opens. */
       exportDialog: {
         title: "Export Skill",
@@ -1114,11 +1156,8 @@ export const EN: Text = {
       addMenu: {
         label: "Add skill",
         scratch: "Write from scratch",
-        scratchHint: "Start a new skill and write its instructions",
         upload: "Upload skills",
-        uploadHint: "Choose a SKILL.md or a ZIP package",
         git: "Import from GitHub",
-        gitHint: "Inspect a repository and import its packages",
       },
       backToList: "Back to skills",
       createView: {
@@ -1186,16 +1225,56 @@ export const EN: Text = {
         writeInstead: "Write from scratch instead",
       },
       importAction: "Import",
+      /** The close control every 技能 dialog carries. */
+      closeDialog: "Close",
+      /** 技能 › 上传技能, as the handoff's dialog. */
+      uploadDialog: {
+        hint: "A folder or .zip must contain SKILL.md; a lone .md needs the name and description in YAML. One archive holds one skill package — import a whole repository with \"Import from GitHub\".",
+        chooseFile: "Choose file",
+        dropTitle: "Choose a SKILL.md file",
+        dropHint: "Click, or drag a package or file here",
+        reselect: "Choose again",
+        cancel: "Cancel",
+        confirm: "OK",
+        /** What the server refused, written from the facts in its refusal. */
+        refusals: {
+          entries: (actual: number, cap: number) => `The archive has ${actual} entries; the import accepts at most ${cap}.`,
+          files: (actual: number, cap: number) => `The package has ${actual} files; the import accepts at most ${cap}.`,
+          archiveBytes: (actual: string, cap: string) => `The archive is ${actual}; the limit is ${cap}.`,
+          extractedBytes: (actual: string, cap: string) => `The unpacked package is ${actual}; the limit is ${cap}.`,
+          fileBytes: (path: string, cap: string) => `"${path}" is over the ${cap} per-file limit.`,
+          missingRoot: "The archive has no SKILL.md at its root.",
+          severalRoots: "The archive's top level is not one package directory.",
+          outsideRoot: "The archive contains files outside the package root.",
+          onePackage: "One archive imports one skill package. To import a whole repository, use \"Import from GitHub\" and pick the skills you want.",
+        },
+      },
+      /** 技能 › 从 GitHub 导入, as the handoff's dialog. */
+      gitDialog: {
+        subtitle: "Import from a public GitHub repository",
+        advanced: "Advanced options",
+        progress: (done: number, total: number) => `Importing (${done}/${total})`,
+        importing: "Importing",
+        invalidUrl: "That is not a valid URL. Enter it again.",
+      },
       importBusy: "Importing…",
-      backgroundImportRunning: (done: number, total: number) => `Importing in the background ${done} / ${total}…`,
       backgroundImportDone: (count: number) => `Imported ${count} skills.`,
       backgroundImportPartial: (imported: number, failed: number) => `Imported ${imported}; ${failed} failed.`,
+      backgroundImportEnableFailed: (imported: number, failed: number) =>
+        `Imported ${imported}; ${failed} could not be enabled.`,
       backgroundImportFailed: "The background import failed.",
       backgroundImportFailures: (names: string, count: number) =>
         count > 3 ? `Failed: ${names} and ${count - 3} more` : `Failed: ${names}`,
-      backgroundImportDismiss: "Dismiss the import notice",
       importFailed: "The import failed.",
       importSucceeded: (name: string) => `Imported "${name}".`,
+      /** The 技能 page's own notices (design 1-4). */
+      toastUploadDone: (name: string) => `"${name}" uploaded.`,
+      toastUploadNotEnabled: (name: string) => `"${name}" was imported but could not be enabled.`,
+      toastGitDone: "GitHub import done.",
+      toastGitFailed: "GitHub import failed.",
+      toastProgress: (done: number, total: number) => `Importing (${done}/${total})`,
+      toastRetry: "Retry",
+      toastClose: "Dismiss notice",
       git: {
         title: "Import from GitHub",
         description:
@@ -1274,6 +1353,26 @@ export const EN: Text = {
         editingResource: (path: string) => `Editing reference file: ${path}`,
         saveFile: "Save file",
         closeReferenceEditor: "Close reference editor",
+        /** 2-3: the file editor. */
+        exit: "Exit editing",
+        unsaved: "Unsaved",
+        unsavedTitle: "Unsaved changes",
+        unsavedBody: "This file is not saved. Any changes made here will be lost after leaving. Leave anyway?",
+        deleteTitle: "Delete this item?",
+        deleteBody: "This cannot be undone. Delete this item?",
+        newFolder: "New folder",
+        newFile: "New file",
+        newFileIn: (path: string) => `New file in "${path}"`,
+        uploadFile: "Upload",
+        filePathPlaceholder: "File name or path, for example references/new.md",
+        folderPathPlaceholder: "Folder name, for example references",
+        invalidPath: "A name cannot be empty, start with /, or contain . or .. segments.",
+        editPath: (path: string) => `Rename ${path}`,
+        rename: "Rename",
+        deleteAction: "Delete",
+        deletePath: (path: string) => `Delete ${path}`,
+        saveFailed: "The file could not be saved.",
+        uploadNotText: (name: string) => `"${name}" is not a text file, so it cannot be uploaded as a skill file.`, 
         referenceEditingHint: "Change it, then press Save file.",
         referenceNotText: (name: string) => `"${name}" is not UTF-8 text and cannot be imported as a reference file.`,
         addReferenceFailed: "The reference file could not be read.",
@@ -1595,6 +1694,52 @@ export const EN: Text = {
         connectorsEmpty: "No connectors are available on this machine yet.",
       },
       mcp: {
+        allMcp: "All MCP",
+        myMcp: "My MCP",
+        officialMcp: "Official MCP",
+        searchMcp: "Search MCP",
+        enableAll: "Enable all",
+        disableAll: "Disable all",
+        bulkHint: "Bulk actions affect only the custom servers shown. Built-in switches select sources by default.",
+        bulkFailed: (names: string) => `Could not update: ${names}. Retry to update the remaining servers.`,
+        tryIt: "Try it",
+        tryUnavailable: "Enable the service before trying it. Built-in sources must be available.",
+        noMatches: "No matching MCP servers",
+        manualEntry: "Manual entry",
+        importJsonEntry: "Import JSON",
+        jsonSource: "JSON source",
+        importFillHint: "Paste an mcpServers JSON object or upload a file. Review and edit the configuration below, then confirm to add it.",
+        importEmptyHint: "Paste or upload JSON to fill the configuration fields.",
+        chooseConfiguration: "Server configuration",
+        duplicateName: "Server names must be unique.",
+        timeoutInvalid: "Timeout must be an integer between 1 and 600 seconds.",
+        commandRequired: "A command is required for STDIO.",
+        urlInvalid: "Use an HTTP(S) URL without credentials or a fragment.",
+        confirmAdd: (count: number) => count > 1 ? `Add ${count} servers` : "Confirm add",
+        importFilled: (count: number) => `${count} configuration(s) filled. Review and edit before confirming.`,
+        importProgress: (added: number, total: number) => `${added} of ${total} added. Only remaining configurations will be retried.`,
+        addedCount: (count: number) => `${count} MCP servers added`,
+        savedCheckFailed: (reason: string) => `Configuration saved. Connection check: ${reason}`,
+        importFieldInvalid: (name: string, field: string) => `Invalid ${field} in “${name}”. Correct the JSON and try again.`,
+        configured: "Configured servers",
+        details: "Server details",
+        custom: "External",
+        noDescription: "No description",
+        builtinReadOnly: "Built-in sources are managed by the application and are read-only.",
+        checkedAt: "Last checked",
+        neverChecked: "No check recorded",
+        checkHint: "Connection status is the last discovery or test result, not a continuous heartbeat. Service enablement and session default selection are independent.",
+        storedValue: "Stored securely",
+        publisher: "Publisher / version",
+        serviceEnabled: "Enabled",
+        selected: "Selected",
+        notSelected: "Not selected",
+        authorized: "Authorized",
+        authorizing: "Waiting for authorization",
+        deleted: "MCP server deleted",
+        retry: "Retry",
+        more: (name: string) => `More actions for ${name}`,
+        openDetails: (name: string) => `View ${name} details`,
         heading: "MCP servers",
         help: "Use by default selects sources for sessions that inherit global settings; explicit project or session selections take precedence. Specialists may add other sources. Actual tool calls still depend on service readiness and permissions. Enable service in a custom server’s edit form controls its connection separately. Changes do not reconfigure a running task.",
         builtin: "Built-in",
@@ -1647,8 +1792,8 @@ export const EN: Text = {
         deleteTitle: (name: string) => `Delete the server “${name}”?`,
         deleteBody: (name: string) =>
           `Tools that depend on “${name}” stop working. Results already produced are unaffected.`,
-        addServer: "Add server",
-        createTitle: "New server",
+        addServer: "Add MCP server",
+        createTitle: "New MCP server",
         importServers: "Import",
         importPaste: "Paste JSON",
         importFile: "Upload JSON file",
@@ -1678,6 +1823,8 @@ export const EN: Text = {
         clearAuthorization: "Clear authorization",
         nameRequired: "A server name is required.",
         openAuthorization: "Open the authorization page",
+        actions: (name: string) => `Actions for ${name}`,
+        importChoice: "Import JSON",
       },
       web: {
         searchHeading: "Search",
@@ -1827,6 +1974,7 @@ export const EN: Text = {
         totalColumn: "Total", inputColumn: "Input", outputColumn: "Output", model: "Model", byModel: "Usage by model (tokens)",
         unreported: "Not reported", incomplete: "Only reported usage is included. Actual usage may be higher.",
         empty: "No model usage recorded for this period.", updated: "Updated",
+        skeleton: "Loading model usage…",
       },
       migrated: {
         common: {
@@ -1846,6 +1994,7 @@ export const EN: Text = {
           connectionHeading: "Connection and resources",
           overviewHint: "Select a Runner to manage its connection, machine resources and scientific environments.",
           back: "Back to runtime environments",
+          skeleton: "Loading runtime environments…",
           runner: "Runner",
           local: "Built-in Runner",
           scope: "These environments are installed on this machine for tasks to execute code.",
@@ -1947,7 +2096,7 @@ export const EN: Text = {
         gatewayIdle: "Gateway idle timeout",
         gatewayIdleHint: "How long to wait when a connection sends no new data.",
         gatewayTurn: "Turn timeout",
-        gatewayTurnHint: "The longest a single conversational turn may take.",
+        gatewayTurnHint: "The longest a single conversational turn may take. When both are set, the turn limit is at least the idle limit; setting either one to unlimited removes the rule.",
         kernelIdle: "Kernel idle timeout",
         kernelIdleHint: "How long a persistent kernel may sit idle before it is reclaimed.",
         permissionWait: "Approval wait timeout",
@@ -1957,6 +2106,7 @@ export const EN: Text = {
         seconds: "seconds",
         unlimited: "Unlimited",
         saved: "Saved",
+        orderError: "The turn timeout cannot be shorter than the gateway idle timeout. Raise the turn timeout, lower the idle timeout, or set one of them to unlimited.",
       },
       quotas: {
         heading: "Quotas",

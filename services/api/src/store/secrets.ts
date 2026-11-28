@@ -285,6 +285,39 @@ export async function loadOrCreateModelSecretKey(
   return existing.key;
 }
 
+// [W31-①] Process-wide memo for the model-secret master key.
+// On Windows the DPAPI unwrap runs through a spawned powershell.exe child
+// (~0.4s bare, 2-5s under the startup CPU-contention window). The key file
+// is one per data dir and every consumer (SessionStore.load, CustomMcpServers.load)
+// resolves the SAME file, so two independent loads paid the child spawn
+// twice inside the health gate. The memo makes the second and later
+// `modelSecretKey` awaits resolve from memory. The promise is also the
+// prefetch handle: `warmModelSecretKey()` lets the server entry start the
+// unwrap before the platform component chain reaches it, overlapping the
+// powershell child's lifetime with module loading instead of serializing it
+// into the health-gate budget. A rejection is NOT cached — a failed unwrap
+// (key from another account) stays a fail-fast error on the next call, same
+// behavior as the pre-memo code.
+const modelSecretKeyMemo = new Map<string, Promise<Buffer>>();
+
+export function modelSecretKey(path: string, protector: SecretProtector = secretProtector): Promise<Buffer> {
+  let entry = modelSecretKeyMemo.get(path);
+  if (!entry) {
+    entry = loadOrCreateModelSecretKey(path, protector).catch((error: unknown) => {
+      modelSecretKeyMemo.delete(path);
+      throw error;
+    });
+    modelSecretKeyMemo.set(path, entry);
+  }
+  return entry;
+}
+
+/** Kick off the key resolution early (server entry); callers still await
+ * `modelSecretKey()` — this only warms the memo. Safe to call repeatedly. */
+export function warmModelSecretKey(path: string, protector: SecretProtector = secretProtector): void {
+  void modelSecretKey(path, protector).catch(() => undefined);
+}
+
 /**
  * Encrypt one stored credential. `context` names what the value belongs to and
  * is authenticated with it, so a row copied between tables or between ids fails

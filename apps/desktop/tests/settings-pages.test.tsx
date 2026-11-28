@@ -42,6 +42,7 @@ import { ListSelect } from "../src/views/settings/ListSelect.js";
 import { SystemSettingsDialog } from "../src/views/SystemSettingsDialog.js";
 import { RunnerSection } from "../src/views/settings/RemoteHosts.js";
 import { NetworkSettings } from "../src/views/settings/NetworkSettings.js";
+import { ModelUsageSettings } from "../src/views/settings/ModelUsageSettings.js";
 import { RuntimeSettings } from "../src/views/settings/RuntimeSettings.js";
 import { SkillForm } from "../src/views/settings/SkillForm.js";
 import { SkillsSettings } from "../src/views/settings/SkillsSettings.js";
@@ -856,7 +857,7 @@ describe("the skill card", () => {
     ...fields,
   }) as SkillDescriptor;
 
-  it("identifies all three sources before expanding a card", () => {
+  it("separates the three sources into tabs and marks every card", () => {
     const sourceClient = new StubClient().asClient();
     writeSettingsCache(sourceClient, "skills:jiuwenswarm", {
       enabled: [],
@@ -868,14 +869,21 @@ describe("the skill card", () => {
     const markup = renderToStaticMarkup(
       <SkillsSettings client={sourceClient} />,
     );
-    for (const label of ["SD 内置", "JiuwenSwarm 内置", "自建"]) {
-      assert.ok(markup.includes(label), `The collapsed list does not identify ${label}`);
+    // The catalog's built-in and JiuwenSwarm's own built-ins are the two
+    // official packages; the managed one is 我的.
+    for (const label of [
+      TEXT.settings.skills.tabs.all(3),
+      TEXT.settings.skills.tabs.mine(1),
+      TEXT.settings.skills.tabs.official(2),
+    ]) {
+      assert.ok(markup.includes(label), `The list does not count ${label}`);
     }
-    assert.ok(markup.includes(TEXT.settings.skills.scope));
+    assert.ok(markup.includes(TEXT.settings.skills.cardTag.builtIn), "a built-in card carries no 内置 tag");
+    assert.ok(markup.includes(TEXT.settings.skills.cardTag.external), "a managed card carries no 外部 tag");
     assert.ok(!markup.includes("settings-detail-heading"), "Sources must be visible before opening instructions");
   });
 
-  it("reads source badges in the current language after the module was loaded", () => {
+  it("reads card tags in the current language after the module was loaded", () => {
     const previous = getLanguage();
     const sourceClient = new StubClient().asClient();
     writeSettingsCache(sourceClient, "skills:jiuwenswarm", {
@@ -886,8 +894,8 @@ describe("the skill card", () => {
       for (const language of ["en", "zh-CN"] as const) {
         setLanguage(language);
         const markup = renderToStaticMarkup(<SkillsSettings client={sourceClient} />);
-        assert.ok(markup.includes(TEXT.settings.skills.source.builtIn));
-        assert.ok(markup.includes(TEXT.settings.skills.source.managed));
+        assert.ok(markup.includes(TEXT.settings.skills.cardTag.builtIn));
+        assert.ok(markup.includes(TEXT.settings.skills.cardTag.external));
       }
     } finally { setLanguage(previous); }
   });
@@ -932,12 +940,12 @@ describe("the data sources page", () => {
       <McpServers client={client} onConfirm={noConfirm} onToast={noConfirm} />,
     );
 
-  it("reads one card list, not the custom/built-in tabs", () => {
+  it("shows catalog identity while the first read is pending", () => {
     const markup = page();
     assert.ok(markup.includes("settings-section"), "数据源 rendered no section");
     assert.ok(markup.includes(loading), "数据源 did not start a read");
     assert.ok(!markup.includes('role="tablist"'), "the custom/built-in tabs are back");
-    assert.ok(markup.includes(TEXT.settings.system.mcp.help), "the page does not explain default selection");
+    assert.ok(markup.includes(TEXT.settings.system.groups.mcp.description), "the page does not explain default selection");
   });
 
   it("keeps the create form closed until the user opens it", () => {
@@ -972,8 +980,24 @@ describe("each settings page", () => {
     asksForItsData("网络", <NetworkSettings client={client} onConfirm={noConfirm} />);
   });
 
-  it("远程 renders and asks for its data", () => {
-    asksForItsData("运行环境", <RuntimeSettings client={client} onConfirm={noConfirm} />);
+  it("运行环境 renders its Runner skeleton before the catalog answers", () => {
+    const markup = renderToStaticMarkup(<RuntimeSettings client={client} onConfirm={noConfirm} />);
+
+    assert.ok(markup.includes("settings-section"), "运行环境 rendered no section");
+    assert.ok(markup.includes(TEXT.settings.system.migrated.environments.skeleton),
+      "运行环境 did not paint its first-paint skeleton");
+    assert.ok(markup.includes('aria-busy="true"'), "the runtime skeleton is not marked busy");
+    assert.ok(markup.includes("settings-skeleton-block"), "the runtime skeleton has no stand-in rows");
+  });
+
+  it("模型用量 renders its metrics and table skeleton before the summary answers", () => {
+    const markup = renderToStaticMarkup(<ModelUsageSettings client={client} />);
+
+    assert.ok(markup.includes(TEXT.settings.system.usage.skeleton),
+      "模型用量 did not paint its first-paint skeleton");
+    assert.ok(markup.includes('aria-busy="true"'), "the usage skeleton is not marked busy");
+    assert.equal((markup.match(/is-usage-metric-label/g) ?? []).length, 3, "the usage skeleton has no metric cards");
+    assert.equal((markup.match(/settings-skeleton-row/g) ?? []).length, 4, "the usage skeleton has no table rows");
   });
 
   it("专家 renders and asks for its data", () => {

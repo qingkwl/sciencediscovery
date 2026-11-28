@@ -219,6 +219,9 @@ import type {
   TimeoutKind,
   ScientificEnvironmentSetup,
   SkillDeletionImpact,
+  DeleteSkillFileRequest,
+  RenameSkillFileRequest,
+  UpdateSkillMarkdownRequest,
   UpdateSkillRequest,
   UpdateSkillFileRequest,
   UpdateModelProfileRequest,
@@ -257,7 +260,7 @@ import {
 import { SessionStoreHttpError, SessionEvidenceLockedError } from "../store.js";
 import { providerBadgeLabel, type ExecutionBadge, type ExecutionCapability } from "@sciencediscovery/execution-router";
 import { validateLiveProvider } from "../store/providers.js";
-import { normalizeApiToken } from "../store/secrets.js";
+import { modelSecretKey, normalizeApiToken, warmModelSecretKey } from "../store/secrets.js";
 import { remoteWorkspaceKey, syncRemoteWorkspace } from "../remote-runner.js";
 import { normalizeRemoteHostEndpoint } from "../store/remote-hosts.js";
 import {
@@ -426,6 +429,34 @@ function closeHttpServer(server: Server): Promise<void> {
       else resolveClose();
     });
   });
+}
+
+/**
+ * [W34-①] Routes whose handlers read or write encrypted credentials
+ * (model tokens, provider keys, proxy URLs, memory-graph password, remote
+ * host credentials, runtime subagent keys). The dispatcher resolves the
+ * DPAPI model-secret key before these routes run, so the synchronous
+ * decrypt/encrypt helpers never see an unresolved key. Conservative on
+ * purpose: a route that only *lists* hosts or models is included when its
+ * handler touches `getModelApiToken`/`remoteHostSecret`-style reads — an
+ * extra route here costs nothing (the key resolution is memoized), a
+ * missing one costs a 500.
+ */
+const SECRET_SURFACE_PATH_PREFIXES = [
+  "/api/models",
+  "/api/providers",
+  "/api/settings",
+  "/api/proxy",
+  "/api/web",
+  "/api/memory",
+  "/api/remote-hosts",
+  "/api/runners",
+] as const;
+const SECRET_SURFACE_SUBSTRING = "/runtime-input"; // configureCodex / configureRuntime POSTs match /api/sessions/:id/runtime-input/:kind
+
+function secretSurfaceRoute(pathname: string): boolean {
+  if (pathname.includes(SECRET_SURFACE_SUBSTRING)) return true;
+  return SECRET_SURFACE_PATH_PREFIXES.some((prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`));
 }
 
 export function closeApiServer(server: Server): Promise<void> {
@@ -1133,21 +1164,34 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
   // The catalog is installed before the store loads: saved thinking values are
   // narrowed against it while model profiles are read, so a later install
   // would constrain them against an empty catalog.
-  const ready = modelCatalog.load()
-    .then(() => skillLibraryCatalog.load())
-    .then(() => store.setConfigurationSkillLibrarySource(() => skillLibraryCatalog.list()))
-    .then(() => skillLibraryCatalog.seedBuiltInSkillLibrary(repositoryRoot))
-    .then(() => initializePlatformServices(platform, config, skillLibraryCatalog))
-    .then(() => conversationalConfiguration().service.recoverPendingVerifications())
-    .then(() => store.plugins.bindAssets(async (settings) => {
+  // [W33-0] Per-step timing on the ready chain: the 13th package's install
+  // logs showed a ~5.09s dark segment between `service_started` and the first
+  // `framework_component_*` line (12th package: 326ms for the same span),
+  // with zero log lines inside — the steps below were the only candidates.
+  // Each step now logs its own durationMs so the next boot pinpoints the
+  // slow one. Purely observational: same order, same semantics, same errors.
+  const readyStep = <T>(name: string, run: () => Promise<T>): Promise<T> => {
+    const startedAt = Date.now();
+    return run().then(
+      (value) => { apiLog.info("ready_step", { step: name, durationMs: Date.now() - startedAt }); return value; },
+      (error) => { apiLog.info("ready_step", { step: name, durationMs: Date.now() - startedAt, failed: true }); throw error; },
+    );
+  };
+  const ready = readyStep("model_catalog_load", () => modelCatalog.load())
+    .then(() => readyStep("skill_library_load", () => skillLibraryCatalog.load()))
+    .then(() => readyStep("set_configuration_skill_source", async () => { store.setConfigurationSkillLibrarySource(() => skillLibraryCatalog.list()); }))
+    .then(() => readyStep("seed_built_in_skill_library", () => skillLibraryCatalog.seedBuiltInSkillLibrary(repositoryRoot)))
+    .then(() => readyStep("initialize_platform_services", () => initializePlatformServices(platform, config, skillLibraryCatalog)))
+    .then(() => readyStep("recover_pending_verifications", () => conversationalConfiguration().service.recoverPendingVerifications()))
+    .then(() => readyStep("bind_assets", async () => { store.plugins.bindAssets(async (settings) => {
       const refs = await skillLibraryCatalog.resolveEnabledRefs(settings.enabledSkillLibraries);
       const skills = skillCatalog.resolve(settings.enabledSkillIds ?? []).map(({id,hash,revision,version}) => ({id,hash,revision:revision ?? null,version}));
       return {settings:{...settings,enabledSkillLibraries:settings.enabledSkillLibraries?.map((mount) => ({
         ...mount,versionId:refs.find((ref) => ref.libraryId===mount.libraryId && (!mount.versionId || mount.versionId==="head" || ref.versionId===mount.versionId))!.versionId,
       }))},assets:{skills,libraries:refs}};
-    }))
-    .then(() => recoverContinuations())
-    .then(() => reviewerAuditCoordinator.resume())
+    }); }))
+    .then(() => readyStep("recover_continuations", () => recoverContinuations()))
+    .then(() => readyStep("reviewer_audit_resume", () => reviewerAuditCoordinator.resume()))
     .then(() => undefined);
 
   // With the JiuwenSwarm backend its web search is configured from the web settings: pushed once the store has
@@ -1165,12 +1209,34 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
   // short-lived test server is — would otherwise leave this loop running against a server that no longer
   // exists, one more concurrent caller hammering the shared adapter for no reason. Tied to the server's
   // own close event below, not a bare setTimeout chain.
+  // [rc3 field fix] The flat 5x3s window races the stack's own startup: the
+  // adapter answers as soon as IT is up, but JiuwenSwarm's gateway (whose
+  // config.set the adapter forwards to) lands ~13s+ later on a cold start,
+  // so the whole retry budget expired on HTTP 502 before the target endpoint
+  // existed - the install log showed exactly five sync failures inside the
+  // startup window, then silence. Widen to a two-phase ladder: fast attempts
+  // first (adapter still warming), then slow ones spanning the gateway's
+  // cold-start tail. Still bounded and abortable so a test server that
+  // closes early kills the chain.
+  const WEB_SYNC_RETRY_DELAYS_MS = [3_000, 3_000, 5_000, 10_000, 20_000];
   const jiuwenSwarmWebSyncAbort = new AbortController();
+  // [W33-1] The model-secret key is now resolved lazily ([W33-1] in
+  // store.ts / custom-servers.ts: fresh installs skip the DPAPI unwrap —
+  // a powershell.exe child measured ~5s inside the startup contention
+  // window — until ciphertext exists). Warm it in the background once the
+  // boot settles, so the first interactive credential write finds it ready
+  // instead of paying the spawn on a request. Best-effort: a failure here
+  // surfaces only when real usage hits the same memoized promise, and
+  // short-lived test servers simply never reach the 10s delay.
+  void ready.then(async () => {
+    await delay(10_000, undefined, undefined).catch(() => undefined);
+    await modelSecretKey(resolve(config.dataDir, "model-secrets.key")).catch(() => undefined);
+  }).catch(() => undefined);
   if (jiuwenSwarm) {
     void ready.then(async () => {
-      for (let attempt = 0; attempt < 5 && !jiuwenSwarmWebSyncAbort.signal.aborted; attempt += 1) {
+      for (let attempt = 0; attempt < WEB_SYNC_RETRY_DELAYS_MS.length && !jiuwenSwarmWebSyncAbort.signal.aborted; attempt += 1) {
         if ((await syncJiuwenSwarmWeb()).ok) return;
-        await delay(3_000, undefined, { signal: jiuwenSwarmWebSyncAbort.signal }).catch(() => undefined);
+        await delay(WEB_SYNC_RETRY_DELAYS_MS[attempt]!, undefined, { signal: jiuwenSwarmWebSyncAbort.signal }).catch(() => undefined);
       }
     }).catch(() => undefined);
   }
@@ -1328,6 +1394,21 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
     const requestPath = (request.url ?? "/").split("?", 1)[0] || "/";
     try {
       const url = new URL(request.url ?? "/", "http://localhost");
+      // [W34-①] Secret-surface routes resolve the DPAPI model-secret key
+      // BEFORE dispatch. The 14th package measured 5371ms when the key
+      // resolved inside session_store during boot (data dir with one
+      // model_secrets row); now the boot path never resolves it, so these
+      // routes pay the one-time memoized cost at first interactive use
+      // instead — and the ready+10s background prewarm usually wins the
+      // race, making even this a no-op. Reads need the key for decryption
+      // (getModelApiToken and friends throw when it is unresolved); writes
+      // call ensureSecretKey themselves, but the dispatcher-side guard
+      // covers synchronous writer entry points (configureCodex et al.).
+      if (secretSurfaceRoute(url.pathname)) {
+        await store.ensureSecretKey().catch((error) => {
+          apiLog.warn("secret_key_resolution_failed", { requestId, error: String(error) });
+        });
+      }
       // The desktop shell has already authenticated the person through HUAWEI
       // ID. Its local control plane still needs the internal bearer token, but
       // asking a person to copy that token is a setup step, not a security
@@ -1867,8 +1948,12 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
         return;
       }
       if (request.method === "POST" && url.pathname === "/api/mcp/sources/reload") {
+        // [W31-④] reloadIfChanged: the shell's first-chat warmup fires this
+        // right after boot, and an unconditional reload reset the connections
+        // the boot refresh had just established (three stdio child processes
+        // re-spawned for nothing). Real configuration changes still rebuild.
         sendJson(response, 200, {
-          catalog: await mcpCatalog.reload(),
+          catalog: await mcpCatalog.reloadIfChanged(),
           sources: mcpCatalog.listStatuses(),
         });
         return;
@@ -2942,12 +3027,43 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
         return;
       }
 
+      const skillFileRenameMatch = url.pathname.match(/^\/api\/skills\/([^/]+)\/files\/(.+)\/rename$/);
+      if (skillFileRenameMatch && request.method === "POST") {
+        sendJson(response, 200, await skillCatalog.renameFile(
+          decodeURIComponent(skillFileRenameMatch[1]!),
+          decodeURIComponent(skillFileRenameMatch[2]!),
+          await readJson<RenameSkillFileRequest>(request),
+        ));
+        return;
+      }
+
       const skillFileMatch = url.pathname.match(/^\/api\/skills\/([^/]+)\/files\/(.+)$/);
       if (skillFileMatch && request.method === "PUT") {
         sendJson(response, 200, await skillCatalog.updateFile(
           decodeURIComponent(skillFileMatch[1]!),
           decodeURIComponent(skillFileMatch[2]!),
           await readJson<UpdateSkillFileRequest>(request),
+        ));
+        return;
+      }
+      if (skillFileMatch && request.method === "DELETE") {
+        sendJson(response, 200, await skillCatalog.deleteFile(
+          decodeURIComponent(skillFileMatch[1]!),
+          decodeURIComponent(skillFileMatch[2]!),
+          await readJson<DeleteSkillFileRequest>(request),
+        ));
+        return;
+      }
+
+      const skillMarkdownMatch = url.pathname.match(/^\/api\/skills\/([^/]+)\/skill-md$/);
+      if (skillMarkdownMatch && request.method === "GET") {
+        sendJson(response, 200, skillCatalog.readSkillMarkdown(decodeURIComponent(skillMarkdownMatch[1]!)));
+        return;
+      }
+      if (skillMarkdownMatch && request.method === "PUT") {
+        sendJson(response, 200, await skillCatalog.updateSkillMarkdown(
+          decodeURIComponent(skillMarkdownMatch[1]!),
+          await readJson<UpdateSkillMarkdownRequest>(request),
         ));
         return;
       }
@@ -5082,6 +5198,19 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
           message,
         );
       }
+      // A refused Skill import answers with the facts behind the sentence, so
+      // a localized surface can say what was over the cap, by how much, and
+      // what to do next instead of echoing the validator's English. The prose
+      // stays in `error` for callers that show the server's own text.
+      else if ((error as { skillRefusal?: unknown }).skillRefusal !== undefined) {
+        sendError(
+          response,
+          code === "PAYLOAD_TOO_LARGE" ? 413 : 400,
+          message,
+          "SKILL_PACKAGE_REFUSED",
+          { refusal: (error as { skillRefusal: unknown }).skillRefusal },
+        );
+      }
       else if (code === "EVOLVE_UNAVAILABLE") sendError(response, 503, message);
       else if (code === "ENOENT") sendError(response, 404, "File not found");
       else if (code === "PAYLOAD_TOO_LARGE" || code === "QUOTA_EXCEEDED") {
@@ -5294,6 +5423,15 @@ export async function startApiServer(config = loadServerConfig()): Promise<Serve
   // SIGTERM handling or the memory watch (#1105 F1).
   const budget = heapBudget();
   const trajectoryEvents = trajectoryMaxEvents();
+  // [W33-1] The early warmModelSecretKey() prefetch from [W31-①] is GONE:
+  // measurements on the 13th package showed the powershell.exe DPAPI spawn
+  // costs ~5s inside the startup CPU-contention window no matter where it
+  // is issued (as a prefetch it parked the cost on ready-chain fs calls —
+  // skill_library_load's mkdir queued 5012ms behind it; without it, the
+  // same 5s fell on the first memo consumer). The key is now lazy
+  // ([W33-1] in store.ts / custom-servers.ts: fresh installs skip it until
+  // ciphertext exists) and warms in the background after the boot settles
+  // (the ready.then hook above), outside the contention window entirely.
   const server = createApiServer(config);
   await new Promise<void>((resolveListen, reject) => {
     server.once("error", reject);

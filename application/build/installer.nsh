@@ -214,6 +214,51 @@
       DetailPrint "ghost uninstall registry key removed (uninstaller missing: $R1)"
     ${EndIf}
   ${EndIf}
+
+  ; -------------------------------------------------------------------------
+  ; [W34-③] Stage the Defender prewarm sentinel PS1 to $PLUGINSDIR and start
+  ; it detached — here, in .onInit, BEFORE extraction begins.
+  ;
+  ; The 14th package's real-user first start measured 27s between
+  ; Start-Process and the Electron main process's creation: Defender's
+  ; synchronous image scan of the freshly-installed 195MB ScienceDiscovery.exe
+  ; inside CreateProcess — app code never ran during it, so no in-app splash
+  ; can cover it. The sentinel watches the install directory via %TEMP%
+  ; markers (.onVerifyInstDir writes dir.txt the moment the directory page
+  ; has a usable $INSTDIR); the moment the main exe is fully written it fires
+  ; the exe in ELECTRON_RUN_AS_NODE mode with stdin from NUL, paying the scan
+  ; inside the remaining extraction window (the exe is written early in the
+  ; solid archive's unpack order). customInstall's tail keeps its own
+  ; background probes as the fail-open fallback when the sentinel could not
+  ; run (no PowerShell, marker lost, machine too slow).
+  ;
+  ; WHY STAGING USES A `File` INSTRUCTION: the PS1 is a build input, not an
+  ; extraction product. $INSTDIR\resources\ does not exist yet at .onInit
+  ; (extraction creates it), so the first version of this block pointed the
+  ; sentinel at $INSTDIR\resources\install_prewarm_sentinel.ps1 — a file that
+  ; did not exist at launch time, making the sentinel fail silently on every
+  ; install. $PLUGINSDIR is created by .onInit's own InitPluginsDir
+  ; (installer.nsi:84) and survives until the installer exits; staging to it
+  ; from ${BUILD_RESOURCES_DIR} is the addLicenseFiles pattern
+  ; (installer.nsi:83-86 does exactly this dance for license files).
+  ; The File path is RELATIVE to the build resources dir that NsisTarget.js
+  ; passes as -DBUILD_RESOURCES_DIR (out/targets/nsis/NsisTarget.js:170).
+  InitPluginsDir
+  SetOutPath "$PLUGINSDIR"
+  File "${BUILD_RESOURCES_DIR}\extra\install_prewarm_sentinel.ps1"
+  SetOutPath "$INSTDIR"
+  ;
+  ; Detached via cmd `start /b` — Exec would make the installer WAIT on the
+  ; sentinel (it sleeps in a poll loop for up to 180s), which is exactly the
+  ; serial "installer babysits the probe" antipattern W34 removes. The
+  ; sentinel itself exits immediately after firing the one probe; a hung or
+  ; missing sentinel costs nothing (customInstall's probes still cover it).
+  ; Starting here rather than in customPageAfterChangeDir covers silent
+  ; installs too (no directory page shown), and the sentinel's own 60s
+  ; marker wait absorbs the wizard's page-navigation delay; .onVerifyInstDir
+  ; fires even on the initial default directory.
+  nsExec::ExecToLog 'cmd /c start /b "" powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "$PLUGINSDIR\install_prewarm_sentinel.ps1"'
+  Pop $R0
 !macroend
 
 ; -----------------------------------------------------------------------------
@@ -287,6 +332,17 @@
 ;    why it moved this logic to a page at all), so Quit is used: it is the only
 ;    outcome whose semantics cannot be misread. Users who decline re-run the
 ;    installer and pick a shorter directory; the MessageBox text says so.
+;
+;    [D3 P3-2] Derivation: 259 (MAX_PATH usable) - 1 - maxRel = this value;
+;    maxRel comes from assemble-backend's A5 walk, printed EVERY build.
+;    Dual-rail era (2026-11-23): the venv trees still own maxRel=192 → 66
+;    stays. After P3-3 retires the venv rails the payload max becomes the
+;    FROZEN face (A5 frozen-faces line: jw=185 / services=148, win32 first
+;    measurement) → the value moves to 259-1-185 = 73 IF the jw onedir
+;    stays at backend\jw\frozen\sd-jw\ (or ~82 after the backend\f\sd-jw\
+;    squeeze noted in assemble-backend). Update BOTH sides in the same
+;    commit; a stale value here fails in the UNSAFE direction (letting
+;    roots the payload cannot fit pass the guard).
 !define SD_INSTALL_ROOT_MAX 66
 
 !macro customPageAfterChangeDir
@@ -429,6 +485,43 @@
   FunctionEnd
 !macroend
 
+; [W34-③] Directory confirmation for the sentinel — a NATIVE NSIS callback,
+; not a macro: electron-builder 26.15.3 has NO !macro onVerifyInstDir
+; expansion point (templates/nsis/ greps clean; only .onInit / .onVerifyInstDir
+; / customInstall / customPageAfterChangeDir / customHeader etc. exist), so a
+; `!macro onVerifyInstDir` here is dead code that never runs — the first
+; version of this block shipped exactly that and dir.txt was never written.
+; NSIS itself defines the .onVerifyInstDir callback: it fires on every
+; directory-page change (including the initial default), which is early
+; enough — the sentinel's 60s marker wait overlaps the user's page
+; navigation.
+;
+; The marker carries the BARE $INSTDIR, deliberately WITHOUT replicating
+; assistedInstaller's \${APP_FILENAME} append: the append decision
+; (StrContains at instFilesPre) runs LATER than this callback, so a faithful
+; replication HERE cannot know the answer any earlier — it would only
+; duplicate the guess the sentinel would have to make anyway. The sentinel
+; (install_prewarm_sentinel.ps1) resolves the final directory itself by
+; probing BOTH candidates (bare $INSTDIR and $INSTDIR\ScienceDiscovery.exe)
+; and watching whichever exe appears — the file itself is the ground truth.
+;
+; Top-level runtime instructions ARE legal inside a callback Function (unlike
+; macro bodies outside Functions, which expand at the page-declaration top
+; level — the compile error that shipped this block's first version proved
+; that too). $9 is free here: .onInit's diagnostic-log writer and this
+; callback run on the SAME thread (NSIS is single-threaded), never live at
+; the same time, and every reader between them assigns before use.
+Function .onVerifyInstDir
+  CreateDirectory "$TEMP\sd-sentinel"
+  ClearErrors
+  FileOpen $9 "$TEMP\sd-sentinel\dir.txt" w
+  ${IfNot} ${Errors}
+    FileWrite $9 "$INSTDIR"
+    FileClose $9
+  ${EndIf}
+  ClearErrors
+FunctionEnd
+
 !macro customInstall
 
   ; End marker — a log with "start" but no "end" means the install
@@ -442,6 +535,77 @@
   ${IfNot} ${Errors}
     ${GetTime} "" "L" $1 $2 $3 $4 $5 $6 $7
     FileWrite $9 "[$3-$2-$1 $5:$6:$7] install section end: extraction+tail done$\r$\n"
+
+    ; -----------------------------------------------------------------------
+    ; [W30] Install-time AV warm-up for the two frozen exes.
+    ;
+    ; Same-machine A/B logs (2026-11-27): the frozen rail's cold start pays
+    ; a one-time Defender image scan INSIDE CreateProcess, synchronously on
+    ; the stack thread — sd-services.exe +5.24s (memory-graph→evolve spawn
+    ; gap, one bare spawn() between two adjacent perf marks) and sd-jw.exe
+    ; +9.24s (first status run: ~7s image scan + ~2s cold import). The venv
+    ; rail pays the same class of tax in CHILD threads (its python.exe is
+    ; 0.1MB, CreateProcess returns instantly), which is why venv never shows
+    ; these gaps. Proof it is a first-touch cost: the SECOND spawn of the
+    ; same exe is 12ms (image cached by Defender).
+    ;
+    ; Fix: pay it HERE, at the tail of the install section, while the
+    ; progress page still says "installing". The probe is a bare
+    ; `<exe>` with no arguments: sd_exec_entry.py loads its full static
+    ; import surface at module top (PyInstaller Analysis requires it),
+    ; then dies with usage exit code 2 — so ONE probe warms three
+    ; layers: the image scan, the import chain's file reads, and the
+    ; OS file cache. Expected cold-start effect: spawn gap 5.24s→~50ms,
+    ; status gap 9.24s→~1.3s; install grows by the same ~15s ONCE.
+    ;
+    ; Best-effort discipline: a missing exe skips the probe entirely
+    ; (venv-rail payloads and partial installs no-op), the timeout
+    ; caps locked-down machines where AV scans take minutes (kill +
+    ; continue — a failed warm-up is NOT a failed install), and the
+    ; exit code is LOGGED, never judged: usage probes legitimately
+    ; exit 2, and quarantines/AV blocks surface at first start exactly
+    ; as they did before W30. nsExec::ExecToLog eats the probe's
+    ; stderr (usage line) into the collapsed details log.
+    ;
+    ; Registers: $9 is the log handle (open since the FileOpen above,
+    ; closed once at the macro tail — one handle per file, no
+    ; interleaving). ${GetTime} clobbers $1-$7; nsExec's exit code
+    ; goes to $R0. Both are this file's established scratch registers.
+    ${If} ${FileExists} "$INSTDIR\resources\envs-template\frozen\sd-services\sd-services\sd-services.exe"
+    ${AndIf} ${FileExists} "$INSTDIR\resources\backend\jw\frozen\sd-jw\sd-jw\sd-jw.exe"
+    ; --- [W34-②] probes run DETACHED; the installer never babysits them ----
+    ; The 14th package's real-user install showed the tail as a 12s
+    ; "frozen" window: two serial nsExec waits with zero UI feedback
+    ; (progress bar full, no text) — the classic dead-app impression.
+    ; cmd `start /b` detaches each probe; the exit code is logged by the
+    ; probe wrapper itself (echo to the log via cmd redirection is NOT
+    ; possible for an already-open NSIS handle, so the wrapper echoes to a
+    ; side file the next install reads — best-effort diagnostics, the
+    ; on-the-same-handle lines below record launches instead of exits).
+    ; Fail-open: a probe that never ran surfaces at first start exactly as
+    ; before W30. The main-exe probe is skipped when the [W34-③] sentinel
+    ; already fired it during extraction (dir marker + fired marker under
+    ; %TEMP%\sd-sentinel) — avoiding a second 27s scan of the same image.
+      ${GetTime} "" "L" $1 $2 $3 $4 $5 $6 $7
+      FileWrite $9 "[$3-$2-$1 $5:$6:$7] warmup sd-services: bg-start$\r$\n"
+      nsExec::ExecToLog 'cmd /c start /b "" "$INSTDIR\resources\envs-template\frozen\sd-services\sd-services\sd-services.exe"'
+      Pop $R0
+      ; --- probe 2: sd-jw.exe (jiuwenswarm dispatcher, the 90.8MB one) ---
+      FileWrite $9 "[$3-$2-$1 $5:$6:$7] warmup sd-jw: bg-start$\r$\n"
+      nsExec::ExecToLog 'cmd /c start /b "" "$INSTDIR\resources\backend\jw\frozen\sd-jw\sd-jw\sd-jw.exe"'
+      Pop $R0
+      ; --- probe 3: main exe in Node mode (scan warm) unless the sentinel
+      ; already fired it during extraction (check the fired marker). ---
+      IfFileExists "$TEMP\sd-sentinel\fired.txt" 0 w34_main_exe_probe
+        FileWrite $9 "[$3-$2-$1 $5:$6:$7] warmup main-exe: skipped (sentinel fired during extraction)$\r$\n"
+        Goto w34_main_exe_done
+      w34_main_exe_probe:
+        FileWrite $9 "[$3-$2-$1 $5:$6:$7] warmup main-exe: bg-start$\r$\n"
+        nsExec::ExecToLog 'cmd /c start /b "" cmd /c "set ELECTRON_RUN_AS_NODE=1&& "$INSTDIR\ScienceDiscovery.exe" < nul"'
+        Pop $R0
+      w34_main_exe_done:
+    ${EndIf}
+
     FileClose $9
   ${EndIf}
 !macroend
@@ -556,9 +720,64 @@
     ${If} ${FileExists} "$APPDATA\sd-shell"
       !insertmacro DeleteFastThenHelper "$APPDATA\sd-shell"
     ${EndIf}
-    RMDir /r "$R5"
-    ${If} ${FileExists} "$R5"
-      !insertmacro DeleteFastThenHelper "$R5"
+    ; [W28] Ownership guard for the mirrored data dir. data-dir.txt is a
+    ; plain-text mirror the shell writes next to its wizard state; a stale
+    ; or hand-edited file once named a directory that was NOT this
+    ; product's data (2026-11-27: an unrelated directory was deleted while
+    ; the user's real data lived elsewhere, because a test install had
+    ; repointed the mirror). The uninstaller must not act on a path it
+    ; cannot recognize as its own: the target has to be a real
+    ; subdirectory (not a drive root, not a Windows system directory,
+    ; not the install dir) AND carry at least one marker this product's
+    ; backend creates (envs/, secrets/, jiuwenswarm/, catalog.sqlite,
+    ; model-secrets.key). Anything else is skipped, with the reason in
+    ; %TEMP%\sd-data-delete.log — a missed deletion is recoverable by
+    ; hand; a wrong deletion is not. $R6 verdict / $R7 scratch / $R8
+    ; unused here (GetTime below writes $1-$7; $R5 carries the dir).
+    ${IfNot} ${FileExists} "$R5"
+      DetailPrint "user-data delete: $R5 does not exist — nothing to remove"
+    ${Else}
+      StrCpy $R6 "ok"
+      StrLen $R7 $R5
+      ${If} $R7 <= 3
+        StrCpy $R6 "refused"
+      ${EndIf}
+      ${If} $R5 == $WINDIR
+      ${OrIf} $R5 == $PROGRAMFILES
+      ${OrIf} $R5 == $PROGRAMFILES32
+      ${OrIf} $R5 == $PROGRAMFILES64
+      ${OrIf} $R5 == $PROFILE
+      ${OrIf} $R5 == $APPDATA
+      ${OrIf} $R5 == $LOCALAPPDATA
+      ${OrIf} $R5 == $TEMP
+      ${OrIf} $R5 == $DESKTOP
+      ${OrIf} $R5 == $INSTDIR
+        StrCpy $R6 "refused"
+      ${EndIf}
+      ${If} ${FileExists} "$R5\envs"
+      ${OrIf} ${FileExists} "$R5\secrets"
+      ${OrIf} ${FileExists} "$R5\jiuwenswarm"
+      ${OrIf} ${FileExists} "$R5\catalog.sqlite"
+      ${OrIf} ${FileExists} "$R5\model-secrets.key"
+        ; recognized data dir
+      ${Else}
+        StrCpy $R6 "refused"
+      ${EndIf}
+      ${If} $R6 == "ok"
+        RMDir /r "$R5"
+        ${If} ${FileExists} "$R5"
+          !insertmacro DeleteFastThenHelper "$R5"
+        ${EndIf}
+      ${Else}
+        ClearErrors
+        FileOpen $9 "$TEMP\sd-data-delete.log" a
+        ${IfNot} ${Errors}
+          ${GetTime} "" "L" $1 $2 $3 $4 $5 $6 $7
+          FileWrite $9 "[$3-$2-$1 $5:$6:$7] user-data delete SKIPPED: $R5 failed the ownership guard (not a recognized ScienceDiscovery data dir)$\r$\n"
+          FileClose $9
+        ${EndIf}
+        DetailPrint "user-data delete: $R5 failed the ownership guard — kept (see %TEMP%\sd-data-delete.log)"
+      ${EndIf}
     ${EndIf}
     RMDir /r "$PROFILE\.jiuwenswarm-instances"
     ${If} ${FileExists} "$PROFILE\.jiuwenswarm-instances"

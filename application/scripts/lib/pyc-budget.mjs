@@ -1,5 +1,13 @@
 // pyc-budget: prove the payload's precompiled bytecode is INSIDE the payload.
 //
+// [D3 P3-4 RETIREMENT MARKER — venv-rail gate, partial]
+// payloadCompileEnv/unpackedBytecodeVerdict stay while ANY venv rail
+// ships (dual-rail window). The whole-tree pyc RATIO gate retires with
+// the venv staging (assemble 7c + A6's pyc face); its successor, the
+// frozen integrity manifest (frozen-manifest.mjs + assemble 5.5c +
+// frozen-verify.ts), is already live for the frozen faces. Do not
+// extend the pyc face; new coverage goes to the frozen manifest.
+//
 // Field history (problems W25, release6, 2026-11-05): the local build script
 // exported PYTHONPYCACHEPREFIX=$TMPB/pycache, and assemble-backend.mjs builds
 // its compile environment as {...process.env}, so compileall inherited the

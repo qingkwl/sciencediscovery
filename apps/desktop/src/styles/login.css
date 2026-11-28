@@ -58,7 +58,7 @@
 
 .login-content {
   width: 100%;
-  max-width: 544px;
+  max-width: 600px;
   padding-top: clamp(72px, 12.2vh, 132px);
   padding-bottom: 64px;
 }
@@ -108,7 +108,7 @@
 }
 
 .login-entry-primary {
-  flex: 1 1 220px;
+  flex: 0 0 auto;
   min-width: 0;
 }
 
@@ -120,9 +120,9 @@
   gap: 8px;
   height: 40px;
   min-height: 40px;
-  padding: 0 20px;
+  padding: 0 14px;
   border: 1px solid var(--login-line);
-  border-radius: 6px;
+  border-radius: 999px;
   background: #fff;
   color: var(--login-ink);
   font: inherit;
@@ -231,7 +231,7 @@
   min-height: 40px;
   padding: 0 24px;
   border: 1px solid var(--login-line);
-  border-radius: 6px;
+  border-radius: 999px;
   background: #fff;
   color: var(--login-ink);
   font: inherit;
@@ -264,7 +264,7 @@
   min-height: 40px;
   padding: 0 24px;
   border: 1px solid transparent;
-  border-radius: 6px;
+  border-radius: 999px;
   background: var(--login-ink);
   color: #fff;
   font: inherit;
@@ -290,7 +290,7 @@
   min-height: 40px;
   padding: 0 24px;
   border: 1px solid transparent;
-  border-radius: 6px;
+  border-radius: 999px;
   background: var(--login-ink);
   color: #fff;
   font: inherit;
@@ -303,7 +303,19 @@
 }
 
 .login-huawei-button:hover { background: #000; }
+/* An empty account-service base disables the entry rather than bouncing back
+   to the workspace; the notice beside it explains why. */
+.login-huawei-button:disabled { cursor: default; opacity: .45; }
+.login-huawei-button:disabled:hover { background: var(--login-ink); }
 .login-huawei-button:focus-visible { outline: 2px solid var(--login-ink); outline-offset: 2px; }
+
+.login-notice {
+  max-width: 600px;
+  margin: 16px 0 0;
+  color: var(--login-muted);
+  font-size: 13px;
+  line-height: 20px;
+}
 
 .login-huawei-mark {
   display: grid;

@@ -35,7 +35,7 @@ import { ExportHistoryStore } from "./export-history.ts";
 import {
   effectiveDataDir, loadWizardState, needsWizard, pidAlive, saveWizardState, type WizardState,
 } from "./wizard-state.ts";
-import { defaultDataDir, probeDataDir } from "./wizard-data-dir.ts";
+import { defaultDataDir, ensureWritableDir, probeDataDir } from "./wizard-data-dir.ts";
 import {
   runSelfCheck,
 } from "./wizard-api.ts";
@@ -350,7 +350,15 @@ async function loadUi(endpoints: Endpoints, token: string | null): Promise<void>
   const reachable = await waitForUiOrigin(endpoints.ui, 30_000, fetch, (ms) => new Promise((r) => setTimeout(r, ms)), Date.now);
   if (!reachable) log(`loadUi: ui origin not answering within 30s; loading anyway (did-fail-load retry is the backstop)`);
   if (!mainWindow || quitConfirmed) return;
-  log(`[perf] loadUi elapsed=${Date.now() - appStartAt}ms`);
+  // [perf base fix] elapsed used appStartAt (module-load clock), so a wizard
+  // session parked on the data-dir step for hours inflated "loadUi" into a
+  // meaningless number (34216661ms observed) and made fresh installs look
+  // "slow" by the user-wait seconds the wizard itself added. The startup
+  // clock starts when the user CONFIRMS the data dir (startupFlow entry) —
+  // that is the moment the machine starts working. appStartAt stays as the
+  // session-wide anchor for non-loadUi lines.
+  const perfBase = startupFlowEnteredAt ?? appStartAt;
+  log(`[perf] loadUi elapsed=${Date.now() - perfBase}ms${startupFlowEnteredAt ? " base=startupFlow" : ""}`);
   SD_PERF("loadUi-loadURL", `ui=${endpoints.ui}`);
   attachAuthFallback(endpoints);
   // Preload consumes the fragment before page JS runs.
@@ -752,10 +760,14 @@ function stopConsoleSweep(): void {
 async function ensureBackend(
   endpoints: Endpoints, proxyEnv: NodeJS.ProcessEnv | null, dataDir: string | null,
 ): Promise<boolean> {
-  // 1s first probe — ECONNREFUSED returns instantly anyway, the poll
-  // interval means a 3s budget wasted ~2s before spawning the stack.
+  // 250ms first probe — a live loopback backend answers /api/health in
+  // single-digit ms; a dead port fails with ECONNREFUSED instantly. The old
+  // 1s budget only ever burned time on the "not up yet" path (W31-③: the
+  // comment's "ECONNREFUSED returns instantly" was true per fetch, but the
+  // poll loop then idled out the whole budget — measured 1.05s on every
+  // cold start before the stack was even spawned).
   SD_PERF("ensureBackend-enter");
-  if (await waitHealthy(endpoints.health, 1_000, fetch)) {
+  if (await waitHealthy(endpoints.health, 250, fetch)) {
     log("backend already healthy; reusing running stack");
     SD_PERF("backend-reused-healthy");
     // F9: a reused stack is a LIVE backend this shell did not spawn, but
@@ -1001,8 +1013,15 @@ async function surfaceBackendDead(code: number | null): Promise<void> {
 
 let startupProxyEnv: NodeJS.ProcessEnv | null = null;
 let startupFlowInFlight = false;
+// [perf base fix] the wall-clock moment the user confirmed the data dir (or
+// the non-wizard boot reached startupFlow). loadUi reports against this when
+// set so wizard think-time never counts as "startup time" (see loadUi).
+let startupFlowEnteredAt: number | null = null;
 
 async function startupFlow(proxyEnv: NodeJS.ProcessEnv | null): Promise<void> {
+  // [perf base fix] stamp the moment the startup work actually begins; the
+  // wizard park-time before this moment is user think-time, not startup.
+  startupFlowEnteredAt ??= Date.now();
   SD_PERF("startupFlow-enter");
   // The window shows the local loading page while we probe and (if needed)
   // cold-start the stack; loadUi replaces it once healthy.
@@ -1265,6 +1284,16 @@ function registerWizardIpc(proxyEnv: NodeJS.ProcessEnv | null): void {
     if (!clean) return { ok: false, message: "路径不能为空。" };
     const check = probeDataDir(clean, installRootForWizard());
     if (!check.ok) return { ok: false, message: check.reason ?? "目录不可用。" };
+    // Confirm-time creation: the input probe is deliberately mkdir-free
+    // (probeWritableWithoutMkdir — it runs on half-typed values every 400ms),
+    // so THIS is where the chosen dir first comes to exist on disk. Matches
+    // the page copy "确认后将在选定的目录准备运行环境". ensureWritableDir
+    // re-probes writability on the real dir (a file squatting on the target
+    // was invisible to the read-only probe and fails here with a truthful
+    // message instead of after the wizard state was already saved).
+    if (!ensureWritableDir(clean)) {
+      return { ok: false, message: "目录创建失败（请检查权限或杀毒软件）。" };
+    }
     // Wizard half-takeover: confirming the data dir is all the shell wizard
     // still owns — the SPA takes over model config and boot waiting from
     // here. Mark the wizard done and hand the window to the normal startup
@@ -1517,6 +1546,27 @@ function createWindow(): void {
     exportStreams.abortAll();
   });
   mainWindow.webContents.on("destroyed", () => { exportStreams.abortAll(); });
+  // [W27] window.open from the SPA: MCP OAuth (McpServers.tsx opens a sized
+  // popup and navigates it to the provider) and the feedback dialog
+  // (about:blank tab, then location.replace) both depend on the call returning
+  // a real window — a blanket deny would break them. Allow the popup but
+  // confine it to a plain browser window (no node integration), and send
+  // everything that is not the popup-placeholder itself to the system
+  // browser. Note the main window's own full-page navigations are
+  // deliberately NOT guarded: the HUAWEI sign-in flow navigates the main
+  // window to the accounts service and back via returnUrl — that is the
+  // product design, and the W27 reload loop (a mis-built bundle navigating
+  // to a same-origin path the SPA fallback swallowed) is caught one layer
+  // up, by the App's /v1 misroute guard + the assemble-time bundle check.
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (url === "about:blank") {
+      const options: Electron.BrowserWindowConstructorOptions = { webPreferences: { nodeIntegration: false, contextIsolation: true, sandbox: true } };
+      return { action: "allow", overrideBrowserWindowOptions: options };
+    }
+    log(`[nav-guard] refusing window.open to ${url}; opening externally`);
+    void electronShell.openExternal(url).catch(() => undefined);
+    return { action: "deny" };
+  });
   // First-run race: the health gate watches the control API (4410), but the
   // ui origin (4310 adapter) binds several seconds later on cold machines —
   // the first loadURL died with ERR_CONNECTION_REFUSED and the window sat

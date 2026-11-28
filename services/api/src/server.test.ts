@@ -4270,6 +4270,79 @@ test("an active run keeps its effective settings snapshot while later runs use u
   }
 });
 
+test("the raw SKILL.md, file delete and rename routes carry the revision they read", async (context) => {
+  const tempRoot = resolve(process.cwd(), ".tmp", `skill-raw-api-${Date.now()}-${process.pid}`);
+  await mkdir(tempRoot, { recursive: true });
+  context.after(() => removeTestRoot(tempRoot));
+  const { origin } = await startTestApi(context, tempRoot);
+  const headers = { ...authorization, "content-type": "application/json" };
+
+  const created = await jsonRequest<SkillDetail>(`${origin}/api/skills`, {
+    body: JSON.stringify({
+      description: "A package the raw editor writes.",
+      instructions: "# Raw\n",
+      metadata: { version: "1.0.0" },
+      name: "raw-editor-skill",
+    }),
+    headers,
+    method: "POST",
+  });
+  assert.equal(created.response.status, 201);
+  const id = created.body.id;
+
+  // The editor reads the whole document, frontmatter included.
+  const markdown = await jsonRequest<{ content: string; revision: number }>(`${origin}/api/skills/${id}/skill-md`, {
+    headers: authorization,
+  });
+  assert.equal(markdown.response.status, 200);
+  assert.match(markdown.body.content, /name: raw-editor-skill/u);
+  assert.equal(markdown.body.revision, 1);
+
+  const written = await jsonRequest<SkillDetail>(`${origin}/api/skills/${id}/skill-md`, {
+    body: JSON.stringify({
+      content: "---\nname: raw-editor-skill\ndescription: Rewritten as raw text.\n---\n\n# Raw v2\n",
+      expectedRevision: 1,
+    }),
+    headers,
+    method: "PUT",
+  });
+  assert.equal(written.response.status, 200);
+  assert.equal(written.body.currentRevision, 2);
+  assert.equal(written.body.description, "Rewritten as raw text.");
+
+  const createdFile = await jsonRequest<SkillDetail>(`${origin}/api/skills/${id}/files/references%2Fnew.md`, {
+    body: JSON.stringify({ content: "# New\n", expectedRevision: 2 }),
+    headers,
+    method: "PUT",
+  });
+  assert.equal(createdFile.response.status, 200);
+  assert.deepEqual(createdFile.body.resources.map((item) => item.path), ["references/new.md"]);
+
+  const renamed = await jsonRequest<SkillDetail>(`${origin}/api/skills/${id}/files/references%2Fnew.md/rename`, {
+    body: JSON.stringify({ expectedRevision: 3, to: "references/renamed.md" }),
+    headers,
+    method: "POST",
+  });
+  assert.equal(renamed.response.status, 200);
+  assert.deepEqual(renamed.body.resources.map((item) => item.path), ["references/renamed.md"]);
+
+  // A delete that names the revision before the rename is a conflict, not a
+  // silent overwrite; the route the page retries with succeeds.
+  const stale = await fetch(`${origin}/api/skills/${id}/files/references%2Frenamed.md`, {
+    body: JSON.stringify({ expectedRevision: 3 }),
+    headers,
+    method: "DELETE",
+  });
+  assert.equal(stale.status, 409);
+  const deleted = await jsonRequest<SkillDetail>(`${origin}/api/skills/${id}/files/references%2Frenamed.md`, {
+    body: JSON.stringify({ expectedRevision: 4 }),
+    headers,
+    method: "DELETE",
+  });
+  assert.equal(deleted.response.status, 200);
+  assert.deepEqual(deleted.body.resources, []);
+});
+
 test("skill lifecycle APIs author, import, edit, select, audit impact, and delete safely", async (context) => {
   const tempRoot = resolve(process.cwd(), ".tmp", `skill-api-${Date.now()}-${process.pid}`);
   await mkdir(tempRoot, { recursive: true });
@@ -4486,6 +4559,52 @@ test("skill lifecycle APIs author, import, edit, select, audit impact, and delet
   const diff = await jsonRequest<ArtifactVersionDiff>(`${origin}/api/sessions/${session.body.id}/artifact-versions/${reportVersions.body[1]!.id}/diff`, { headers: authorization });
   assert.ok(diff.body.lines.some((line) => line.kind === "removed" && line.text === "Original value."));
   assert.ok(diff.body.lines.some((line) => line.kind === "added" && line.text === "Corrected value with units."));
+});
+
+test("a refused upload answers with the count and the package shape, not just the cap", async (context) => {
+  const tempRoot = resolve(process.cwd(), ".tmp", `skill-refusal-${Date.now()}-${process.pid}`);
+  await mkdir(tempRoot, { recursive: true });
+  context.after(() => removeTestRoot(tempRoot));
+  const { origin } = await startTestApi(context, tempRoot);
+
+  const upload = (files: Record<string, Uint8Array>): FormData => {
+    const form = new FormData();
+    form.set("file", new Blob([Buffer.from(zipSync(files))], { type: "application/zip" }), "skills-main.zip");
+    return form;
+  };
+  const refusalOf = async (form: FormData): Promise<{
+    code?: string;
+    details?: { refusal?: unknown };
+    error?: string;
+    status: number;
+  }> => {
+    const response = await fetch(`${origin}/api/skills/import`, { body: form, headers: authorization, method: "POST" });
+    return { ...(await response.json() as { code?: string; details?: { refusal?: unknown }; error?: string }), status: response.status };
+  };
+
+  // A repository-wide ZIP reaches the entry cap first. The client cannot write
+  // "N 个条目，上限 500" from a sentence that only names the cap.
+  const repositoryZip: Record<string, Uint8Array> = {
+    "skills-main/SKILL.md": strToU8("---\nname: many\ndescription: Many entries.\n---\n\nBody.\n"),
+    "skills-main/alpha/SKILL.md": strToU8("---\nname: alpha\ndescription: One.\n---\n"),
+    "skills-main/beta/SKILL.md": strToU8("---\nname: beta\ndescription: Two.\n---\n"),
+  };
+  for (let index = 0; index < 498; index += 1) repositoryZip[`skills-main/references/${index}.md`] = strToU8("#");
+  const entries = await refusalOf(upload(repositoryZip));
+  assert.equal(entries.status, 413);
+  assert.equal(entries.code, "SKILL_PACKAGE_REFUSED");
+  assert.equal(entries.error, "Skill archive exceeds 500 entries");
+  assert.deepEqual(entries.details?.refusal, { actual: 501, cap: 500, limit: "entries", reason: "too-large" });
+
+  // Under the cap, the same repository ZIP fails the one-package shape: the
+  // skills sit in subdirectories and there is no SKILL.md at the root.
+  const shape = await refusalOf(upload({
+    "skills-main/alpha/SKILL.md": strToU8("---\nname: alpha\ndescription: One.\n---\n"),
+    "skills-main/beta/SKILL.md": strToU8("---\nname: beta\ndescription: Two.\n---\n"),
+  }));
+  assert.equal(shape.status, 400);
+  assert.equal(shape.code, "SKILL_PACKAGE_REFUSED");
+  assert.deepEqual(shape.details?.refusal, { reason: "missing-root" });
 });
 
 test("ART-001 a missing artifact version answers 404 on provenance and diff like content", async (context) => {

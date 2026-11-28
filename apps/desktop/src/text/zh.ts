@@ -202,6 +202,8 @@ export const ZH = {
     verifying: "正在确认登录状态…",
     errorTitle: "登录未完成",
     errorBody: "华为账号返回了错误，或账号服务未能验证这次登录。请重试。",
+    accountServiceMissing:
+      "本次构建未配置账号服务地址，华为账号登录暂不可用。请联系构建方设置 VITE_ACCOUNTS_API 后重新构建。",
     localTokenMissing: "登录已完成，但本机访问凭据未能签发。请确认本地服务已启动后重试，或退出登录。",
     retry: "重试",
     accountTab: "华为账号登录",
@@ -445,6 +447,10 @@ export const ZH = {
     } as Record<string, string>,
     summaryPass: "未发现问题",
     summaryFindings: (count: number) => `${count} 个问题`,
+    /** A warning is not a revision request; its row and badge say 提醒. */
+    summaryWarnings: (count: number) => `${count} 个提醒`,
+    summaryFindingsAndWarnings: (critical: number, warnings: number) =>
+      `${critical} 个问题 · ${warnings} 个提醒`,
     summaryContradicted: "矛盾",
     summaryPartlySupported: "部分支持",
     summaryIncomplete: "交付不完整",
@@ -471,7 +477,7 @@ export const ZH = {
       citation: "引用：核对引文标识符能否识别、格式是否完整；不核实文献是否支持结论。",
       computation: "计算：把报告里的数值与证据、数据逐项比对，检查数字与统计口径是否一致。",
       completeness: "完整性：按本次任务声明的交付清单，检查应交付的文件是否都在、是否为空白。",
-      semantics: "语义：由来源服务读原文，判断结论是否有出处支撑；只有深度审查会做。",
+      semantics: "语义：深度审查读取引用的文献原文，判断结论是否有出处支撑；只有深度审查会做。",
       other: "通用发现：不属于某一类具体检查，是审查过程中记录的问题。",
       gaps: "未检查：这次审查没有做这一项，原因见下方；未检查不等于通过。",
       source: "来源核验：把一条结论与来源原文对照，给出支持、部分支持、矛盾或无结论。",
@@ -500,10 +506,13 @@ export const ZH = {
       citation_identity: "这次审查没有核对文献身份（作者、期刊、年份）。",
       computation: "这次审查没有核对数字与计算依据。",
     } as Record<string, string>,
+    /** The claim-support gap as a Deep review leaves it. Asking the reader to
+     *  run a Deep review again would contradict the level they just chose. */
+    deepGapBodies: {
+      inconclusive: "深度审查已经尝试核对结论与来源，但没能作出判断（可能缺少足够的原文，或读到的内容无法明确支持或否定结论），所以这一项仍算未检查。这不代表报告有问题。",
+      noComparison: "深度审查没有找到可与原文比对的结论，所以这一项仍算未检查。",
+    },
     gapBodyUnknown: "这次审查没有执行这一项。",
-    /** A source check that could not conclude is not a report defect. */
-    inconclusive: "来源核验没有得出结论",
-    inconclusiveBody: "来源服务未返回结论，这不代表报告有问题。",
     /** A citation-format-only Quick pass did not look at claim support. */
     citationOnlyNote: "本次只核对引用格式，未检查结论支撑。",
     /** Why a checkpoint produced nothing, by the server's reason code. */
@@ -544,9 +553,9 @@ export const ZH = {
     queued: (count: number) => `排队 ${count}`,
     /** A bounded passage in a locked source; "定位" and evidence levels are
      *  internal vocabulary, so the card says what was found instead. */
-    locators: (count: number) => `${count} 处原文`,
-    sourceInconclusiveWith: (count: number) => `找到 ${count} 处原文，但还不足以支撑这条结论。`,
-    sourceInconclusiveNone: "没有找到可用于支撑这条结论的原文。",
+    locators: (count: number) => `${count} 处来源材料`,
+    sourceInconclusiveWith: (count: number) => `找到 ${count} 处来源材料，但还不足以判断这条结论是否成立。`,
+    sourceInconclusiveNone: "没有找到可用于判断这条结论的来源材料。",
     failedDetail: "审查过程报告了错误。",
     empty: "这个检查点没有产生审查记录。",
     noReviews: "还没有审查记录。",
@@ -554,10 +563,10 @@ export const ZH = {
     levelName: (level: string): string => (level === "quick" ? "快速" : "深度"),
     levelPill: (level: string): string => (level === "quick" ? "快速" : "深度"),
     /** The pill only names the level; the tip carries what the name claims.
-     *  The two levels differ in whether a source service is consulted. */
+     *  The two levels differ in whether the cited source text is read. */
     levelTip: (level: string): string => (level !== "quick"
-      ? "深度审查：在快速检查之外，调用来源服务逐条核对结论与原文是否一致。"
-      : "快速审查：只在本机做确定性的结构、引用格式和交付完整性检查，不调用外部来源服务。"),
+      ? "深度审查：在快速检查之外，读取引用的文献原文和证据，逐条核对结论与来源是否一致。"
+      : "快速审查：只在本机做确定性的结构、引用格式和交付完整性检查，不读取文献原文。"),
   },
 
   /** The bottom-right banner while the JiuwenSwarm cluster is still starting
@@ -1118,6 +1127,8 @@ export const ZH = {
       empty: "没有读到技能。",
       search: "搜索技能",
       searchPlaceholder: "搜索技能…",
+      /** The × inside the search field that puts the whole list back. */
+      clearSearch: "清空搜索",
       noMatches: "没有匹配的技能。",
 
       heading: "技能",
@@ -1125,9 +1136,40 @@ export const ZH = {
       noProject: "还没有可用的项目，无法读取技能选择。",
       off: "已停用",
       on: "已启用",
-      scope: "这里的开关控制 ScienceDiscovery 中技能的全局启用状态，对所有任务生效。",
       toggle: (name: string) => `启用或停用「${name}」`,
       installedCount: (count: number) => `已安装 ${count}`,
+      /** The three tabs above the list. The count is part of the label, as in
+       *  the handoff: every row the tab holds, not only those matching the
+       *  current search. */
+      tabs: {
+        label: "技能分类",
+        all: (count: number) => `全部技能（${count}）`,
+        mine: (count: number) => `我的技能（${count}）`,
+        official: (count: number) => `官方技能（${count}）`,
+        basic: "基本信息",
+        files: "技能详情",
+      },
+      /** The way out of a package's own page. */
+      back: "返回",
+      /** 技能详情: the package's files on the left, one of them open on the right. */
+      fileTree: {
+        list: "文件列表",
+        reading: "正在读取文件…",
+        copy: "复制",
+        download: "下载",
+        copied: "已复制",
+      },
+      /** The tag on a card: a package that ships with the app, or one the user
+       *  brought in. */
+      cardTag: {
+        builtIn: "内置",
+        external: "外部",
+      },
+      /** A category the user opened that holds no rows at all. */
+      emptyScope: "这个分类下还没有技能。",
+      /** The list's own subtitle. The directory's entry keeps the shorter line
+       *  it uses as a tooltip; this page says what the page itself does. */
+      listDescription: "管理并安装智能体可用的技能",
       /** The native save dialog a Skill export opens. */
       exportDialog: {
         title: "导出技能",
@@ -1141,11 +1183,8 @@ export const ZH = {
       addMenu: {
         label: "添加技能",
         scratch: "从零开始写",
-        scratchHint: "新建一个技能，自己填写指令",
         upload: "上传技能",
-        uploadHint: "选择 SKILL.md 或包含它的 ZIP 技能包",
         git: "从 GitHub 导入",
-        gitHint: "检查仓库，按提交导入其中的技能包",
       },
       backToList: "返回技能列表",
       createView: {
@@ -1211,16 +1250,56 @@ export const ZH = {
         writeInstead: "改为从零开始写",
       },
       importAction: "导入",
+      /** The close control every 技能 dialog carries. */
+      closeDialog: "关闭",
+      /** 技能 › 上传技能, as the handoff's dialog. */
+      uploadDialog: {
+        hint: "文件夹或 .zip 需要包含 SKILL.md，单个 .md 文件需要有 YAML 格式的名称和描述；一个压缩包只能装一个技能包，整个仓库请用「从 GitHub 导入」。",
+        chooseFile: "选择文件",
+        dropTitle: "选择Skill.md文件",
+        dropHint: "点击或拖动压缩包或文件到此处",
+        reselect: "重新选择",
+        cancel: "取消",
+        confirm: "确定",
+        /** 上传被服务端拒绝时，按拒绝的事实写出的句子。 */
+        refusals: {
+          entries: (actual: number, cap: number) => `压缩包里有 ${actual} 个条目，上限是 ${cap} 个。`,
+          files: (actual: number, cap: number) => `技能包里有 ${actual} 个文件，上限是 ${cap} 个。`,
+          archiveBytes: (actual: string, cap: string) => `压缩包大小是 ${actual}，超过了 ${cap} 的上限。`,
+          extractedBytes: (actual: string, cap: string) => `解压后的内容有 ${actual}，超过了 ${cap} 的上限。`,
+          fileBytes: (path: string, cap: string) => `「${path}」超过了单个文件 ${cap} 的上限。`,
+          missingRoot: "压缩包的根目录里没有 SKILL.md。",
+          severalRoots: "压缩包的顶层不是单个技能包目录。",
+          outsideRoot: "压缩包里有技能包根目录之外的文件。",
+          onePackage: "一个压缩包只能导入一个技能包。如果这是装着多个技能的仓库，请改用「从 GitHub 导入」，先选择要导入的技能。",
+        },
+      },
+      /** 技能 › 从 GitHub 导入, as the handoff's dialog. */
+      gitDialog: {
+        subtitle: "从公开的 Github 仓库中导入",
+        advanced: "高级选项",
+        progress: (done: number, total: number) => `正在导入(${done}/${total})`,
+        importing: "导入中",
+        invalidUrl: "URL格式不正确，请重新输入",
+      },
       importBusy: "正在导入…",
-      backgroundImportRunning: (done: number, total: number) => `正在后台导入 ${done} / ${total}…`,
       backgroundImportDone: (count: number) => `已导入 ${count} 个技能。`,
       backgroundImportPartial: (imported: number, failed: number) => `已导入 ${imported} 个，${failed} 个失败。`,
+      backgroundImportEnableFailed: (imported: number, failed: number) =>
+        `已导入 ${imported} 个技能，但 ${failed} 个未能启用。`,
       backgroundImportFailed: "后台导入失败。",
       backgroundImportFailures: (names: string, count: number) =>
         count > 3 ? `失败：${names} 等 ${count} 个` : `失败：${names}`,
-      backgroundImportDismiss: "关闭导入提示",
       importFailed: "导入失败。",
       importSucceeded: (name: string) => `已导入「${name}」。`,
+      /** The 技能 page's own notices (design 1-4). */
+      toastUploadDone: (name: string) => `「${name}」上传成功！`,
+      toastUploadNotEnabled: (name: string) => `「${name}」已导入，但未能启用。`,
+      toastGitDone: "GitHub 技能导入成功！",
+      toastGitFailed: "GitHub 技能导入失败",
+      toastProgress: (done: number, total: number) => `正在导入(${done}/${total})`,
+      toastRetry: "点击重试",
+      toastClose: "关闭提示",
       git: {
         title: "从 GitHub 导入",
         description: "先检查仓库里有哪些技能包，再选择要导入的条目；导入会固定在你看到的那次提交上。",
@@ -1297,6 +1376,26 @@ export const ZH = {
         editingResource: (path: string) => `正在编辑参考文件：${path}`,
         saveFile: "保存文件",
         closeReferenceEditor: "关闭参考文件编辑器",
+        /** 2-3: the file editor. */
+        exit: "退出编辑",
+        unsaved: "未保存",
+        unsavedTitle: "尚未保存更改",
+        unsavedBody: "当前内容尚未保存，返回后所做的更改将会丢失。确定要离开吗？",
+        deleteTitle: "确认删除？",
+        deleteBody: "删除后将无法恢复，确定要删除此内容吗？",
+        newFolder: "新建文件夹",
+        newFile: "新建文件",
+        newFileIn: (path: string) => `在「${path}」下新建文件`,
+        uploadFile: "上传",
+        filePathPlaceholder: "文件名或路径，例如 references/new.md",
+        folderPathPlaceholder: "文件夹名，例如 references",
+        invalidPath: "名称不能为空、不能以 / 开头，也不能包含 . 或 ..。",
+        editPath: (path: string) => `编辑 ${path}`,
+        rename: "编辑名称",
+        deleteAction: "删除",
+        deletePath: (path: string) => `删除 ${path}`,
+        saveFailed: "保存失败。",
+        uploadNotText: (name: string) => `「${name}」不是文本文件，无法作为技能文件上传。`,
         referenceEditingHint: "修改后点「保存文件」。",
         referenceNotText: (name: string) => `「${name}」不是 UTF-8 文本，不能作为参考文件导入。`,
         addReferenceFailed: "没有读入这个参考文件。",
@@ -1616,6 +1715,52 @@ export const ZH = {
         connectorsEmpty: "这台机器上还没有可用的连接器。",
       },
       mcp: {
+        allMcp: "全部MCP",
+        myMcp: "我的MCP",
+        officialMcp: "官方MCP",
+        searchMcp: "搜索MCP",
+        enableAll: "一键启用",
+        disableAll: "一键关闭",
+        bulkHint: "批量操作仅影响当前显示的自定义服务；内置服务开关控制会话默认使用。",
+        bulkFailed: (names: string) => `以下服务更新失败：${names}。可重试更新剩余服务。`,
+        tryIt: "去试试",
+        tryUnavailable: "未启用服务不支持；内置来源需处于可用状态。",
+        noMatches: "没有匹配的 MCP 服务",
+        manualEntry: "手动填写",
+        importJsonEntry: "导入 JSON",
+        jsonSource: "JSON 来源",
+        importFillHint: "粘贴包含 mcpServers 的 JSON 或上传文件，检查并修改下方配置后，确认添加。",
+        importEmptyHint: "粘贴或上传 JSON 后，配置会自动填入下方表单。",
+        chooseConfiguration: "服务器配置",
+        duplicateName: "服务器名称不能重复。",
+        timeoutInvalid: "超时必须是 1 到 600 之间的整数。",
+        commandRequired: "STDIO 需要填写命令。",
+        urlInvalid: "请填写不含用户名、密码或片段的 HTTP(S) 地址。",
+        confirmAdd: (count: number) => count > 1 ? `确认添加 ${count} 台服务器` : "确认添加",
+        importFilled: (count: number) => `已填入 ${count} 份配置，请检查并修改后确认添加。`,
+        importProgress: (added: number, total: number) => `已添加 ${added}/${total} 台，仅重试尚未添加的配置。`,
+        addedCount: (count: number) => `已添加 ${count} 台 MCP 服务器`,
+        savedCheckFailed: (reason: string) => `配置已保存。连接检查：${reason}`,
+        importFieldInvalid: (name: string, field: string) => `「${name}」的 ${field} 无效，请修改 JSON 后重试。`,
+        configured: "已配置的服务器",
+        details: "服务器详情",
+        custom: "外部",
+        noDescription: "暂无描述",
+        builtinReadOnly: "内置来源由应用管理，仅支持查看。",
+        checkedAt: "最近检查时间",
+        neverChecked: "暂无检查记录",
+        checkHint: "连接状态为最近一次发现或测试的结果，并非持续心跳。服务启用与会话默认选用分别设置。",
+        storedValue: "已安全保存",
+        publisher: "发布者 / 版本",
+        serviceEnabled: "已启用",
+        selected: "已选用",
+        notSelected: "未选用",
+        authorized: "已授权",
+        authorizing: "正在等待授权",
+        deleted: "MCP 服务器已删除",
+        retry: "重试",
+        more: (name: string) => `${name}的更多操作`,
+        openDetails: (name: string) => `查看${name}详情`,
         heading: "MCP 服务器",
         help: "“默认使用”选择继承全局设置的会话所用的来源；项目或会话的显式选择优先。专家可能补充其他来源，实际工具调用仍受服务就绪状态和权限限制。自定义服务器编辑表单中的“启用服务”单独控制连接。更改不会重新配置正在运行的任务。",
         builtin: "内置",
@@ -1667,8 +1812,8 @@ export const ZH = {
         saved: "MCP 服务器已保存",
         deleteTitle: (name: string) => `删除服务器「${name}」？`,
         deleteBody: (name: string) => `删除「${name}」后依赖它的工具不再可用，已经跑完的结果不受影响。`,
-        addServer: "添加服务器",
-        createTitle: "新建服务器",
+        addServer: "新增 MCP 服务器",
+        createTitle: "新增 MCP 服务器",
         importServers: "导入",
         importPaste: "粘贴 JSON",
         importFile: "上传 JSON 文件",
@@ -1698,6 +1843,8 @@ export const ZH = {
         clearAuthorization: "清除授权",
         nameRequired: "名称不能为空。",
         openAuthorization: "打开授权页面",
+        actions: (name: string) => `${name}的操作`,
+        importChoice: "导入 JSON",
       },
       web: {
         searchHeading: "搜索",
@@ -1845,6 +1992,7 @@ export const ZH = {
         totalColumn: "总量", inputColumn: "输入", outputColumn: "输出", model: "模型", byModel: "按模型统计（Token）",
         unreported: "未上报", incomplete: "仅包含已上报用量，实际用量可能更高。",
         empty: "所选时间范围内暂无模型用量记录。", updated: "更新时间",
+        skeleton: "正在读取模型用量…",
       },
       migrated: {
         common: {
@@ -1864,6 +2012,7 @@ export const ZH = {
           connectionHeading: "连接与资源",
           overviewHint: "选择一台 Runner，管理它的连接、机器资源和科学环境。",
           back: "返回运行环境",
+          skeleton: "正在读取运行环境…",
           runner: "执行机器",
           local: "内置 Runner",
           scope: "以下环境安装在这台机器上，供任务执行代码时使用。",
@@ -1965,7 +2114,7 @@ export const ZH = {
         gatewayIdle: "网关空闲超时",
         gatewayIdleHint: "连接一直没有新数据时等待的时间。",
         gatewayTurn: "单轮超时",
-        gatewayTurnHint: "一轮对话允许的最长时间。",
+        gatewayTurnHint: "一轮对话允许的最长时间。两者都设置时，单轮时限不短于网关空闲时限；把其中一项设为不限则不受此限制。",
         kernelIdle: "内核空闲超时",
         kernelIdleHint: "持久内核闲置多久后回收。",
         permissionWait: "授权等待超时",
@@ -1975,6 +2124,7 @@ export const ZH = {
         seconds: "秒",
         unlimited: "不限",
         saved: "已保存",
+        orderError: "单轮超时不能短于网关空闲超时。请调大单轮超时、调小网关空闲超时，或把其中一项设为不限。",
       },
       quotas: {
         heading: "配额",

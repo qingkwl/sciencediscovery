@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import { ApiRequestError, type ApiClient } from "../../api/client.js";
 import {
@@ -32,26 +32,34 @@ import type {
   JiuwenSwarmSkillSwitchTarget,
   SkillDescriptor,
   SkillDetail,
+  StartGitSkillImportJobRequest,
 } from "../../api/types.js";
 import type { ConfirmRequest } from "../../app/use-workspace.js";
 import {
   dismissGitSkillImportJob,
   enableCreatedSkills,
+  resumeGitSkillImport,
+  retryEnableCreatedSkills,
   startGitSkillImportInBackground,
+  subscribeGitSkillImportEnableFailure,
   subscribeGitSkillImportJob,
+  type GitSkillImportEnableFailure,
 } from "../../app/git-skill-import-job.js";
 import { saveSkillPackage } from "../../app/skill-export.js";
 import { skillMark } from "../../app/slash.js";
 import { useLoaded } from "../../app/use-loaded.js";
 import { TEXT } from "../../text.js";
 import { SkillAddMenu } from "./SkillAddMenu.js";
+import { SkillDialog } from "./SkillDialog.js";
+import { SkillToasts, type SkillToastItem } from "./SkillToasts.js";
 import { SkillDetailView } from "./SkillDetailView.js";
-import { SkillEditorView } from "./SkillEditorView.js";
+import { SkillFileEditorView } from "./SkillFileEditorView.js";
 import { SkillForm } from "./SkillForm.js";
 import { SkillGitImportView } from "./SkillGitImportView.js";
 import { SkillRowMenu, type SkillRowAction } from "./SkillRowMenu.js";
+import { markTone } from "./skill-tone.js";
 import { SkillUploadView } from "./SkillUploadView.js";
-import { BulkToggles, Group, LoadGate, Switch, Tag } from "./rows.js";
+import { BulkToggles, LoadGate, Switch } from "./rows.js";
 
 interface Props {
   client: ApiClient;
@@ -71,10 +79,12 @@ interface Props {
 type SkillView =
   | { kind: "list" }
   | { kind: "create" }
-  | { kind: "upload" }
-  | { kind: "git" }
-  | { description: string; id: string; kind: "detail"; name: string }
+  | { description: string; id: string; kind: "detail"; name: string; tab?: "basic" | "files" }
   | { id: string; kind: "edit"; name: string };
+
+/** The two ways in that stay on the list: both are dialogs over it, as the
+ *  handoff draws them, so the page behind them keeps its scroll and its rows. */
+type SkillDialogKind = "git" | "upload";
 
 interface SkillPage {
   switchesAvailable: boolean;
@@ -120,30 +130,25 @@ function serverValue(page: SkillPage, key: string): boolean | undefined {
 }
 
 /**
- * Every row a bulk action covers, with the target to send for it.
+ * One row a bulk action covers, with the target to send for it.
  *
  * A catalog skill brings the JiuwenSwarm name it is installed as when the page
  * knows it, which is what keeps the bulk write free of a lookup per skill. A
  * skill JiuwenSwarm does not have yet goes by id, and the server imports it
  * only if the action needs it there.
  */
-function skillRows(page: SkillPage): SkillRow[] {
-  return [
-    ...page.skills.map((skill): SkillRow => ({
+function skillRow(skill: SkillDescriptor | JiuwenSwarmSkill, installedNames: Record<string, string>): SkillRow {
+  return "id" in skill
+    ? {
       key: catalogKey(skill.id),
       name: skill.name,
       skillId: skill.id,
       target: {
         skillId: skill.id,
-        ...(page.installedNames?.[skill.id] === undefined ? {} : { name: page.installedNames[skill.id] }),
+        ...(installedNames[skill.id] === undefined ? {} : { name: installedNames[skill.id] }),
       },
-    })),
-    ...page.jiuwenSwarmSkills.map((skill): SkillRow => ({
-      key: jiuwenKey(skill.name),
-      name: skill.name,
-      target: { name: skill.name },
-    })),
-  ];
+    }
+    : { key: jiuwenKey(skill.name), name: skill.name, target: { name: skill.name } };
 }
 
 /** The result that belongs to a row: by id when its target had one, else by name. */
@@ -159,8 +164,46 @@ function setSkillEnabled(client: ApiClient, skill: SkillDescriptor | JiuwenSwarm
     : setJiuwenSwarmSkillEnabled(client, skill.name, enabled);
 }
 
-function sourceLabel(source: SkillDescriptor["source"]): string {
-  return source === "built-in" ? TEXT.settings.skills.source.builtIn : TEXT.settings.skills.source.managed;
+/** Which tab holds a row: 官方 for a package that ships with the app, 我的 for
+ *  one the user brought in.
+ *
+ *  A catalog row says `built-in` or `managed`; a row only JiuwenSwarm knows
+ *  says `builtin` for its own bundled skills and anything else for the ones
+ *  installed beside them. The two vocabularies name the same split. */
+type SkillScope = "all" | "mine" | "official";
+
+function rowScope(skill: SkillDescriptor | JiuwenSwarmSkill): Exclude<SkillScope, "all"> {
+  return skill.source === "built-in" || skill.source === "builtin" ? "official" : "mine";
+}
+
+/** The rows the list is showing: the search narrows by name, the tab by scope.
+ *  The toolbar's bulk pair sits outside the list but writes to these same
+ *  rows, so both read them through this one function. */
+function visibleRows(page: SkillPage, scope: SkillScope, term: string) {
+  // The search matches names only: descriptions are long prose, and a word
+  // that happens to appear in one is a poor reason to keep a package while
+  // the user is hunting for a name they remember.
+  const matches = (name: string) => term === "" || name.toLowerCase().includes(term);
+  return [
+    ...page.skills.filter((skill) => matches(skill.name)).map((skill) => ({ kind: "catalog" as const, skill })),
+    ...page.jiuwenSwarmSkills.filter((skill) => matches(skill.name)).map((skill) => ({ kind: "jiuwenswarm" as const, skill })),
+  ].filter((row) => scope === "all" || rowScope(row.skill) === scope);
+}
+
+/** The card's name with the searched-for text marked.
+ *
+ *  The search is literal, so a name holding `(` or `.` is not a pattern. Every
+ *  occurrence is marked, in the name's own case; the term arrives lowercased.
+ */
+function markedName(name: string, term: string): ReactNode[] {
+  if (term === "") return [name];
+  const literal = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const parts = name.split(new RegExp(`(${literal})`, "iu"));
+  return parts.map((part, index) => (
+    part.toLowerCase() === term
+      ? <mark className="skill-card-hit" key={index}>{part}</mark>
+      : part
+  ));
 }
 
 /** The title and one-line description of a page below the list. Read through
@@ -169,10 +212,6 @@ function subviewCopy(view: Exclude<SkillView, { kind: "list" }>): { description:
   switch (view.kind) {
     case "create":
       return TEXT.settings.skills.createView;
-    case "upload":
-      return TEXT.settings.skills.uploadView;
-    case "git":
-      return TEXT.settings.skills.git;
     case "detail":
       return { description: view.description, title: view.name };
     case "edit":
@@ -205,12 +244,26 @@ export function SkillsSettings({ client, onConfirm }: Props) {
   const [pending, setPending] = useState<ReadonlySet<string>>(() => new Set());
   const [notice, setNotice] = useState<string>();
   const [query, setQuery] = useState("");
+  const [scope, setScope] = useState<SkillScope>("all");
+  const searchInput = useRef<HTMLInputElement>(null);
   const [exportStatus, setExportStatus] = useState<{
     error?: boolean;
     id: string;
     message: string;
   }>();
   const [backgroundImport, setBackgroundImport] = useState<GitSkillImportJob>();
+  const [enableFailure, setEnableFailure] = useState<GitSkillImportEnableFailure>();
+  const [uploadToast, setUploadToast] = useState<{
+    detail?: string;
+    id: number;
+    kind: "error" | "success";
+    message: string;
+  }>();
+  /** A running job's progress toast can be hidden without cancelling the job;
+   *  its result still arrives when the job ends. */
+  const [dismissedProgress, setDismissedProgress] = useState<string>();
+  /** The last Git import request, so a failed result can be retried in place. */
+  const [lastGitRequest, setLastGitRequest] = useState<StartGitSkillImportJobRequest>();
   const handledImportJob = useRef<string | undefined>(undefined);
 
   // An export's outcome is a passing confirmation, not a property of the row:
@@ -227,7 +280,24 @@ export function SkillsSettings({ client, onConfirm }: Props) {
   // this pane only watches it. Once it ends, new packages are switched on in
   // JiuwenSwarm (as a foreground import did) and the catalog is re-read once.
   useEffect(() => subscribeGitSkillImportJob(setBackgroundImport), []);
+  // The switch-on step belongs to the import, not to this pane: when it could
+  // not finish, the notice says so here even if the pane was closed then.
+  useEffect(() => subscribeGitSkillImportEnableFailure(setEnableFailure), []);
+  // The app tries to pick a reloaded import back up at startup; if the API was
+  // not reachable yet, opening 设置 is the next chance to finish that work.
+  useEffect(() => {
+    void resumeGitSkillImport(client);
+  }, [client]);
   const [view, setView] = useState<SkillView>({ kind: "list" });
+  // A message belongs to the page that produced it. Moving on starts clean,
+  // so a refusal from one page does not follow the reader into the next; the
+  // next page's own actions set their own message afterwards.
+  const goTo = (next: SkillView) => {
+    setFailure(undefined);
+    setNotice(undefined);
+    setView(next);
+  };
+  const [dialog, setDialog] = useState<SkillDialogKind>();
 
   const loaded = useLoaded<SkillPage>(async () => {
     const [catalog, state] = await Promise.allSettled([
@@ -264,6 +334,8 @@ export function SkillsSettings({ client, onConfirm }: Props) {
       || backgroundImport.status === "failed";
     if (!terminal || handledImportJob.current === backgroundImport.id) return;
     handledImportJob.current = backgroundImport.id;
+    // The dialog's progress is done; the list's banner carries the outcome.
+    setDialog((current) => (current === "git" ? undefined : current));
     // Enabling newly created packages is the job store's work: the pane may
     // be closed when the import ends. When the pane is open, wait for that
     // same run before re-reading the switch list; otherwise the reload can
@@ -309,21 +381,23 @@ export function SkillsSettings({ client, onConfirm }: Props) {
   };
 
   /**
-   * Enable or disable every listed skill in one request.
+   * Enable or disable the skills the page is showing, in one request.
    *
-   * The rows move first, on the intent, and the single write follows; its
-   * per-target answer puts back exactly the rows JiuwenSwarm refused, and one
-   * list read afterwards reconciles the page. The row switches stay disabled
-   * while `bulkPending` is set, that is until the batch write settles: a switch
-   * pressed in that window would race the batch. Once it settles a switch is an
-   * ordinary single write, and the reload started below reconciles the page.
+   * "All" means the current tab (and the current search): 我的技能 with two
+   * cards is two writes, not every package on the machine. The rows move
+   * first, on the intent, and the single write follows; its per-target answer
+   * puts back exactly the rows JiuwenSwarm refused, and one list read
+   * afterwards reconciles the page. The row switches stay disabled while
+   * `bulkPending` is set, that is until the batch write settles: a switch
+   * pressed in that window would race the batch. Once it settles a switch is
+   * an ordinary single write, and the reload started below reconciles the page.
    * A page of 31 skills used to be 31 awaited requests plus its own reload,
    * which is what froze it for seconds.
    */
-  const setAll = async (next: boolean) => {
+  const setAll = async (next: boolean, visible: Array<SkillDescriptor | JiuwenSwarmSkill>) => {
     const page = loaded.value;
     if (!page?.switchesAvailable) return;
-    const rows = skillRows(page);
+    const rows = visible.map((skill) => skillRow(skill, page.installedNames ?? {}));
     if (!rows.length) return;
     setFailure(undefined);
     setBulkPending(true);
@@ -406,6 +480,7 @@ export function SkillsSettings({ client, onConfirm }: Props) {
           setBusy(true);
           try {
             await deleteSkill(client, skill.id);
+            goTo({ kind: "list" });
             setNotice(TEXT.settings.skills.rowMenu.deleted(skill.name));
           } catch (reason) {
             setFailure(reason instanceof Error ? reason.message : TEXT.settings.skills.rowMenu.deleteFailed);
@@ -425,7 +500,7 @@ export function SkillsSettings({ client, onConfirm }: Props) {
 
   const chooseRowAction = (skill: SkillDescriptor, action: SkillRowAction) => {
     if (action === "export") void exportSkill(skill);
-    else if (action === "edit") setView({ id: skill.id, kind: "edit", name: skill.name });
+    else if (action === "edit") goTo({ id: skill.id, kind: "edit", name: skill.name });
     else void removeSkill(skill);
   };
 
@@ -436,54 +511,142 @@ export function SkillsSettings({ client, onConfirm }: Props) {
    * An *update* of a skill that was already installed is left alone: the user
    * may have switched it off on purpose, and re-enabling it would undo that
    * while replacing its files, which is not what they asked for.
+   *
+   * Returns why the package could not be enabled, so the caller that reports a
+   * passing install can say this instead of claiming it is ready to use.
    */
-  const afterInstall = async (skill: SkillDetail) => {
+  const afterInstall = async (skill: SkillDetail): Promise<string | undefined> => {
     setBusy(true);
     setFailure(undefined);
+    let problem: string | undefined;
     try {
       const page = loaded.value;
       const wasInstalled = page?.skills.some((entry) => entry.id === skill.id) ?? false;
       if (page?.switchesAvailable) {
         if (!wasInstalled) await setJiuwenSwarmSkillEnabledById(client, skill.id, true);
       } else if (!page?.native && !wasInstalled) {
-        setFailure(page?.switchError ?? TEXT.settings.saveFailed);
+        problem = page?.switchError ?? TEXT.settings.saveFailed;
+        setFailure(problem);
       }
     } catch (reason) {
-      setFailure(reason instanceof Error ? reason.message : TEXT.settings.saveFailed);
+      problem = reason instanceof Error ? reason.message : TEXT.settings.saveFailed;
+      setFailure(problem);
     } finally {
       setBusy(false);
       loaded.reload();
     }
+    return problem;
   };
 
   /** Enable a new skill when JiuwenSwarm is available; native creation needs no import. */
   const afterCreate = async (skill: SkillDetail) => {
     // A created package is a list item from now on, and the list is where the
     // user would go to look at it, so the form does not linger.
-    setView({ kind: "list" });
+    goTo({ kind: "list" });
     await afterInstall(skill);
   };
 
-  const installed = loaded.value
-    ? loaded.value.skills.length + loaded.value.jiuwenSwarmSkills.length
-    : undefined;
-  const copy = view.kind === "list" ? undefined : subviewCopy(view);
-  const back = () => setView({ kind: "list" });
+  // A passing upload is news about a dialog that just closed, so it leaves by
+  // itself; a failed Git import stays until it is dismissed or retried. An
+  // upload that arrived but stayed switched off is a failure, too.
+  useEffect(() => {
+    if (!uploadToast || uploadToast.kind === "error") return;
+    const timer = setTimeout(() => setUploadToast(undefined), 4_000);
+    return () => clearTimeout(timer);
+  }, [uploadToast]);
 
+  const toasts: SkillToastItem[] = [];
+  if (uploadToast) {
+    toasts.push({
+      id: `upload-${uploadToast.id}`,
+      kind: uploadToast.kind,
+      message: uploadToast.message,
+      ...(uploadToast.detail ? { detail: uploadToast.detail } : {}),
+      onClose: () => setUploadToast(undefined),
+    });
+  }
+  // The Git dialog carries its own progress; the toast takes over once it is
+  // closed, which is how a background import stays visible on the list.
+  if (backgroundImport && dialog !== "git") {
+    const job = backgroundImport;
+    const enableProblem = enableFailure?.jobId === job.id ? enableFailure : undefined;
+    // A failed switch-on is its own problem with its own remedy: the import
+    // retry re-runs subdirectories, and only the enable retry switches on the
+    // packages that arrived. When a job has both, both are offered — the
+    // import retry cannot do the enable run's work.
+    const pushEnableRetry = (target: typeof job, problem: GitSkillImportEnableFailure) => {
+      toasts.push({
+        id: `git-enable-${target.id}`,
+        kind: "error",
+        message: TEXT.settings.skills.backgroundImportEnableFailed(target.imported.length, problem.count),
+        detail: problem.message,
+        onClose: () => dismissGitSkillImportJob(),
+        onRetry: () => {
+          void retryEnableCreatedSkills(client, target).then(() => loaded.reload());
+        },
+      });
+    };
+    if (job.status === "queued" || job.status === "running") {
+      if (dismissedProgress !== job.id) {
+        toasts.push({
+          id: `git-progress-${job.id}`,
+          kind: "progress",
+          message: TEXT.settings.skills.toastProgress(job.done, job.total),
+          onClose: () => setDismissedProgress(job.id),
+        });
+      }
+    } else if (job.status === "failed" || job.failures.length > 0) {
+      toasts.push({
+        id: `git-result-${job.id}`,
+        kind: "error",
+        message: job.status === "failed"
+          ? TEXT.settings.skills.toastGitFailed
+          : TEXT.settings.skills.backgroundImportPartial(job.imported.length, job.failures.length),
+        detail: job.failures.length
+          ? TEXT.settings.skills.backgroundImportFailures(
+            job.failures.slice(0, 3).map((failure) => failure.subdirectory).join("、"),
+            job.failures.length,
+          )
+          : undefined,
+        onClose: () => dismissGitSkillImportJob(),
+        ...(lastGitRequest
+          ? {
+            onRetry: () => {
+              void startGitSkillImportInBackground(client, lastGitRequest).catch((reason: unknown) => {
+                setFailure(reason instanceof Error ? reason.message : TEXT.settings.skills.importFailed);
+              });
+            },
+          }
+          : {}),
+      });
+      if (enableProblem !== undefined) pushEnableRetry(job, enableProblem);
+    } else if (enableProblem !== undefined) {
+      // The packages are installed, but a new one that stays switched off is
+      // not the success the reader asked for; say what is still off and let
+      // the switch-on step run again.
+      pushEnableRetry(job, enableProblem);
+    } else {
+      toasts.push({
+        id: `git-result-${job.id}`,
+        kind: "success",
+        message: TEXT.settings.skills.toastGitDone,
+        detail: TEXT.settings.skills.backgroundImportDone(job.imported.length),
+        onClose: () => dismissGitSkillImportJob(),
+      });
+    }
+  }
+
+  const copy = view.kind === "list" ? undefined : subviewCopy(view);
+  const back = () => goTo({ kind: "list" });
+
+  // The list's title is one block: the filters and the add control sit on the
+  // tab row below it, where the handoff puts them.
   const header = view.kind === "list" ? (
-    <header className="settings-detail-header">
+    <header className="settings-detail-header skill-list-head">
       <div>
-        <h3>
-          {TEXT.settings.system.groups.skills.label}
-          {installed === undefined ? null : (
-            <span className="skill-installed-count">
-              {TEXT.settings.skills.installedCount(installed)}
-            </span>
-          )}
-        </h3>
-        <p>{TEXT.settings.system.groups.skills.description}</p>
+        <h3>{TEXT.settings.system.groups.skills.label}</h3>
+        <p>{TEXT.settings.skills.listDescription}</p>
       </div>
-      <SkillAddMenu onChoose={(choice) => setView({ kind: choice })} />
     </header>
   ) : view.kind === "detail" || view.kind === "edit" ? null : (() => {
     const pageCopy = subviewCopy(view);
@@ -501,7 +664,9 @@ export function SkillsSettings({ client, onConfirm }: Props) {
   // shell this pane imitates: outside the scrolling content, so a long SKILL.md
   // cannot carry the trail away, and out of the page's own column, so the name
   // and description start where 文件 does.
-  const trail = copy === undefined ? null : (
+  // A package's own page draws its own 返回 link at the top of its column,
+  // as the handoff does; the other sub-pages keep the trail bar.
+  const trail = copy === undefined || view.kind === "detail" || view.kind === "edit" ? null : (
     <div className="skill-pane-bar">
       <button
         aria-label={TEXT.settings.skills.backToList}
@@ -525,77 +690,218 @@ export function SkillsSettings({ client, onConfirm }: Props) {
   return (
     <div className="skill-pane">
       {trail}
-      <div className={`settings-group-detail${view.kind === "edit" ? " is-skill-editor" : ""}`}>
+      <div className={`settings-group-detail${view.kind === "list" ? " is-skill-list" : ""}${view.kind === "detail" ? " is-skill-detail" : ""}${view.kind === "edit" ? " is-skill-file-editor" : ""}`}>
       {header}
-      {view.kind === "list" && backgroundImport ? (
-        <div
-          className={`skill-import-banner${backgroundImport.status === "failed" ? " is-error" : ""}`}
-          role={backgroundImport.status === "failed" ? "alert" : "status"}
-        >
-          <div className="skill-import-banner-copy">
-            <strong>
-              {backgroundImport.status === "queued" || backgroundImport.status === "running"
-                ? TEXT.settings.skills.backgroundImportRunning(
-                  backgroundImport.done,
-                  backgroundImport.total,
-                )
-                : backgroundImport.status === "failed"
-                  ? TEXT.settings.skills.backgroundImportFailed
-                  : backgroundImport.failures.length
-                    ? TEXT.settings.skills.backgroundImportPartial(
-                      backgroundImport.imported.length,
-                      backgroundImport.failures.length,
-                    )
-                    : TEXT.settings.skills.backgroundImportDone(backgroundImport.imported.length)}
-            </strong>
-            {backgroundImport.failures.length ? (
-              <small>
-                {TEXT.settings.skills.backgroundImportFailures(
-                  backgroundImport.failures.slice(0, 3).map((failure) => failure.subdirectory).join("、"),
-                  backgroundImport.failures.length,
-                )}
-              </small>
-            ) : null}
-          </div>
-          {backgroundImport.status === "queued" || backgroundImport.status === "running" ? null : (
-            <button
-              aria-label={TEXT.settings.skills.backgroundImportDismiss}
-              className="skill-import-banner-close"
-              onClick={() => dismissGitSkillImportJob()}
-              type="button"
+      {view.kind !== "list" && (failure !== undefined || notice !== undefined || exportStatus !== undefined) ? (
+        <div className="skill-subpage-notices">
+          {failure === undefined ? null : <small className="row-note is-error" role="alert">{failure}</small>}
+          {notice === undefined ? null : <small className="row-note" role="status">{notice}</small>}
+          {exportStatus === undefined ? null : (
+            <span
+              className={`skill-export-status${exportStatus.error ? " is-error" : ""}`}
+              role={exportStatus.error ? "alert" : "status"}
             >
-              ×
-            </button>
+              {exportStatus.message}
+            </span>
           )}
         </div>
       ) : null}
+      {view.kind === "list" ? (() => {
+        // The tabs and the add control stay on screen while the first read is
+        // in flight: 添加技能 is a way in, not a property of the list below it.
+        // The counts wait for the answer, because a number guessed from no
+        // data would have to change under the reader's eyes.
+        const page = loaded.value;
+        const allRows = page ? [...page.skills, ...page.jiuwenSwarmSkills] : [];
+        const officialCount = allRows.filter((skill) => rowScope(skill) === "official").length;
+        const counts: Record<SkillScope, number> = {
+          all: allRows.length,
+          mine: allRows.length - officialCount,
+          official: officialCount,
+        };
+        const bulkRows = page ? visibleRows(page, scope, query.trim().toLowerCase()) : [];
+        return (
+          <div className="skill-toolbar">
+            {page ? (
+              <div
+                aria-label={TEXT.settings.skills.tabs.label}
+                className="skill-tabs"
+                id="skill-tabs"
+                role="tablist"
+              >
+                {(["all", "mine", "official"] as const).map((tab) => (
+                  <button
+                    aria-controls="skill-list-panel"
+                    aria-selected={scope === tab}
+                    className={`skill-tab${scope === tab ? " is-active" : ""}`}
+                    key={tab}
+                    onClick={() => setScope(tab)}
+                    role="tab"
+                    type="button"
+                  >
+                    {TEXT.settings.skills.tabs[tab](counts[tab])}
+                  </button>
+                ))}
+              </div>
+            ) : <div className="skill-tabs" />}
+            <div className="skill-toolbar-end">
+              {page?.switchesAvailable && bulkRows.length > 0
+                ? <BulkToggles
+                  busy={busy || bulkPending}
+                  onAll={(next) => void setAll(next, bulkRows.map((row) => row.skill))}
+                  variant="toolbar"
+                />
+                : null}
+              <div className="skill-search-field">
+                <input
+                  aria-label={TEXT.settings.skills.search}
+                  className="skill-search-input"
+                  onChange={(event) => setQuery(event.target.value)}
+                  placeholder={TEXT.settings.skills.searchPlaceholder}
+                  ref={searchInput}
+                  type="search"
+                  value={query}
+                />
+                {query === "" ? null : (
+                  <button
+                    aria-label={TEXT.settings.skills.clearSearch}
+                    className="skill-search-clear"
+                    onClick={() => {
+                      setQuery("");
+                      // The field is what the user is working in; clearing it
+                      // should leave the caret there rather than on the button.
+                      searchInput.current?.focus();
+                    }}
+                    type="button"
+                  >
+                    <svg
+                      aria-hidden="true"
+                      fill="none"
+                      height="14"
+                      stroke="currentColor"
+                      strokeLinecap="round"
+                      strokeWidth="1.8"
+                      viewBox="0 0 24 24"
+                      width="14"
+                    >
+                      <path d="M6 6l12 12M18 6L6 18" />
+                    </svg>
+                  </button>
+                )}
+              </div>
+              <SkillAddMenu
+                onChoose={(choice) => {
+                  if (choice === "create") goTo({ kind: "create" });
+                  else setDialog(choice);
+                }}
+              />
+            </div>
+          </div>
+        );
+      })() : null}
       {view.kind === "list" ? (
-        <div className="skill-search-row">
-          <input
-            aria-label={TEXT.settings.skills.search}
-            className="skill-search-input"
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder={TEXT.settings.skills.searchPlaceholder}
-            type="search"
-            value={query}
-          />
-        </div>
-      ) : null}
-      {view.kind === "list" ? (
-      <Group>
-        <p className="row-note">{TEXT.settings.skills.scope}</p>
-        {failure ? <small className="row-note is-error" role="alert">{failure}</small> : null}
-        {notice ? <small className="row-note" role="status">{notice}</small> : null}
         <LoadGate loaded={loaded}>
           {(page) => {
             const term = query.trim().toLowerCase();
-            const matches = (name: string, description: string) =>
-              term === "" || name.toLowerCase().includes(term) || description.toLowerCase().includes(term);
-            const skills = page.skills.filter((skill) => matches(skill.name, skill.description));
-            const jiuwenSwarmSkills = page.jiuwenSwarmSkills.filter((skill) => matches(skill.name, skill.description));
-            const noMatches = term !== "" && skills.length === 0 && jiuwenSwarmSkills.length === 0;
+            const allRows = [...page.skills, ...page.jiuwenSwarmSkills];
+            const rows = visibleRows(page, scope, term);
+            const emptyMessage = allRows.length === 0
+              ? TEXT.settings.skills.empty
+              : rows.length > 0
+                ? undefined
+                : term !== ""
+                  ? TEXT.settings.skills.noMatches
+                  : TEXT.settings.skills.emptyScope;
+            const tagFor = (skill: SkillDescriptor | JiuwenSwarmSkill) =>
+              rowScope(skill) === "official"
+                ? TEXT.settings.skills.cardTag.builtIn
+                : TEXT.settings.skills.cardTag.external;
+            const markFor = (skill: { name: string }) => (
+              <span
+                aria-hidden="true"
+                className={`settings-card-mark skill-card-mark is-${markTone(skill.name)}`}
+              >
+                {skillMark(skill)}
+              </span>
+            );
+            /** A package the catalog owns: its title opens the package's page,
+             *  and its actions are export, edit and delete. */
+            const renderCatalog = (skill: SkillDescriptor) => {
+              const key = catalogKey(skill.id);
+              const on = intent[key] ?? page.enabled.includes(skill.id);
+              return (
+                <article className="settings-card skill-card" key={skill.id}>
+                  <div className="skill-card-head">
+                    {markFor(skill)}
+                    <button
+                      className="settings-card-main"
+                      onClick={() => goTo({
+                        description: skill.description,
+                        id: skill.id,
+                        kind: "detail",
+                        name: skill.name,
+                      })}
+                      type="button"
+                    >
+                      <strong>{markedName(skill.name, term)}</strong>
+                      <span className="skill-card-tag">{tagFor(skill)}</span>
+                    </button>
+                    <div className="settings-card-actions">
+                      <Switch
+                        disabled={busy || !page.switchesAvailable || bulkPending || pending.has(key)}
+                        label={TEXT.settings.skills.toggle(skill.name)}
+                        onChange={(next) => void toggle(key, skill, next)}
+                        value={on}
+                      />
+                      <SkillRowMenu
+                        canDelete={skill.source === "managed"}
+                        canEdit={skill.source === "managed" && !skill.readOnly}
+                        disabled={busy}
+                        name={skill.name}
+                        onAction={(action) => chooseRowAction(skill, action)}
+                      />
+                    </div>
+                  </div>
+                  <p className="skill-card-desc">{skill.description}</p>
+                  {exportStatus?.id === skill.id ? (
+                    <span
+                      className={`skill-export-status${exportStatus.error ? " is-error" : ""}`}
+                      role={exportStatus.error ? "alert" : "status"}
+                    >
+                      {exportStatus.message}
+                    </span>
+                  ) : null}
+                </article>
+              );
+            };
+            /** A skill only JiuwenSwarm knows. It has no page of its own here,
+             *  so its title is text and its one action is the switch. */
+            const renderSwarm = (skill: JiuwenSwarmSkill) => {
+              const key = jiuwenKey(skill.name);
+              const on = intent[key] ?? skill.enabled;
+              return (
+                <article className="settings-card skill-card" key={`jiuwenswarm:${skill.name}`}>
+                  <div className="skill-card-head">
+                    {markFor(skill)}
+                    <div className="settings-card-main is-static">
+                      <strong>{markedName(skill.name, term)}</strong>
+                      <span className="skill-card-tag">{tagFor(skill)}</span>
+                    </div>
+                    <div className="settings-card-actions">
+                      <Switch
+                        disabled={busy || !page.switchesAvailable || bulkPending || pending.has(key)}
+                        label={TEXT.settings.skills.toggle(skill.name)}
+                        onChange={(next) => void toggle(key, skill, next)}
+                        value={on}
+                      />
+                    </div>
+                  </div>
+                  <p className="skill-card-desc">{skill.description}</p>
+                </article>
+              );
+            };
             return (
-              <div className="settings-list">
+              <>
                 {page.native ? <p className="row-note">{TEXT.settings.skills.jiuwenSwarmOnly}</p> : null}
                 {page.switchError ? <div className="row-note is-error" role="alert">
                   {page.switchError}
@@ -603,102 +909,23 @@ export function SkillsSettings({ client, onConfirm }: Props) {
                     {TEXT.settings.retry}
                   </button>
                 </div> : null}
-                {page.skills.length === 0 && page.jiuwenSwarmSkills.length === 0
-                  ? <p className="settings-empty">{TEXT.settings.skills.empty}</p>
-                  : noMatches
-                    ? <p className="settings-empty">{TEXT.settings.skills.noMatches}</p>
-                    : page.switchesAvailable
-                      ? <BulkToggles busy={busy || bulkPending} onAll={(next) => void setAll(next)} />
-                      : null}
-                {skills.map((skill) => {
-                  const key = catalogKey(skill.id);
-                  const on = intent[key] ?? page.enabled.includes(skill.id);
-                  return (
-                    <div className="settings-card" key={skill.id}>
-                      <span className="settings-card-mark">{skillMark(skill)}</span>
-                      <button
-                        className="settings-card-main"
-                        onClick={() => setView({
-                          description: skill.description,
-                          id: skill.id,
-                          kind: "detail",
-                          name: skill.name,
-                        })}
-                        type="button"
-                      >
-                        <strong>
-                          {skill.name}
-                          {page.switchesAvailable ? <Tag tone={on ? "on" : "off"}>
-                            {on ? TEXT.settings.skills.on : TEXT.settings.skills.off}
-                          </Tag> : null}
-                        </strong>
-                        <small>{skill.description}</small>
-                        <span className={`skill-source-badge ${skill.source === "built-in" ? "is-sd" : "is-managed"}`}>
-                          {sourceLabel(skill.source)}
-                        </span>
-                      </button>
-                      {exportStatus?.id === skill.id ? (
-                        <span
-                          className={`skill-export-status${exportStatus.error ? " is-error" : ""}`}
-                          role={exportStatus.error ? "alert" : "status"}
-                        >
-                          {exportStatus.message}
-                        </span>
-                      ) : null}
-                      <div className="settings-card-actions">
-                        {skill.source === "managed" || skill.source === "built-in" ? (
-                          <SkillRowMenu
-                            canDelete={skill.source === "managed"}
-                            canEdit={skill.source === "managed" && !skill.readOnly}
-                            disabled={busy}
-                            name={skill.name}
-                            onAction={(action) => chooseRowAction(skill, action)}
-                          />
-                        ) : null}
-                        <Switch
-                          disabled={busy || !page.switchesAvailable || bulkPending || pending.has(key)}
-                          label={TEXT.settings.skills.toggle(skill.name)}
-                          onChange={(next) => void toggle(key, skill, next)}
-                          value={on}
-                        />
-                      </div>
+                {failure ? <small className="row-note is-error" role="alert">{failure}</small> : null}
+                {notice ? <small className="row-note" role="status">{notice}</small> : null}
+                <div aria-labelledby="skill-tabs" id="skill-list-panel" role="tabpanel">
+                  {emptyMessage === undefined ? (
+                    <div className="settings-list skill-grid">
+                      {rows.map((row) => (
+                        row.kind === "catalog" ? renderCatalog(row.skill) : renderSwarm(row.skill)
+                      ))}
                     </div>
-                  );
-                })}
-                {jiuwenSwarmSkills.map((skill) => {
-                  const key = jiuwenKey(skill.name);
-                  const on = intent[key] ?? skill.enabled;
-                  return (
-                    <div className="settings-card" key={`jiuwenswarm:${skill.name}`}>
-                      <span className="settings-card-mark">{skillMark(skill)}</span>
-                      <div className="settings-card-main">
-                        <strong>
-                          {skill.name}
-                          <Tag tone={on ? "on" : "off"}>
-                            {on ? TEXT.settings.skills.on : TEXT.settings.skills.off}
-                          </Tag>
-                        </strong>
-                        <small>{skill.description}</small>
-                        <span className={`skill-source-badge ${skill.source === "builtin" ? "is-jiuwenswarm" : "is-managed"}`}>
-                          {skill.source === "builtin" ? TEXT.settings.skills.source.jiuwenBuiltIn : TEXT.settings.skills.source.jiuwenLocal}
-                        </span>
-                      </div>
-                      <div className="settings-card-actions">
-                        <Switch
-                          disabled={busy || !page.switchesAvailable || bulkPending || pending.has(key)}
-                          label={TEXT.settings.skills.toggle(skill.name)}
-                          onChange={(next) => void toggle(key, skill, next)}
-                          value={on}
-                        />
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
+                  ) : (
+                    <p className="settings-empty">{emptyMessage}</p>
+                  )}
+                </div>
+              </>
             );
           }}
         </LoadGate>
-      </Group>
       ) : null}
 
       {view.kind === "create" ? (
@@ -707,37 +934,94 @@ export function SkillsSettings({ client, onConfirm }: Props) {
         </div>
       ) : null}
 
-      {view.kind === "upload" ? (
-        <SkillUploadView
-          client={client}
-          onImported={afterInstall}
-          onWriteInstead={() => setView({ kind: "create" })}
-        />
+      {dialog === "upload" ? (
+        <SkillDialog
+          onClose={() => setDialog(undefined)}
+          title={TEXT.settings.skills.addMenu.upload}
+        >
+          <SkillUploadView
+            client={client}
+            onCancel={() => setDialog(undefined)}
+            onImported={async (skill) => {
+              setDialog(undefined);
+              // Say what actually happened: a package that arrived but could
+              // not be switched on is not "uploaded" in the sense the reader
+              // needs, and the success notice would talk them out of looking.
+              const problem = await afterInstall(skill);
+              setUploadToast(problem === undefined
+                ? {
+                  id: Date.now(),
+                  kind: "success",
+                  message: TEXT.settings.skills.toastUploadDone(skill.name),
+                }
+                : {
+                  id: Date.now(),
+                  kind: "error",
+                  message: TEXT.settings.skills.toastUploadNotEnabled(skill.name),
+                  detail: problem,
+                });
+            }}
+          />
+        </SkillDialog>
       ) : null}
 
-      {view.kind === "git" ? (
-        <SkillGitImportView
-          client={client}
-          onDone={() => setView({ kind: "list" })}
-          onStart={async (request) => {
-            await startGitSkillImportInBackground(client, request);
-          }}
-        />
+      {dialog === "git" ? (
+        <SkillDialog
+          onClose={() => setDialog(undefined)}
+          title={TEXT.settings.skills.git.title}
+        >
+          <SkillGitImportView
+            client={client}
+            job={backgroundImport}
+            onCancel={() => setDialog(undefined)}
+            onStart={async (request) => {
+              setLastGitRequest(request);
+              await startGitSkillImportInBackground(client, request);
+            }}
+          />
+        </SkillDialog>
       ) : null}
 
       {view.kind === "detail" ? (
-        <SkillDetailView client={client} skillId={view.id} />
+        <SkillDetailView
+          client={client}
+          enabled={intent[catalogKey(view.id)] ?? loaded.value?.enabled.includes(view.id) ?? false}
+          initialTab={view.tab}
+          onBack={back}
+          onDelete={(skill) => void removeSkill(skill)}
+          onEdit={(skill) => goTo({ id: skill.id, kind: "edit", name: skill.name })}
+          onToggle={(skill, next) => void toggle(catalogKey(skill.id), skill, next)}
+          pending={busy || bulkPending || pending.has(catalogKey(view.id))}
+          skillId={view.id}
+          switchesAvailable={loaded.value?.switchesAvailable ?? false}
+        />
       ) : null}
 
       {view.kind === "edit" ? (
-        <SkillEditorView
+        <SkillFileEditorView
           client={client}
-          onCancel={back}
-          onSaved={() => loaded.reload()}
+          onCancel={() => goTo({
+            description: "",
+            id: view.id,
+            kind: "detail",
+            name: view.name,
+            tab: "files",
+          })}
+          onSaved={(skill) => {
+            loaded.reload();
+            goTo({
+              description: skill.description,
+              id: skill.id,
+              kind: "detail",
+              name: skill.name,
+              tab: "files",
+            });
+          }}
           skillId={view.id}
         />
       ) : null}
       </div>
+      <SkillToasts items={toasts} />
     </div>
   );
 }

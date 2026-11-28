@@ -34,6 +34,7 @@ import type {
   CreateSkillPackageRequest,
   CreateSkillRequest,
   CreateSkillDialogueDraftRequest,
+  DeleteSkillFileRequest,
   DistillSessionSkillRequest,
   ExecutionRun,
   CreateGitSkillReviewDraftsRequest,
@@ -44,9 +45,11 @@ import type {
   InspectGitSkillRepositoryRequest,
   StartGitSkillImportJobRequest,
   MergeSkillReviewDraftsRequest,
+  RenameSkillFileRequest,
   SkillDescriptor,
   SkillDetail,
   SkillPackageFileBytes,
+  SkillPackageRefusal,
   SkillResource,
   SkillResourceContent,
   SkillResourceKind,
@@ -57,7 +60,9 @@ import type {
   SkillVersionSummary,
   SkillVersionProvenance,
   SkillDraft,
+  SkillMarkdownContent,
   SkillValidationDiagnostic,
+  UpdateSkillMarkdownRequest,
   UpdateSkillRequest,
   UpdateSkillFileRequest,
 } from "@sciencediscovery/schema";
@@ -633,9 +638,18 @@ export async function checkoutGitSkillRepository(
   }
 }
 
-function payloadTooLarge(message: string): NodeJS.ErrnoException {
+/** Attach the structured reason to an error that already carries the prose.
+ *  The property is deliberately not part of the public error contract: only
+ *  the HTTP layer reads it, to pass the reason on to the client. */
+function refused<T extends Error>(error: T, refusal: SkillPackageRefusal): T {
+  (error as T & { skillRefusal?: SkillPackageRefusal }).skillRefusal = refusal;
+  return error;
+}
+
+function payloadTooLarge(message: string, refusal?: SkillPackageRefusal): NodeJS.ErrnoException {
   const error = new Error(message) as NodeJS.ErrnoException;
   error.code = "PAYLOAD_TOO_LARGE";
+  if (refusal) (error as NodeJS.ErrnoException & { skillRefusal?: SkillPackageRefusal }).skillRefusal = refusal;
   return error;
 }
 
@@ -747,7 +761,12 @@ export function validateSkillPackage(
   } = {},
 ): LoadedPackage {
   if (!sourceFiles.size) throw validationError("Skill package is empty");
-  if (sourceFiles.size > SKILL_LIMITS.files) throw payloadTooLarge(`Skill package exceeds ${SKILL_LIMITS.files} files`);
+  if (sourceFiles.size > SKILL_LIMITS.files) {
+    throw payloadTooLarge(
+      `Skill package exceeds ${SKILL_LIMITS.files} files`,
+      { reason: "too-large", limit: "files", actual: sourceFiles.size, cap: SKILL_LIMITS.files },
+    );
+  }
   const files = new Map<string, Buffer>();
   let extractedBytes = 0;
   for (const [rawPath, sourceBytes] of sourceFiles) {
@@ -755,12 +774,32 @@ export function validateSkillPackage(
     if (files.has(path)) throw validationError(`Duplicate normalized skill package path: ${path}`);
     const bytes = Buffer.from(sourceBytes);
     const limit = path === "SKILL.md" ? SKILL_LIMITS.skillMarkdownBytes : SKILL_LIMITS.resourceBytes;
-    if (bytes.length > limit) throw payloadTooLarge(`${path} exceeds ${limit} bytes`);
+    if (bytes.length > limit) {
+      throw payloadTooLarge(
+        `${path} exceeds ${limit} bytes`,
+        { reason: "too-large", limit: path === "SKILL.md" ? "markdown-bytes" : "resource-bytes", actual: bytes.length, cap: limit, path },
+      );
+    }
     extractedBytes += bytes.length;
     if (extractedBytes > SKILL_LIMITS.extractedBytes) {
-      throw payloadTooLarge(`Skill package exceeds ${SKILL_LIMITS.extractedBytes} extracted bytes`);
+      throw payloadTooLarge(
+        `Skill package exceeds ${SKILL_LIMITS.extractedBytes} extracted bytes`,
+        { reason: "too-large", limit: "extracted-bytes", actual: extractedBytes, cap: SKILL_LIMITS.extractedBytes },
+      );
     }
     files.set(path, bytes);
+  }
+  // A path cannot be both a file and a folder. The writer would have to mkdir
+  // a path that a file now occupies (or the reverse) after the revision was
+  // committed, and that surfaces as a raw EEXIST rather than a package error.
+  for (const path of files.keys()) {
+    const segments = path.split("/");
+    for (let depth = 1; depth < segments.length; depth += 1) {
+      const ancestor = segments.slice(0, depth).join("/");
+      if (files.has(ancestor)) {
+        throw validationError(`Skill package path is both a file and a folder: ${ancestor}`);
+      }
+    }
   }
   const skillMarkdown = files.get("SKILL.md");
   if (!skillMarkdown) throw validationError("Skill package must contain SKILL.md at its root");
@@ -894,7 +933,10 @@ async function writePackageDirectory(root: string, files: ReadonlyMap<string, Bu
 
 function inspectZip(bytes: Buffer): void {
   if (bytes.length > SKILL_LIMITS.archiveBytes) {
-    throw payloadTooLarge(`Skill archive exceeds ${SKILL_LIMITS.archiveBytes} bytes`);
+    throw payloadTooLarge(
+      `Skill archive exceeds ${SKILL_LIMITS.archiveBytes} bytes`,
+      { reason: "too-large", limit: "archive-bytes", actual: bytes.length, cap: SKILL_LIMITS.archiveBytes },
+    );
   }
   let eocd = -1;
   for (let offset = Math.max(0, bytes.length - 65_557); offset <= bytes.length - 22; offset += 1) {
@@ -904,7 +946,12 @@ function inspectZip(bytes: Buffer): void {
   const entries = bytes.readUInt16LE(eocd + 10);
   const centralOffset = bytes.readUInt32LE(eocd + 16);
   if (entries === 0xffff || centralOffset === 0xffffffff) throw validationError("ZIP64 skill archives are not supported");
-  if (entries > SKILL_LIMITS.files) throw payloadTooLarge(`Skill archive exceeds ${SKILL_LIMITS.files} entries`);
+  if (entries > SKILL_LIMITS.files) {
+    throw payloadTooLarge(
+      `Skill archive exceeds ${SKILL_LIMITS.files} entries`,
+      { reason: "too-large", limit: "entries", actual: entries, cap: SKILL_LIMITS.files },
+    );
+  }
   let offset = centralOffset;
   let extractedBytes = 0;
   for (let index = 0; index < entries; index += 1) {
@@ -925,11 +972,18 @@ function inspectZip(bytes: Buffer): void {
       throw validationError("Skill ZIP cannot contain symlinks");
     }
     if (originalSize > SKILL_LIMITS.resourceBytes) {
-      throw payloadTooLarge(`Skill ZIP entry exceeds ${SKILL_LIMITS.resourceBytes} bytes`);
+      const entryPath = bytes.subarray(offset + 46, offset + 46 + nameLength).toString("utf8");
+      throw payloadTooLarge(
+        `Skill ZIP entry exceeds ${SKILL_LIMITS.resourceBytes} bytes`,
+        { reason: "too-large", limit: "entry-bytes", actual: originalSize, cap: SKILL_LIMITS.resourceBytes, path: entryPath },
+      );
     }
     extractedBytes += originalSize;
     if (extractedBytes > SKILL_LIMITS.extractedBytes) {
-      throw payloadTooLarge(`Skill archive exceeds ${SKILL_LIMITS.extractedBytes} extracted bytes`);
+      throw payloadTooLarge(
+        `Skill archive exceeds ${SKILL_LIMITS.extractedBytes} extracted bytes`,
+        { reason: "too-large", limit: "extracted-bytes", actual: extractedBytes, cap: SKILL_LIMITS.extractedBytes },
+      );
     }
     offset += 46 + nameLength + extraLength + commentLength;
   }
@@ -950,7 +1004,15 @@ function extractZip(bytes: Buffer): Map<string, Buffer> {
         extractedBytes += chunk.length;
         if (fileBytes > SKILL_LIMITS.resourceBytes || extractedBytes > SKILL_LIMITS.extractedBytes) {
           file.terminate();
-          throw payloadTooLarge(`Skill archive exceeds extracted byte limits`);
+          throw fileBytes > SKILL_LIMITS.resourceBytes
+            ? payloadTooLarge(
+              `Skill archive exceeds extracted byte limits`,
+              { reason: "too-large", limit: "resource-bytes", actual: fileBytes, cap: SKILL_LIMITS.resourceBytes, path },
+            )
+            : payloadTooLarge(
+              `Skill archive exceeds extracted byte limits`,
+              { reason: "too-large", limit: "extracted-bytes", actual: extractedBytes, cap: SKILL_LIMITS.extractedBytes },
+            );
         }
         chunks.push(Buffer.from(chunk));
       }
@@ -970,15 +1032,26 @@ function extractZip(bytes: Buffer): Map<string, Buffer> {
 function stripArchiveRoot(files: ReadonlyMap<string, Buffer>): { directoryName?: string; files: Map<string, Buffer> } {
   if (files.has("SKILL.md")) return { files: cloneFiles(files) };
   const firstSegments = new Set([...files.keys()].map((path) => path.split("/")[0]!));
-  if (firstSegments.size !== 1) throw validationError("Skill ZIP must contain one package root");
+  if (firstSegments.size !== 1) {
+    throw refused(validationError("Skill ZIP must contain one package root"), { reason: "several-roots" });
+  }
   const directoryName = [...firstSegments][0]!;
   const prefix = `${directoryName}/`;
+  if (![...files.keys()].some((path) => path.startsWith(prefix))) {
+    // The one top-level entry is a file, not a directory: an archive of loose
+    // files has no package root at all, rather than files outside one.
+    throw refused(validationError("Skill ZIP package root must contain SKILL.md"), { reason: "missing-root" });
+  }
   const stripped = new Map<string, Buffer>();
   for (const [path, bytes] of files) {
-    if (!path.startsWith(prefix)) throw validationError("Skill ZIP contains entries outside its package root");
+    if (!path.startsWith(prefix)) {
+      throw refused(validationError("Skill ZIP contains entries outside its package root"), { reason: "outside-root" });
+    }
     stripped.set(path.slice(prefix.length), Buffer.from(bytes));
   }
-  if (!stripped.has("SKILL.md")) throw validationError("Skill ZIP package root must contain SKILL.md");
+  if (!stripped.has("SKILL.md")) {
+    throw refused(validationError("Skill ZIP package root must contain SKILL.md"), { reason: "missing-root" });
+  }
   return { directoryName, files: stripped };
 }
 
@@ -2323,6 +2396,141 @@ export class SkillCatalog {
       const loaded = validateSkillPackage(files, { directoryName: id, revision });
       const committed = await this.commitManaged(loaded, revision, new Date().toISOString(), {
         ...(input.sourceSessionId ? { sessionId: input.sourceSessionId } : {}),
+        source: "manual",
+      });
+      const previous = this.index.managed[id]!;
+      this.index.managed[id] = { currentRevision: revision };
+      try {
+        await this.saveIndex();
+      } catch (error) {
+        this.index.managed[id] = previous;
+        await rm(this.revisionRoot(id, revision), { force: true, recursive: true });
+        throw error;
+      }
+      this.managed.set(id, committed);
+      return structuredClone(committed.detail);
+    });
+  }
+
+  /** The raw bytes of SKILL.md, frontmatter included: the file editor shows
+   *  the document it is about to write back. */
+  readSkillMarkdown(id: string): SkillMarkdownContent {
+    this.assertLoaded();
+    const value = this.builtIns.get(id) ?? this.managed.get(id);
+    if (!value) throw new SkillCatalogError("SKILL_NOT_FOUND", `Skill not found: ${id}`);
+    const bytes = value.files.get("SKILL.md");
+    if (!bytes) throw new SkillCatalogError("SKILL_NOT_FOUND", `SKILL.md is missing: ${id}`);
+    return { content: bytes.toString("utf8"), revision: value.detail.currentRevision, skillId: id };
+  }
+
+  /** Replace SKILL.md with the text the editor showed. The package is
+   *  validated after the write, so a bad frontmatter or a renamed identity is
+   *  refused instead of committed. */
+  async updateSkillMarkdown(id: string, input: UpdateSkillMarkdownRequest): Promise<SkillDetail> {
+    return await this.mutate(async () => {
+      this.assertLoaded();
+      if (this.builtIns.has(id)) throw new SkillCatalogError("SKILL_READ_ONLY", `Built-in skill is read-only: ${id}`);
+      const current = this.managed.get(id);
+      if (!current) throw new SkillCatalogError("SKILL_NOT_FOUND", `Skill not found: ${id}`);
+      if (input.expectedRevision !== current.detail.currentRevision) {
+        throw new SkillCatalogError("SKILL_CONFLICT", `Skill revision conflict: expected ${input.expectedRevision}, current ${current.detail.currentRevision}`);
+      }
+      const revision = current.detail.currentRevision + 1;
+      const files = cloneFiles(current.files);
+      files.set("SKILL.md", Buffer.from(input.content, "utf8"));
+      const loaded = validateSkillPackage(files, { directoryName: id, revision });
+      const committed = await this.commitManaged(loaded, revision, new Date().toISOString(), {
+        source: "manual",
+      });
+      const previous = this.index.managed[id]!;
+      this.index.managed[id] = { currentRevision: revision };
+      try {
+        await this.saveIndex();
+      } catch (error) {
+        this.index.managed[id] = previous;
+        await rm(this.revisionRoot(id, revision), { force: true, recursive: true });
+        throw error;
+      }
+      this.managed.set(id, committed);
+      return structuredClone(committed.detail);
+    });
+  }
+
+  /** Remove one resource, or every resource under a folder path. SKILL.md is
+   *  the package's identity and is never removed here; deleting the Skill is
+   *  the catalog's own operation. */
+  async deleteFile(id: string, rawPath: string, input: DeleteSkillFileRequest): Promise<SkillDetail> {
+    return await this.mutate(async () => {
+      this.assertLoaded();
+      if (this.builtIns.has(id)) throw new SkillCatalogError("SKILL_READ_ONLY", `Built-in skill is read-only: ${id}`);
+      const current = this.managed.get(id);
+      if (!current) throw new SkillCatalogError("SKILL_NOT_FOUND", `Skill not found: ${id}`);
+      if (input.expectedRevision !== current.detail.currentRevision) {
+        throw new SkillCatalogError("SKILL_CONFLICT", `Skill revision conflict: expected ${input.expectedRevision}, current ${current.detail.currentRevision}`);
+      }
+      const path = normalizedPackagePath(rawPath);
+      if (path === "SKILL.md") throw validationError("SKILL.md cannot be deleted");
+      const targets = [...current.files.keys()].filter((candidate) => candidate === path || candidate.startsWith(`${path}/`));
+      if (targets.length === 0) throw new SkillCatalogError("SKILL_NOT_FOUND", `Skill file not found: ${path}`);
+      const revision = current.detail.currentRevision + 1;
+      const files = cloneFiles(current.files);
+      for (const target of targets) files.delete(target);
+      const loaded = validateSkillPackage(files, { directoryName: id, revision });
+      const committed = await this.commitManaged(loaded, revision, new Date().toISOString(), {
+        source: "manual",
+      });
+      const previous = this.index.managed[id]!;
+      this.index.managed[id] = { currentRevision: revision };
+      try {
+        await this.saveIndex();
+      } catch (error) {
+        this.index.managed[id] = previous;
+        await rm(this.revisionRoot(id, revision), { force: true, recursive: true });
+        throw error;
+      }
+      this.managed.set(id, committed);
+      return structuredClone(committed.detail);
+    });
+  }
+
+  /** Move a file, or a folder and everything under it, to a new path. */
+  async renameFile(id: string, rawFrom: string, input: RenameSkillFileRequest): Promise<SkillDetail> {
+    return await this.mutate(async () => {
+      this.assertLoaded();
+      if (this.builtIns.has(id)) throw new SkillCatalogError("SKILL_READ_ONLY", `Built-in skill is read-only: ${id}`);
+      const current = this.managed.get(id);
+      if (!current) throw new SkillCatalogError("SKILL_NOT_FOUND", `Skill not found: ${id}`);
+      if (input.expectedRevision !== current.detail.currentRevision) {
+        throw new SkillCatalogError("SKILL_CONFLICT", `Skill revision conflict: expected ${input.expectedRevision}, current ${current.detail.currentRevision}`);
+      }
+      const from = normalizedPackagePath(rawFrom);
+      const to = normalizedPackagePath(input.to);
+      if (from === "SKILL.md" || to === "SKILL.md" || to.startsWith("SKILL.md/")) {
+        throw validationError("SKILL.md keeps its name");
+      }
+      if (to === from || to.startsWith(`${from}/`)) {
+        throw validationError(`A file cannot be moved into itself: ${from} -> ${to}`);
+      }
+      const moved = [...current.files.keys()].filter((candidate) => candidate === from || candidate.startsWith(`${from}/`));
+      if (moved.length === 0) throw new SkillCatalogError("SKILL_NOT_FOUND", `Skill file not found: ${from}`);
+      const renamed = new Map(moved.map((candidate) => [
+        candidate,
+        candidate === from ? to : `${to}${candidate.slice(from.length)}`,
+      ]));
+      const movedSet = new Set(moved);
+      for (const target of renamed.values()) {
+        if (current.files.has(target) && !movedSet.has(target)) {
+          throw validationError(`A file already exists at ${target}`);
+        }
+      }
+      const revision = current.detail.currentRevision + 1;
+      const files = cloneFiles(current.files);
+      for (const source of moved) files.delete(source);
+      for (const [source, target] of renamed) {
+        files.set(target, Buffer.from(current.files.get(source)!));
+      }
+      const loaded = validateSkillPackage(files, { directoryName: id, revision });
+      const committed = await this.commitManaged(loaded, revision, new Date().toISOString(), {
         source: "manual",
       });
       const previous = this.index.managed[id]!;

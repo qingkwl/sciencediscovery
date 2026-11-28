@@ -772,7 +772,13 @@ export async function installMockApi(page: Page, options: MockOptions = {}): Pro
         const index = state.mcpServers.findIndex((entry) => entry.id === mcpServer[1]);
         if (index === -1) return json(route, 404, { error: "mcp server not found" });
         if (method === "PUT") {
-          state.mcpServers[index] = { ...state.mcpServers[index], ...JSON.parse(body ?? "{}") };
+          const patch = JSON.parse(body ?? "{}");
+          const updated = { ...state.mcpServers[index], ...patch };
+          // The product derives readiness from enablement and its latest check.
+          if (typeof patch.enabled === "boolean") {
+            updated.status = !updated.enabled ? "disabled" : updated.error ? "error" : updated.checkedAt ? "ready" : "untested";
+          }
+          state.mcpServers[index] = updated;
           return json(route, 200, state.mcpServers[index]);
         }
         if (method === "DELETE") {
@@ -786,7 +792,19 @@ export async function installMockApi(page: Page, options: MockOptions = {}): Pro
       }
 
       if (path === "/api/timeout-settings" && method === "PUT") {
-        state.timeouts = JSON.parse(body ?? "{}") as Record<string, number>;
+        const next = JSON.parse(body ?? "{}") as Record<string, number>;
+        const idle = next.gatewayIdleTimeoutMs ?? 0;
+        const turn = next.gatewayTurnTimeoutMs ?? 0;
+        // The product's store refuses a finite turn limit below a finite idle
+        // limit (`normalizeTimeoutSettings` in services/api/src/store/settings.ts).
+        // The mock answers like that store, so a page that skips its own check
+        // fails here instead of only in production.
+        if (idle > 0 && turn > 0 && turn < idle) {
+          return json(route, 400, {
+            error: "gatewayTurnTimeoutMs must be greater than or equal to gatewayIdleTimeoutMs when both timeouts are finite",
+          });
+        }
+        state.timeouts = next;
         return json(route, 200, state.timeouts);
       }
 

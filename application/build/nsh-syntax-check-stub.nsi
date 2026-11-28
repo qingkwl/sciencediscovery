@@ -77,7 +77,15 @@ InstallDir "$LOCALAPPDATA\Programs"
 !define MENU_FILENAME "ScienceDiscovery"
 !define APP_ID "cn.sciencediscovery.desktop"
 !define PROJECT_DIR "."
-!define BUILD_RESOURCES_DIR "build"
+; BUILD_RESOURCES_DIR: the real run passes an ABSOLUTE path (out/targets/nsis/
+; NsisTarget.js:170). A relative "build" is wrong twice over for the stub:
+; File instructions resolve relative paths against the SCRIPT's own dir
+; (application\build\), so "build\extra\..." would look for
+; application\build\build\extra\... — the first stub version's
+; "no files found" compile error proved that. "./" makes NSIS resolve
+; against CWD instead, which scripts/nsh-syntax-check.mjs sets to
+; application/ — where build/extra/install_prewarm_sentinel.ps1 lives.
+!define BUILD_RESOURCES_DIR "./"
 ; electron-builder sets this for nsis.allowToChangeInstallationDirectory:true,
 ; which is what makes assistedInstaller.nsh:23 include StrContains.nsh and :42
 ; expand customPageAfterChangeDir — the two things installer.nsh depends on.

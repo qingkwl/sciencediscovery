@@ -29,9 +29,9 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { copyFile, cp, mkdir, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
-import { existsSync, lstatSync, readFileSync, readlinkSync } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { existsSync, lstatSync, readdirSync, readFileSync, readlinkSync } from "node:fs";
+import { dirname, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   copyVenvRuntimeDlls, greenletRuntimeProblem, greenletVersionAtLeast,
   replaceVenvSymlinks, pythonNamesFor, relocatablePythonTree,
@@ -555,6 +555,39 @@ for (const { src, dest } of copySet) {
   await mkdir(dirname(dest), { recursive: true });
   await cp(src, dest, { recursive: true, force: true });
 }
+
+// [W27] The desktop SPA's HUAWEI sign-in URL is baked at build time from
+// VITE_ACCOUNTS_API (apps/desktop/.env.production is the production default).
+// A bundle built with NO value anywhere compiles buildEnv() to "" — "same
+// origin" — and the sign-in button then navigates to a path the local API's
+// static fallback answers with index.html: a reload loop that looks like a
+// crash (2026-11-27, 78 navigations observed on one install). The same
+// check covers apps/web, whose browser deployment needs the same absolute
+// origin. Content check, not a re-run of vite: the compiled buildEnv object
+// literal carries the URL verbatim, so its absence in the bundle is the
+// defect itself. Dev/e2e bundles (mode=development) never reach this copy.
+for (const appDir of ["apps/desktop", "apps/web"]) {
+  const distDir = join(backendOut, appDir.replace("/", sep), "dist", "assets");
+  let baked = false;
+  if (existsSync(distDir)) {
+    for (const f of await readdir(distDir)) {
+      if (!f.endsWith(".js")) continue;
+      const text = await readFile(join(distDir, f), "utf8");
+      if (text.includes("https://sciencediscovery.openjiuwen.com/accounts")) { baked = true; break; }
+    }
+  }
+  if (!baked) {
+    fail(
+      `[W27] ${appDir} bundle does not carry the accounts origin. `
+      + "The HUAWEI sign-in URL is compiled from VITE_ACCOUNTS_API; with no "
+      + "value the button navigates to a same-origin path the SPA fallback "
+      + "swallows (reload loop, see problems/W27). Build the bundle with the "
+      + "env set (apps/*/.env.production is the default) — pnpm --filter "
+      + `${appDir === "apps/desktop" ? "@sciencediscovery/desktop" : "@sciencediscovery/web"} build.`,
+    );
+  }
+  say(`${appDir}: accounts origin baked into the bundle (W27 guard)`);
+}
 // If a prepared SEA directory was staged under services/runner/dist, remove
 // that duplicate after copying it to the node_modules layout above.
 await rm(join(backendOut, "services", "runner", "dist", "sea"), { recursive: true, force: true });
@@ -710,6 +743,10 @@ await sweepNodeModules(jwSrcOut);
 
 // Rewrite the setuptools editable finder so package paths resolve relative to
 // wherever the payload got installed (site-packages → .venv → src).
+// [D3 P3-4 RETIREMENT MARKER — venv-rail step] The frozen exe has no
+// editable installs (its imports resolve from the PYZ); this whole
+// rewrite retires with the jw venv staging. Keep until the P4 window
+// closes — it is load-bearing for the venv rail the rollback uses.
 const finderGlob = /^(?:__editable___.*_finder\.py)$/;
 const sitePackages = join(jwSrcOut, ".venv", ...dialect.sitePackages(PYTHON_MINOR).split("/"));
 // parents[N] must land exactly on the jw src root: N is derived from the
@@ -744,6 +781,54 @@ for (const e of await readdir(sitePackages, { withFileTypes: true })) {
   lines.splice(idx, 1, `_SRC = Path(__file__).resolve().parents[${anchorLevel}]`, `MAPPING: dict[str, str] = {${rewritten}}`);
   await writeFile(file, lines.join("\n"), "utf8");
   say(`rewrote editable finder ${e.name} (paths now resolve relative to the payload)`);
+}
+
+// ---------------------------------------------------------------------------
+// 5.5 JiuwenSwarm frozen onedir (D3 P1-5)
+//
+// Build the frozen sd-jw exe from the STAGED jw src tree's venv and place it
+// at backend/jw/frozen/sd-jw/ — the layout jiuwenswarm.mjs's frozenJwExe()
+// resolves (P1-3). The venv+src staging above STAYS for the dual-rail
+// verification window (SD_JW_FREEZE=0); retirement of that staging is P3-3
+// once P4's window closes.
+//
+// Build contract: PyInstaller runs from the staged tree's OWN venv python
+// (the spec asserts this — collect_* must resolve against exactly the venv
+// the payload ships). CODEBUDDY_SAFE_DELETE_ENABLED=0: PyInstaller's build
+// cleanup triggers the sandbox safe-delete shim at bulk thresholds (lesson
+// L8), killing otherwise-successful builds.
+// ---------------------------------------------------------------------------
+const sdFreezeSpec = join(repo, "application", "scripts", "freeze", "sd-jw.spec");
+if (!existsSync(sdFreezeSpec)) {
+  fail(`D3 freeze spec missing: ${relative(out, sdFreezeSpec)}`);
+}
+{
+  const frozenOut = join(jwPayload, "frozen", "sd-jw");
+  const stagedVenvPython = join(jwPayload, ".venv", dialect.venvBin, dialect.venvPythonName);
+  if (!existsSync(stagedVenvPython)) {
+    fail(`staged jw venv python missing (freeze build source): ${relative(out, stagedVenvPython)}`);
+  }
+  say("building frozen sd-jw onedir (PyInstaller, ~6 min)");
+  try {
+    // payloadCompileEnv (the compileAll env filter, defined later at §7)
+    // is not yet in scope here; build a minimal env instead — the freeze
+    // build child needs PATH and the shim-disable, nothing else exported.
+    // SD_FREEZE_VENV: the spec's venv guard + project_root follow the
+    // STAGED tree when this is set (see sd-jw.spec's staged-mode block).
+    const stagedVenvBin = join(jwPayload, ".venv", dialect.venvBin);
+    const freezeEnv = { ...process.env, CODEBUDDY_SAFE_DELETE_ENABLED: "0", SD_FREEZE_VENV: stagedVenvBin };
+    execFileSync(stagedVenvPython, ["-m", "PyInstaller", "--distpath", frozenOut, "--workpath", join(out, "..", "freeze-work"), sdFreezeSpec, "--noconfirm"], {
+      env: freezeEnv, windowsHide: true, stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024,
+    });
+  } catch (error) {
+    const detail = (error.stdout?.toString?.() ?? "") + (error.stderr?.toString?.() ?? error.message);
+    fail(`frozen sd-jw build FAILED:\n${detail.slice(0, 4000)}`);
+  }
+  const frozenExe = join(frozenOut, "sd-jw", "sd-jw.exe");
+  if (!existsSync(frozenExe)) {
+    fail(`frozen build produced no exe: ${relative(out, frozenExe)}`);
+  }
+  say(`frozen sd-jw OK: ${relative(out, frozenExe)}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -784,6 +869,125 @@ for (const name of VENV_NAMES) {
     await writeFile(file, `${BACKEND_PLACEHOLDER}${dialect.pthSeparator}${tail}\n`, "utf8");
     say(`placeholdered ${name}/${e.name}`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// 5.5b sd-services frozen onedir (D3 P2-2/P2-5)
+//
+// ORDER: this block MUST run after §6 (envs-template staging) — it builds
+// from the STAGED sd-services venv, which §6 is what copies into place.
+// (First full-assemble run failed here with "staged venv python missing"
+// because 5.5b sat before §6; keep the numbering but not the position.)
+//
+// Same contract as 5.5 but for the shared services venv: build the
+// sd-services exe from the STAGED envs-template venv and place it at
+// backend/envs-template/frozen/sd-services/ — the layout resolveMcpPython
+// (node-client.ts) and config.ts (paperFrozenCommand) probe on the target
+// machine. start-stack.mjs's FROZEN_SERVICES_EXE resolves the same path.
+// The venv staging stays (dual rail); retirement is P3-3.
+// ---------------------------------------------------------------------------
+{
+  const sdServicesSpec = join(repo, "application", "scripts", "freeze", "sd-services.spec");
+  if (!existsSync(sdServicesSpec)) {
+    fail(`D3 services freeze spec missing: ${relative(out, sdServicesSpec)}`);
+  }
+  const frozenOut = join(out, "envs-template", "frozen", "sd-services");
+  const stagedVenvDir = join(out, "envs-template", "sd-services");
+  const stagedVenvPython = join(stagedVenvDir, dialect.venvBin, dialect.venvPythonName);
+  if (!existsSync(stagedVenvPython)) {
+    fail(`staged sd-services venv python missing (freeze build source): ${relative(out, stagedVenvPython)}`);
+  }
+  say("building frozen sd-services onedir (PyInstaller, ~3 min)");
+  try {
+    const stagedVenvBin2 = join(stagedVenvDir, dialect.venvBin);
+    const freezeEnv = { ...process.env, CODEBUDDY_SAFE_DELETE_ENABLED: "0", SD_FREEZE_VENV: stagedVenvBin2 };
+    execFileSync(stagedVenvPython, ["-m", "PyInstaller", "--distpath", frozenOut, "--workpath", join(out, "..", "freeze-work"), sdServicesSpec, "--noconfirm"], {
+      env: freezeEnv, windowsHide: true, stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024,
+    });
+  } catch (error) {
+    const detail = (error.stdout?.toString?.() ?? "") + (error.stderr?.toString?.() ?? error.message);
+    fail(`frozen sd-services build FAILED:\n${detail.slice(0, 4000)}`);
+  }
+  const frozenServicesExe = join(frozenOut, "sd-services", "sd-services.exe");
+  if (!existsSync(frozenServicesExe)) {
+    fail(`frozen services build produced no exe: ${relative(out, frozenServicesExe)}`);
+  }
+  say(`frozen sd-services OK: ${relative(out, frozenServicesExe)}`);
+  // [D3 P3-4, W13 — hollow-exe post-mortem probe] The 5.5b build once
+  // produced an exe whose PYZ contained ZERO sciencediscovery_adapter and
+  // ZERO sciencediscovery_memory_graph modules (collect_submodules silently
+  // emptied by the placeholdered staged venv; only the dispatcher's static
+  // imports survived) — every installed machine then died at the adapter,
+  // the UI's front door. A file-counting manifest cannot see a missing
+  // MODULE, so grep the freeze workdir's PYZ archive TOC (the exact list of
+  // what went into the exe) and require every first-party package to be
+  // present with real submodule depth. This is the probe that would have
+  // caught W13 at build time, and it needs zero cooperation from the
+  // packages (no __main__ entry points, no probe flags).
+  {
+    const pyzToc = join(out, "..", "freeze-work", "sd-services", "PYZ-00.toc");
+    if (!existsSync(pyzToc)) {
+      fail(`frozen exe module probe FAILED: PYZ TOC not found at ${pyzToc}`);
+    }
+    const tocText = readFileSync(pyzToc, "utf8");
+    for (const pkg of ["sciencediscovery_evolve", "sciencediscovery_gateway", "sciencediscovery_adapter", "sciencediscovery_memory_graph"]) {
+      // Count "…'pkg.sub…'" archive entries; the entry form is
+      // ('pkg.module', 'path.pyc', 'PYZ-00.pyz', ...). The bare package
+      // root counts as 1, so a healthy sweep is always >= 1; W13's hollow
+      // builds scored exactly 0 for adapter/memory_graph.
+      const re = new RegExp(`'${pkg}(?:\\.[A-Za-z0-9_]+)?'`, "g");
+      const hits = tocText.match(re)?.length ?? 0;
+      if (hits < 2) {
+        fail(`frozen exe module probe FAILED: ${pkg} has ${hits} module(s) in the PYZ (hollow exe — W13 regression). Refusing to ship.`);
+      }
+      say(`frozen exe module probe OK: ${pkg} (${hits} modules)`);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 5.5c frozen-payload integrity manifest (D3 P3-1)
+//
+// ORDER: MUST run after BOTH 5.5 (jw freeze) and 5.5b (services freeze) —
+// it snapshots the two frozen onedirs. Sat before 5.5b until the first
+// full-chain run caught a services manifest with 0 entries.
+//
+// Snapshot every file of both frozen onedirs into frozen-manifest.json
+// and self-verify it BEFORE the tree ships. The W25 lesson in its new
+// shape: a silently-wrong file (sweep ate it, AV quarantined it, the
+// copy raced) must fail THIS build, not the first spawn on a user
+// machine. The bootstrap (P3-3) re-verifies on first run.
+// ---------------------------------------------------------------------------
+{
+  // Windows: dynamic import of an absolute path needs a file:// URL
+  // (ERR_UNSUPPORTED_ESM_URL_SCHEME otherwise; first full assemble catch).
+  const { buildFrozenManifest, verifyFrozenManifest } = await import(pathToFileURL(join(repo, "scripts", "lib", "frozen-manifest.mjs")).href);
+  const jwOnedir = join(jwPayload, "frozen", "sd-jw", "sd-jw");
+  const servicesOnedir = join(out, "envs-template", "frozen", "sd-services", "sd-services");
+  const manifest = await buildFrozenManifest({
+    jw: jwOnedir,
+    services: servicesOnedir,
+  });
+  const covered = Object.keys(manifest.onedirs);
+  if (covered.length === 0) {
+    fail("frozen manifest: no onedir found to snapshot (5.5/5.5b must run first)");
+  }
+  say(`A6 frozen snapshot: ${covered.map((k) => `${k}=${manifest.onedirs[k].fileCount} files`).join(", ")}`);
+
+  // Self-check: the snapshot must verify against the tree it just walked.
+  const resolver = (entryPath) => {
+    const [rootKey, ...rest] = entryPath.split("/");
+    const base = rootKey === "jw" ? jwOnedir : servicesOnedir;
+    return join(base, ...rest);
+  };
+  const { problems } = await verifyFrozenManifest(manifest, resolver);
+  if (problems.length > 0) {
+    fail(`frozen manifest self-check FAILED (${problems.length} problems; first: ${JSON.stringify(problems[0])})`);
+  }
+
+  const manifestPath = join(out, "frozen-manifest.json");
+  await writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+  say(`A6 frozen manifest written: ${relative(out, manifestPath)} (${manifest.files.length} entries)`);
 }
 
 // ---------------------------------------------------------------------------
@@ -981,6 +1185,12 @@ if (dialect.hasTrampolines) {
 // no-op. checked-hash (PEP 552): validity keys on the source CONTENT hash, so
 // downstream copy chains (electron-builder → NSIS → dataDir) may restamp
 // mtimes freely without invalidating what we ship.
+// [D3 P3-4 RETIREMENT MARKER — venv-rail step] Retires together with the
+// venv staging in 5/6 and A6's pyc face when the dual-rail window closes
+// (P4: two clean releases, then delete 7c + the precompileTargets call
+// in bootstrap). The frozen onedirs need NO precompile — their bytecode
+// is baked into the PYZ archives; frozen integrity is A6's frozen face
+// (frozen-manifest), not this step.
 say("precompiling Python bytecode for bundled venvs");
 // Do NOT spread process.env into the compile environment unfiltered. It used to
 // read `{...process.env, PYTHONWARNINGS: "ignore"}`, which let a build script's
@@ -996,6 +1206,10 @@ const compileAll = (pythonExe, target, exclude) =>
     ...(exclude ? ["-x", exclude] : []), target], { env: compileEnv, windowsHide: true, stdio: "pipe", maxBuffer: 64 * 1024 * 1024 });
 const basePythonExe = join(out, "python", ...dialect.bundledBasePythonPath.split("/"));
 const jwVenvPython = join(jwPayload, ".venv", dialect.venvBin, dialect.venvPythonName);
+// sd-services venv interpreter as staged in the payload (envs-template):
+// the A1b+ probe collection's --env services run uses it. Same dialect
+// resolution as jwVenvPython above.
+const sdServicesVenvPython = join(out, "envs-template", "sd-services", dialect.venvBin, dialect.venvPythonName);
 const compileTargets = [
   { label: "python stdlib", python: basePythonExe, path: join(out, "python", ...dialect.stdlibCompileTarget(PYTHON_MINOR)) },
   ...VENV_NAMES.map(name => ({ label: `venv ${name}`, python: basePythonExe, path: join(out, "envs-template", name, ...dialect.sitePackages(PYTHON_MINOR).split("/")) })),
@@ -1007,7 +1221,15 @@ const compileTargets = [
   // dead weight that shipped in every installer). -x skips path
   // components named tests so the bytecode is never generated in the first
   // place; the post-compile sweep below is the belt-and-suspenders net.
-  { label: "jiuwenswarm src", python: jwVenvPython, path: jwPayload, exclude: "[/\\\\]tests[/\\\\]" },
+  // [W26] frozen/ is excluded for the opposite reason: the onedir's datas
+  // pyc files were snapshotted by the 5.5c manifest BEFORE this step runs.
+  // compileall with checked-hash would rewrite any pyc whose source-hash
+  // mismatches (the skills __pycache__ shipped in the jw source tree does
+  // not match what this venv's python regenerates — 140 files, +31B each),
+  // silently invalidating the manifest we just wrote. The frozen onedirs
+  // need NO precompile anyway (bytecode lives in the PYZ archives; the
+  // comment above this section says exactly that) — keep compileall out.
+  { label: "jiuwenswarm src", python: jwVenvPython, path: jwPayload, exclude: "[/\\\\](?:tests|frozen)[/\\\\]" },
 ];
 for (const { label, python, path: target, exclude } of compileTargets) {
   if (!existsSync(target)) continue;
@@ -1164,7 +1386,117 @@ try {
   say("payload runtime probe OK: package table swept as the rules intend, jw venv store write+query, default-EF fallback readable, HTML compressor on trafilatura");
 } catch (error) {
   const detail = (error.stdout?.toString?.() ?? "") + (error.stderr?.toString?.() ?? error.message);
-  fail(`payload runtime probe FAILED (jw venv):\n${detail}`);
+  // W8 closed (2026-11-25): the build machine's chromadb Rust add segfault
+  // (problems/W8, machine-level VC++ runtime damage) was fixed via the VC++
+  // x64 redistributable reinstall and verified green on both the dev venv
+  // and a full assemble probe run. The SD_PROBE_SKIP_STORE_WRITE escape and
+  // this segfault hint are retired: a store-leg segfault now fails the build
+  // plainly, which is the correct signal on a healthy machine.
+  fail(`payload runtime probe FAILED (jw venv):
+${detail}`);
+}
+
+// A1b+ probe COLLECTION (D3 P0-3): the single probe above stays the
+// authority for the sweep contract; the collection below grows to cover
+// the P0-dynamic-paths inventory (A/B/C areas) one probe per dynamic
+// import path. Two runs — the payload carries TWO python trees:
+//   --env jw        upstream tree + babel chain (jwVenvPython)
+//   --env services  first-party sidecars + candidates (sdServicesVenvPython)
+// Sentinel-gated like the single probe (VERIFY_OK required, exit code
+// alone is never trusted — same lesson as W22/L51). B/C-area probes
+// land as jw src settles; the frozen plan in run_verify.py means a
+// file absent from PROBE_ORDER is drift, not a skip.
+const verifyDir = join(dirname(fileURLToPath(import.meta.url)), "verify");
+const runVerify = join(verifyDir, "run_verify.py");
+if (!existsSync(runVerify)) {
+  fail(`probe collection runner missing: ${relative(out, runVerify)}`);
+}
+function runProbeCollection(label, pythonExe, envFilter) {
+  const collectionEnv = { ...compileEnv };
+  delete collectionEnv.SD_PROBE_DEV_TREE;
+  delete collectionEnv.SD_VERIFY_TARGET;
+  collectionEnv.SD_VERIFY_TARGET = "venv";
+  // Placeholder semantics vs build-time probes: the services env's editable
+  // .pth files were rewritten to @@SD_BACKEND_ROOT@@\services\<name>\src in §6 —
+  // a token the INSTALL-time bootstrap resolves on the user machine. At build
+  // time that token is inert, so a staged-venv probe importing
+  // sciencediscovery_evolve (vendored-runner probe, A3 of the P0 inventory)
+  // would die with ModuleNotFoundError even though the payload itself is
+  // complete (backend/services/<name>/src IS in the payload tree — verified
+  // by A2 RequiredFiles). Mirror the bootstrap's replacement here by
+  // prepending the REAL build-time source roots onto PYTHONPATH: the probes
+  // then exercise the exact package trees the installer ships.
+  if (envFilter === "services") {
+    const editableSrcs = ["adapter", "evolve", "gateway", "memory-graph"].map(
+      (n) => join(backendOut, "services", n, "src"),
+    );
+    for (const src of editableSrcs) {
+      if (!existsSync(src)) fail(`probe collection PYTHONPATH entry missing: ${relative(out, src)}`);
+    }
+    const injected = editableSrcs.join(dialect.pthSeparator === "\\" ? ";" : ":");
+    collectionEnv.PYTHONPATH = collectionEnv.PYTHONPATH
+      ? `${injected}${dialect.pthSeparator === "\\" ? ";" : ":"}${collectionEnv.PYTHONPATH}`
+      : injected;
+  }
+  try {
+    const out2 = execFileSync(pythonExe, [runVerify, "--env", envFilter], {
+      env: collectionEnv, windowsHide: true, encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"], maxBuffer: 16 * 1024 * 1024,
+    });
+    if (!/^VERIFY_OK/m.test(out2 ?? "") && !/^VERIFY_PARTIAL/m.test(out2 ?? "")) {
+      fail(`probe collection FAILED (${label}): no VERIFY_OK/VERIFY_PARTIAL sentinel\n${out2 ?? ""}`);
+    }
+    say(`probe collection OK (${label})`);
+  } catch (error) {
+    const detail = (error.stdout?.toString?.() ?? "") + (error.stderr?.toString?.() ?? error.message);
+    fail(`probe collection FAILED (${label}):\n${detail}`);
+  }
+}
+runProbeCollection("jw venv", jwVenvPython, "jw");
+runProbeCollection("sd-services venv", sdServicesVenvPython, "services");
+
+
+// ---------------------------------------------------------------------------
+// 6b. [D3 P3-4 EARLY RETIREMENT — venv rail removed from the PAYLOAD]
+// Ordered after the probe collection on purpose: the staged sd-services
+// venv and backend/jw/.venv are the FREEZE BUILD SOURCE (5.5/5.5b) and
+// the probe target (A1b+), so they must exist until the last consumer
+// has run. From here on the frozen onedirs are the ONLY Python runtime
+// shipped; deleting the venv trees here (rather than never staging
+// them) keeps 5.5/5.5b/A1b+ byte-identical to the verified dual-rail
+// build — the retirement is a pure SUBTRACTION at the payload end.
+//
+// Decision (user, 2026-11-24): skip the two-clean-releases window
+// (W7/P3-4's original plan) and retire the venv rail now; the product
+// decision record lives in the KB (versions d3-freeze-rc3). The frozen
+// exe gate below makes the step refuse to run on a tree where either
+// onedir is missing, so a venv rail cannot be silently dropped while
+// its frozen replacement is absent.
+{
+  const jwFrozenExe = join(jwPayload, "frozen", "sd-jw", "sd-jw", "sd-jw.exe");
+  const servicesFrozenExe = join(out, "envs-template", "frozen", "sd-services", "sd-services", "sd-services.exe");
+  if (dialect.family === "win32" && !existsSync(jwFrozenExe)) {
+    fail(`venv retirement refused: jw frozen exe missing (${relative(out, jwFrozenExe)}) — 5.5 must run first`);
+  }
+  if (dialect.family === "win32" && !existsSync(servicesFrozenExe)) {
+    fail(`venv retirement refused: sd-services frozen exe missing (${relative(out, servicesFrozenExe)}) — 5.5b must run first`);
+  }
+  const retired = [
+    join(out, "envs-template", "sd-services"),
+    join(jwPayload, ".venv"),
+  ];
+  for (const dir of retired) {
+    if (!existsSync(dir)) continue;
+    await rm(dir, { recursive: true, force: true });
+    say(`venv rail retired from payload: ${relative(out, dir)}`);
+  }
+  // The venv trees are gone, so nothing can normalize/compile them anymore —
+  // A2/pyc gates below already degrade correctly on missing dirs
+  // (launcher normalize skips absent dirs; compileTargets `continue`s on
+  // missing paths), but 7b/7c run BEFORE 6b in this file, so no reorder is
+  // needed. Keep the entries listed so a future reorder fails LOUDLY here
+  // instead of silently re-adding a venv to the payload.
+  say("venv retirement complete: frozen onedirs are the only Python runtime shipped");
 }
 
 
@@ -1173,10 +1505,18 @@ try {
 // killed the stack cold start in a shipped installer).
 const requiredFiles = [
   join(jwPayload, ".sciencediscovery-patches.json"),
-  join(jwPayload, ".venv", dialect.venvBin, dialect.family === "darwin" ? "jiuwenswarm-start" : "jiuwenswarm-start.exe"),
+  // [D3 P3-4 early retirement] jiuwenswarm-start.exe lived in the jw venv's
+  // Scripts/ — that venv is retired from the payload (6b); the frozen exe
+  // below is the spawn entry the stack resolves now.
+  // [D3 P1-5] the frozen exe the P1-3 spawn rail resolves; required because
+  // the manifest is what the INSTALLER verifies — a missing onedir must
+  // fail the build here, not the first spawn on a user machine.
+  join(jwPayload, "frozen", "sd-jw", "sd-jw", "sd-jw.exe"),
+  // [D3 P2-2] same contract for the services onedir (MCP/evolve/memory-graph
+  // spawn rail after 6b retired the sd-services venv from the payload).
+  join(out, "envs-template", "frozen", "sd-services", "sd-services", "sd-services.exe"),
   join(out, "backend", "services", "api", "dist", "server.js"),
   join(out, "backend", "services", "runner", "dist", "server.js"),
-  join(out, "envs-template", "sd-services", ...dialect.sitePackages(PYTHON_MINOR).split("/"), "_editable_impl_sciencediscovery_gateway.pth"),
   join(out, "micromamba", dialect.micromambaName),
   join(out, "python", ...dialect.bundledBasePythonPath.split("/")),
 ];
@@ -1208,8 +1548,13 @@ say(`required-files manifest OK (${requiredFiles.length} entries)`);
 // a missing receipt is a hard failure — the runtime verify reads it too.
 {
   const stagedTag = stagedPatchTag(jwPayload);
+  // [D3 P3-4 early retirement] the verifier runs on the BUNDLED base
+  // interpreter, not the jw venv python — 6b retired .venv from the payload
+  // above, and swarm-patches.py is pure stdlib (argparse/hashlib/json/re),
+  // which the base python fully covers. A2b runs after 6b, so jwVenvPython
+  // is a deleted file here (spawn ENOENT, caught in the first retired build).
   const command = patchVerifyCommand({
-    jwPython: jwVenvPython,
+    jwPython: basePythonExe,
     swarmPatchesPy: join(backendOut, "scripts", "swarm-patches.py"),
     jwPayloadDir: jwPayload,
     tag: stagedTag,
@@ -1331,6 +1676,56 @@ const pycByRegion = {};
   topRel.length = Math.min(topRel.length, 10);
 }
 say(`A5 path budget: maxRel=${maxRel} (runtime limit ${maxRelRuntime} @ default root ${DEFAULT_ROOT_LEN}, build limit ${maxRelBuild} incl. compileall +${COMPILEALL_TEMP_MARGIN}) — longest: ${maxRelPath}`);
+
+// [D3 P3-2] A5 frozen-face report: the onedir rails' deepest paths are
+// a TREND quantity of their own — the frozen trees are what P3-3 leaves
+// behind after the venv retirement, and their maxRel (measured in the
+// same install-root-relative space, payload prefix INCLUDED) decides
+// the post-dual-rail budget. The dual-rail gate above still uses the
+// WHOLE payload max (venv trees included); this report is the leading
+// indicator for the day that shrinks. 2026-11-23 first measurement
+// (win32 sandbox build): jw=185 services=148 (payload prefixes
+// backend\jw\frozen\sd-jw\sd-jw resp. envs-template\frozen\
+// sd-services\sd-services included) — jw's deep path is
+// jiuwenswarm\agents\harness\code\rails\...\basic-information.aet.md;
+// 185 < 195 but only by 10, so the jw onedir prefix is the next
+// squeeze target if the post-retirement budget needs room (P3-3 can
+// move it to backend\f\sd-jw\, buying 9).
+{
+  const frozenMaxRel = (onedirDir) => {
+    let deepest = 0;
+    let deepestPath = "";
+    const stack = [onedirDir];
+    while (stack.length > 0) {
+      const dir = stack.pop();
+      let entries;
+      try { entries = readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+      for (const e of entries) {
+        const p = join(dir, e.name);
+        if (e.isDirectory()) { stack.push(p); continue; }
+        const rel = installRootRel(p);
+        if (rel.length > deepest) { deepest = rel.length; deepestPath = rel; }
+      }
+    }
+    return { deepest, deepestPath };
+  };
+  const faces = {
+    jw: join(jwPayload, "frozen", "sd-jw", "sd-jw"),
+    services: join(out, "envs-template", "frozen", "sd-services", "sd-services"),
+  };
+  const parts = [];
+  for (const [key, dir] of Object.entries(faces)) {
+    if (!existsSync(dir)) continue;
+    const { deepest, deepestPath } = frozenMaxRel(dir);
+    parts.push(`${key}=${deepest}`);
+    if (dialect.hasTrampolines && deepest > maxRelRuntime) {
+      fail(`A5 frozen face: onedir '${key}' maxRel=${deepest} > ${maxRelRuntime} (${deepestPath}) — the frozen rail itself breaches the budget`);
+    }
+  }
+  if (parts.length > 0) {
+    say(`A5 frozen faces: ${parts.join(", ")} (runtime limit ${maxRelRuntime}; venv-era deep paths retire with P3-3, these are what stays)`);
+  }
+}
 if (dialect.hasTrampolines && maxRel > maxRelRuntime) {
   fail(`payload path budget exceeded: maxRel=${maxRel} > ${maxRelRuntime} (over by ${maxRel - maxRelRuntime}) under the worst-case default install root (${DEFAULT_ROOT_LEN} chars).\n` +
     `  Longest paths:\n    ${topRel.map(([n, p]) => `${n}  ${p}`).join("\n    ")}\n` +
@@ -1367,11 +1762,27 @@ if (!dialect.hasTrampolines) {
 // eroding is a budget that fails all at once. The ratio and its calibration
 // live in scripts/lib/pyc-budget.mjs, pinned against both release6 trees by
 // test/pyc-budget.test.ts — change the limit there, not here.
+//
+// [D3 P3-4 early retirement] SCOPE CHANGE: with the venv rail gone from the
+// payload (6b), the only region a first-launch compileall can still tax is
+// the bundled stdlib. The frozen onedirs carry their bytecode inside the PYZ
+// archives — the loose .py files there are package DATA, imports never touch
+// them — and backend/jw's loose .py tree is the jw source-of-record the
+// patch-verify chain fingerprints (swarm-patches.py), not an import surface.
+// The gate therefore judges the PRECOMPILE FACE (region allowlist below)
+// instead of the whole tree; frozen/jw-src .py files drop out of BOTH the
+// ratio and the advisory. version.json's bytecode.byRegion keeps every
+// region (audit trail) but the gate and bootstrap's unpacked-verdict read
+// the same allowlist.
+const PYC_FACE_REGIONS = ["python"];
 {
-  const verdict = pycBudgetVerdict(pyCount, pycCount);
+  const facePy = PYC_FACE_REGIONS.reduce((n, r) => n + (pycByRegion[r]?.py ?? 0), 0);
+  const facePyc = PYC_FACE_REGIONS.reduce((n, r) => n + (pycByRegion[r]?.pyc ?? 0), 0);
+  const verdict = pycBudgetVerdict(facePy, facePyc);
   const pct = (n) => `${(n * 100).toFixed(1)}%`;
-  say(`A6 bytecode budget: ${pycCount} .pyc for ${pyCount} .py = ${pct(verdict.ratio)} (limit ${pct(PYC_MIN_RATIO)})`);
-  const weak = regionsBelowRatio(pycByRegion);
+  say(`A6 bytecode budget (precompile face ${JSON.stringify(PYC_FACE_REGIONS)}): ${facePyc} .pyc for ${facePy} .py = ${pct(verdict.ratio)} (limit ${pct(PYC_MIN_RATIO)})`);
+  const faceRegions = Object.fromEntries(PYC_FACE_REGIONS.map((r) => [r, pycByRegion[r]]).filter(([, v]) => v));
+  const weak = regionsBelowRatio(faceRegions);
   if (weak.length > 0) {
     // Advisory, not a failure: the gate is whole-tree, and a whole-tree ratio
     // has a blind spot proportional to a region's size — a SMALL target losing
@@ -1384,6 +1795,32 @@ if (!dialect.hasTrampolines) {
     fail(`payload bytecode budget failed: ${verdict.reason}.\n` +
       `  The .pyc files are either missing or were written OUTSIDE the payload. Check the build environment for PYTHONPYCACHEPREFIX (it redirects compileall's output and still exits 0 — problems W25) and check the "precompiled bytecode for <label>" lines above for a target that was skipped.\n` +
       `  Do NOT ship: the installed tree recompiles on first run, a multi-minute startup regression.`);
+  }
+}
+
+// [D3 P3-1] A6 frozen face: when a frozen onedir ships, its integrity
+// manifest must exist AND cover it — this is the gate-side twin of the
+// 5.5c self-check (the same file, asserted from the gate's side so a
+// 5.5c regression cannot ship an onedir without its manifest).
+{
+  const frozenJwExe = join(jwPayload, "frozen", "sd-jw", "sd-jw", "sd-jw.exe");
+  const manifestPath = join(out, "frozen-manifest.json");
+  if (existsSync(frozenJwExe)) {
+    if (!existsSync(manifestPath)) {
+      fail(`A6: frozen sd-jw exe shipped but ${relative(out, manifestPath)} is missing (5.5c snapshot step failed)`);
+    }
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    const covered = manifest.onedirs ?? {};
+    for (const key of ["jw", "services"]) {
+      const onedir = key === "jw"
+        ? join(jwPayload, "frozen", "sd-jw", "sd-jw")
+        : join(out, "envs-template", "frozen", "sd-services", "sd-services");
+      if (!existsSync(onedir)) continue;
+      if (!covered[key] || covered[key].fileCount < 50) {
+        fail(`A6: frozen onedir '${key}' shipped with no/too-thin manifest coverage (${covered[key]?.fileCount ?? 0} entries; a real onedir is hundreds+)`);
+      }
+    }
+    say(`A6 frozen integrity: manifest covers ${manifest.files.length} entries (${Object.keys(covered).join(", ")})`);
   }
 }
 

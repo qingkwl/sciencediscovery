@@ -12,9 +12,12 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 
 from ...auth import require_internal_token
+from ...logging_config import get_logger
 from .research import IdeaTreeEngine, ResearchStore, node, now
 from .prompts import DEFAULTS, CRITERIA
 from .templates import INTENSITIES, TEMPLATES, apply_intensity, snapshot
+
+log = get_logger('idea_research')
 
 
 class Settings(BaseModel):
@@ -76,26 +79,100 @@ def store():
     return _store
 
 
+RESTART_REASON = 'Service restarted; continue manually'
+ACTIVE_STATUSES = ('running', 'pausing')
+
+
 def state_for(project, session, identifier):
+    """The research as it is; a read, never a recovery step.
+
+    `list`, `get` and `events` (once per streamed frame) all call this, and a
+    read of an archived, read-only Session reaches it too, so it must not
+    write. A research a previous process left `running` is settled once at boot
+    by `reconcile_orphaned_researches()`, not by whichever request reads first.
+    """
     active = _running.get(identifier)
     if active:
         s = active[0].state
         if s['projectId'] != project or s['sessionId'] != session:
             raise HTTPException(404, 'Research not found')
         return s
-    s = store().read(project, session, identifier)
-    if s['status'] in ['running', 'pausing']:
-        s.update(status='interrupted', reason='Service restarted; continue manually')
-        for activity in s.get('activities', []):
-            if activity['status'] == 'running':
-                activity.update(status='stopped', finishedAt=now(), error='Service restarted')
-        store().save(s)
-    return s
+    return store().read(project, session, identifier)
+
+
+def settle_after_restart(state):
+    """The restart verdict for one research, its activities closed.
+
+    A stop the user requested while the run was in flight is persisted as
+    `pendingStop`, because the engine that would have settled it died with the
+    process. That request outranks the crash verdict (#1464): `end` restores the
+    research as `ended`, so continuing it stays refused, and `pause` as the
+    `paused` the user asked for. Without the mark a `running`/`pausing` record
+    is an interrupted run, which is also how records written before the mark
+    existed are read.
+    """
+    pending = state.pop('pendingStop', None)
+    if pending == 'end':
+        state.update(status='ended', reason='Ended by user')
+    elif pending == 'pause':
+        state.update(status='paused', reason='Paused by user')
+    else:
+        state.update(status='interrupted', reason=RESTART_REASON)
+    for activity in state.get('activities', []):
+        if activity.get('status') == 'running':
+            activity.update(status='stopped', finishedAt=now(), error='Service restarted')
+
+
+def reconcile_orphaned_researches():
+    """Settle researches a previous process left running; called once at startup.
+
+    The engine lives in this process, so a `running`/`pausing` research found
+    on disk cannot still be driven: it is a restart orphan. The transition has
+    to happen at the restart itself instead of on a read, because reads happen
+    per streamed frame and for archived Sessions, where persisting a status
+    turns an observation into an irreversible write. Returns how many were
+    settled, so the caller can log a count and tests can assert on it.
+    """
+    root = store().root
+    if not root.is_dir():
+        return 0
+    settled = 0
+    for path in sorted(root.glob('*/*/*.json')):
+        project, session, identifier = path.parts[-3], path.parts[-2], path.stem
+        # Never settle a research this process is driving, even if this pass is
+        # invoked again: it is not an orphan.
+        if identifier in _running:
+            continue
+        try:
+            s = store().read(project, session, identifier)
+        except (OSError, ValueError) as error:
+            log.warning('restart reconciliation skipped unreadable research %s/%s/%s: %s',
+                        project, session, identifier, error)
+            continue
+        if s.get('status') not in ACTIVE_STATUSES:
+            continue
+        settle_after_restart(s)
+        try:
+            store().save(s)
+        except (OSError, ValueError) as error:
+            log.warning('restart reconciliation could not save research %s/%s/%s: %s',
+                        project, session, identifier, error)
+            continue
+        settled += 1
+    if settled:
+        log.info('settled %d research(es) interrupted by a service restart', settled)
+    return settled
+
+
+def research_view(s):
+    """The research's own state, without the tree (and without the tree's revision)."""
+    return {k: copy.deepcopy(v) for k, v in s.items() if k not in ['nodes', 'materials', 'revision']}
 
 
 def view(s):
+    """A command's answer: the research and the whole tree, heavy fields included."""
     engine = IdeaTreeEngine(s, store(), {})
-    return dict(research={k: copy.deepcopy(v) for k, v in s.items() if k not in ['nodes', 'materials']}, graph=engine.graph())
+    return dict(research=research_view(s), graph=engine.graph())
 
 
 def start(s, llm):
@@ -169,8 +246,14 @@ async def command(c: Command):
             active = _running.get(s['id'])
             if active:
                 active[0].stop_action = c.operation
+                # The engine still owns the settle, so the runtime status stays
+                # `pausing` and the SSE stream keeps running. Persisting the request
+                # is what lets a restart before that settle report the user's own
+                # verdict instead of folding it into `interrupted` (#1464).
+                s['pendingStop'] = c.operation
                 s['status'] = 'pausing'
             else:
+                s.pop('pendingStop', None)
                 s.update(status='ended' if c.operation == 'end' else 'paused', reason='Ended by user' if c.operation == 'end' else 'Paused by user')
             store().save(s)
         else:
@@ -193,11 +276,20 @@ async def events(c: Command):
     listeners.add(queue)
 
     async def stream():
+        # Per-stream cursor: a listener that attaches mid-research starts from the
+        # whole (compact) tree, and every later frame carries only what changed since
+        # the frame before it. Two listeners therefore keep independent cursors.
+        cursor = None
         try:
             while True:
                 s = state_for(c.projectId, c.sessionId, c.researchId)
-                yield 'data: ' + json.dumps(view(s), ensure_ascii=False) + '\n\n'
-                if s['status'] not in ['running', 'pausing']:
+                research = research_view(s)
+                graph, cursor = IdeaTreeEngine(s, store(), {}).graph_frame(cursor)
+                yield 'data: ' + json.dumps(dict(research=research, graph=graph), ensure_ascii=False) + '\n\n'
+                # The frame just sent decides whether this stream is done: the engine
+                # mutates its state in place, so re-reading `s` here could see a status
+                # the client has not been told about and close on a running frame.
+                if research['status'] not in ['running', 'pausing']:
                     return
                 try:
                     await asyncio.wait_for(queue.get(), timeout=15)

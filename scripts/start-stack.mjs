@@ -266,6 +266,51 @@ const envsDir = process.env.SCIENCE_AGENT_ENVS_DIR
 // and in the payload (envs-template\sd-services, staged by assemble-backend).
 const SHARED_ENV = join(envsDir, "sd-services");
 
+// [D3 P2-2] Frozen rail for the shared-venv sidecars: when a sd-services
+// onedir exists (payload <dataDir>/frozen/sd-services layout from assemble
+// stage 5.5b; explicit env override; dev sandbox .tmp-freeze-dist), the
+// evolve/memory-graph sidecars spawn as `<exe> <entry>` / `<exe> -m <module>`
+// (the dispatcher carries both channels) and the venv machinery below
+// (uv sync, gateway venv probes) is bypassed. SD_SD_SERVICES_FREEZE=0
+// forces the venv rail for the P4 verification window.
+const FROZEN_SERVICES_EXE = (() => {
+  // [D3 P3-4 early retirement] packaged mode REQUIRES the frozen rail: the
+  // venv trees no longer ship, so a missing onedir is a broken install, not
+  // a rail choice. Dev mode keeps SD_SD_SERVICES_FREEZE=0 as an escape hatch
+  // for probing the old rail against a locally provisioned venv.
+  if (packaged) {
+    // The shell injects SCIENCE_AGENT_SD_SERVICES_EXE (packagedEnv, pointing
+    // into the payload's resources tree) — trust it first. The fallbacks
+    // cover a shell version predating that injection: the payload layout
+    // (resources\envs-template\frozen\...) resolved off the repository root
+    // this script runs from, then the historical dataDir copy.
+    const explicit = process.env.SCIENCE_AGENT_SD_SERVICES_EXE?.trim();
+    const candidates = [
+      ...(explicit ? [resolve(explicit)] : []),
+      join(repositoryRoot, "resources", "envs-template", "frozen", "sd-services", "sd-services", "sd-services.exe"),
+      join(dataDir, "frozen", "sd-services", "sd-services", "sd-services.exe"),
+    ];
+    const found = candidates.find((cand) => existsSync(cand));
+    if (!found) {
+      fail("packaged mode requires the frozen sd-services onedir — the venv rail no longer ships; reinstall ScienceDiscovery. (looked in: " + candidates.join("; ") + ")");
+    }
+    return found;
+  }
+  if (process.env.SD_SD_SERVICES_FREEZE === "0") return "";
+  const explicit = process.env.SCIENCE_AGENT_SD_SERVICES_EXE?.trim();
+  if (explicit && existsSync(resolve(explicit))) return resolve(explicit);
+  for (const cand of [
+    join(dataDir, "frozen", "sd-services", "sd-services", "sd-services.exe"),
+    resolve(repositoryRoot, ".tmp-freeze-dist", "sd-services", "sd-services.exe"),
+  ]) {
+    if (existsSync(cand)) return cand;
+  }
+  return "";
+})();
+if (FROZEN_SERVICES_EXE) {
+  say(`frozen sd-services exe: ${FROZEN_SERVICES_EXE} (spawn rail ${packaged ? "REQUIRED" : "ON"})`);
+}
+
 // Build (--no-build skips it). Registry overrides apply to this process only
 // and never touch user/global configuration.
 const runOpts = { cwd: repositoryRoot };
@@ -450,39 +495,56 @@ if (!options.noBuild) {
 
 // Gateway interpreter discovery: two known locations, in the same order as
 // resolveMcpPython; venvPython() handles bin/python vs Scripts/python.exe
-// internally.
+// internally. [D3 P2-2] frozen rail: the exe IS the interpreter for every
+// bundled MCP server; resolveMcpPython in the API resolves the same file
+// (node-client.ts), so the env passthrough below just points there.
 let gatewayPython = process.env.SCIENCE_AGENT_GATEWAY_PYTHON_PATH;
 if (!gatewayPython || !existsSync(gatewayPython)) {
-  const candidates = [venvPython(SHARED_ENV), venvPython(join(repositoryRoot, "services", "gateway", ".venv"))];
+  // [D3 P3-4 early retirement] packaged: the frozen exe is the only bundled
+  // interpreter (FROZEN_SERVICES_EXE resolution above already failed hard
+  // when it is missing, so this list cannot be empty in packaged mode).
+  const candidates = packaged
+    ? [FROZEN_SERVICES_EXE]
+    : [
+      ...(FROZEN_SERVICES_EXE ? [FROZEN_SERVICES_EXE] : []),
+      venvPython(SHARED_ENV),
+      venvPython(join(repositoryRoot, "services", "gateway", ".venv")),
+    ];
   gatewayPython = candidates.find(existsSync);
 }
 if (!gatewayPython) {
   fail(packaged
-    ? `${SHARED_ENV} is missing; the packaged installation is incomplete — reinstall ScienceDiscovery.`
+    ? `the frozen sd-services exe is missing; the packaged installation is incomplete — reinstall ScienceDiscovery.`
     : `${SHARED_ENV} is missing (needed for the bundled Python MCP servers). Run without --no-build once to provision it.`);
 }
 
 // memory-graph: provision unconditionally (the feature toggle lives in
 // System Settings; the environment must be ready)
-let memoryGraphPython = venvPython(SHARED_ENV);
-if (!existsSync(memoryGraphPython)) {
-  if (packaged) fail(`${SHARED_ENV} is missing; the packaged installation is incomplete — reinstall ScienceDiscovery.`);
+// [D3 P2-2] frozen rail: the exe spawns it via the -m channel.
+let memoryGraphPython = packaged
+  ? FROZEN_SERVICES_EXE  // [P3-4] packaged: frozen exe only, resolver failed hard otherwise
+  : (FROZEN_SERVICES_EXE || venvPython(SHARED_ENV));
+if (!packaged && !FROZEN_SERVICES_EXE && !existsSync(memoryGraphPython)) {
   say("Provisioning the shared Python environment (workspace)...");
   await uvSyncProject(repositoryRoot, SHARED_ENV, { locked: true, extraArgs: ["--extra", "candidates"] });
 }
 if (!existsSync(memoryGraphPython)) memoryGraphPython = "";
 
 // evolve: the candidate runtime lives in the shared venv via the workspace's
-// candidates extra (synced above).
-let evolvePython = venvPython(SHARED_ENV);
+// candidates extra (synced above). [D3 P2-2] frozen rail: the exe carries
+// the candidates four (collect_all in the P2-1 spec).
+let evolvePython = packaged
+  ? FROZEN_SERVICES_EXE  // [P3-4] packaged: frozen exe only
+  : (FROZEN_SERVICES_EXE || venvPython(SHARED_ENV));
 if (!existsSync(evolvePython)) evolvePython = "";
 
 // adapter: the JiuwenSwarm front door (on by default)
 let adapterPython = "";
 if (process.env.SCIENCE_AGENT_ADAPTER === "1") {
-  adapterPython = venvPython(SHARED_ENV);
-  if (!existsSync(adapterPython)) {
-    if (packaged) fail(`${SHARED_ENV} is missing; the packaged installation is incomplete — reinstall ScienceDiscovery.`);
+  adapterPython = packaged
+    ? FROZEN_SERVICES_EXE  // [P3-4] packaged: frozen exe only
+    : (FROZEN_SERVICES_EXE || venvPython(SHARED_ENV));
+  if (!packaged && !FROZEN_SERVICES_EXE && !existsSync(adapterPython)) {
     say("Provisioning the shared Python environment (workspace)...");
     await uvSyncProject(repositoryRoot, SHARED_ENV, { locked: true });
   }
@@ -726,7 +788,11 @@ try {
           SCIENCE_AGENT_EVOLVE_INTERNAL_TOKEN: process.env.SCIENCE_AGENT_EVOLVE_INTERNAL_TOKEN ?? "sciencediscovery-evolve-local",
         },
       }));
-      if (!await waitHealthy("evolve", `http://127.0.0.1:${evolvePort}/health`, { timeoutSeconds: healthTimeoutSeconds })) {
+      // [D3 P3-4] the frozen dispatcher's first cold start pays a one-time
+      // cost (AV scans the onedir's DLLs on first load — measured minutes on
+      // locked-down machines), same class as memory-graph's 60s floor.
+      const evolveTimeout = Math.max(healthTimeoutSeconds, 60);
+      if (!await waitHealthy("evolve", `http://127.0.0.1:${evolvePort}/health`, { timeoutSeconds: evolveTimeout })) {
         throw new Error("evolve sidecar failed to start; stopping the stack.");
       }
       perf("evolve-healthy");
@@ -816,7 +882,16 @@ try {
           say("JiuwenSwarm is not running; starting it (node scripts/jiuwenswarm.mjs start)...");
           await jwStart(cfg);
           jwRunning = true; // W20: cleanup() must stop the detached group
-          Object.assign(process.env, await jwEnv(cfg));
+          // PAB-6: a bare await here let one flaky jwEnv() read (half-written
+          // instance file right after start, transient fs error) reject the
+          // whole sidecar promise with no fallback — the process env would
+          // miss the jw URLs and every later spawn derailed. Degrade to a
+          // warning + keep whatever the pre-start probe above established.
+          const startedEnv = await jwEnv(cfg).catch(error => {
+            say(`WARNING: JiuwenSwarm env read-back failed after start (${error instanceof Error ? error.message : String(error)}); keeping previously detected URLs`);
+            return null;
+          });
+          if (startedEnv) Object.assign(process.env, startedEnv);
         }
       })());
     }

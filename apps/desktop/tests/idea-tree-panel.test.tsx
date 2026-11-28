@@ -12,20 +12,30 @@ import { TEXT } from "../src/text.js";
 
 const t = TEXT.ideaTree;
 
-function view(status = "running", researchPatch: Partial<IdeaResearchView["research"]> = {}) {
+function view(
+  status = "running",
+  objective = "提升膜通量",
+  researchPatch: Partial<IdeaResearchView["research"]> = {},
+) {
   return {
     research: {
-      id: "research-1", objective: "提升膜通量", status, phase: "building_tree", round: 1,
+      id: "research-1", objective, status, phase: "building_tree", round: 1,
       batch: [], batchCompleted: 0, tokens: 0, usageKnown: false, reason: null, modelId: "m",
       currentNodeId: null,
       settings: { maxRounds: 3, candidatesPerRound: 2, maxSearchRounds: 2, maxNodes: 20, maxDepth: 3, maxActiveDirections: 2, pruneThreshold: 0.2, maxTokens: null },
       ...researchPatch,
     },
-    graph: { edges: [], nodes: [], objective: "提升膜通量", revision: 1, treeId: "tree-1", updatedAt: "2026-11-18T00:00:00Z" },
+    graph: { edges: [], nodes: [], objective, revision: 1, treeId: "tree-1", updatedAt: "2026-11-18T00:00:00Z" },
   };
 }
 
-function fakeClient(options: { unavailable?: boolean; streamBody?: string; status?: string; researchPatch?: Partial<IdeaResearchView["research"]> } = {}) {
+function fakeClient(options: {
+  unavailable?: boolean;
+  streamBody?: string;
+  objective?: string;
+  status?: string;
+  researchPatch?: Partial<IdeaResearchView["research"]>;
+} = {}) {
   const calls: Array<{ path: string; method: string; body?: unknown }> = [];
   const stub = {
     calls,
@@ -33,8 +43,8 @@ function fakeClient(options: { unavailable?: boolean; streamBody?: string; statu
       const body = init?.body ? JSON.parse(init.body) as { operation: string } : undefined;
       calls.push({ path, method: init?.method ?? "GET", body });
       if (options.unavailable) throw new ApiRequestError("Evolve is not initialized or unavailable", 503);
-      if (body?.operation === "pause") return view("paused");
-      return view(options.status ?? "running", options.researchPatch);
+      if (body?.operation === "pause") return view("paused", options.objective);
+      return view(options.status ?? "running", options.objective, options.researchPatch);
     },
     fetchStream: async () => new Response(options.streamBody ?? "", { status: 200, headers: { "content-type": "text/event-stream" } }),
   };
@@ -54,6 +64,17 @@ test("the panel renders the persisted research it was opened on", async () => {
   assert.match(text, /提升膜通量/);
   assert.match(text, /构建假设树/);
   assert.match(text, /token 用量未上报/);
+  panel.unmount();
+});
+
+test("the panel header shows the whole objective the transcript card shortened", async () => {
+  const objective = "评估不同预处理工艺对水处理膜通量衰减的影响并给出最优参数组合与运行条件";
+  const api = fakeClient({ objective });
+  let panel!: ReactTestRenderer;
+  await act(async () => { panel = create(React.createElement(IdeaResearchPanel, { client: api, sessionId: "s1", researchId: "research-1" })); });
+  await act(async () => { await flush(); });
+  const headings = panel.root.findAll((node) => node.type === "h2");
+  assert.equal(String(headings[0]!.children.join("")), objective);
   panel.unmount();
 });
 
@@ -80,8 +101,75 @@ test("pause sends one control call and shows the returned state", async () => {
   panel.unmount();
 });
 
+test("继续 reports the resumed view, so the card at the transcript's foot can follow it", async () => {
+  const api = recordingClient({ readView: () => view("interrupted") });
+  const seen: IdeaResearchView[] = [];
+  let panel!: ReactTestRenderer;
+  await act(async () => {
+    panel = create(React.createElement(IdeaResearchPanel, {
+      client: api,
+      onResearchChanged: (next: IdeaResearchView) => { seen.push(next); },
+      researchId: "research-1",
+      sessionId: "s1",
+    }));
+  });
+  await act(async () => { await flush(); });
+  assert.equal(seen.at(-1)?.research.status, "interrupted", "the panel's own read is reported as well");
+
+  await act(async () => { buttonWith(panel, t.resume).props.onClick(); });
+  await act(async () => { await flush(); });
+
+  assert.equal(api.calls.filter((call) => call.operation === "continue").length, 1, "继续 is one control call");
+  assert.equal(seen.at(-1)?.research.status, "running", "the state the engine returned after 继续 is handed back");
+  panel.unmount();
+});
+
+test("继续 followed by closing the panel still reports the answer", async () => {
+  let releaseContinue!: () => void;
+  const held = new Promise<void>((resolve) => { releaseContinue = resolve; });
+  const api = {
+    request: async (_path: string, init?: { method?: string; body?: string }) => {
+      const body = init?.body ? JSON.parse(init.body) as { operation?: string } : {};
+      if (body.operation === "continue") {
+        await held;
+        return view("running");
+      }
+      return view("interrupted");
+    },
+    fetchStream: async () => new Response("", { status: 200, headers: { "content-type": "text/event-stream" } }),
+  } as unknown as ApiClient;
+  const seen: Array<{ status: string; sessionId: string }> = [];
+  let panel!: ReactTestRenderer;
+  await act(async () => {
+    panel = create(React.createElement(IdeaResearchPanel, {
+      client: api,
+      onResearchChanged: (next: IdeaResearchView, fromSession: string) => { seen.push({ status: next.research.status, sessionId: fromSession }); },
+      researchId: "research-1",
+      sessionId: "s1",
+    }));
+  });
+  await act(async () => { await flush(); });
+  const before = seen.length;
+
+  await act(async () => { buttonWith(panel, t.resume).props.onClick(); });
+  // The reader presses 继续 and then closes the panel while the request is in
+  // flight: the shortest path to the reported bug, and the answer must still land
+  // in the session list.
+  await act(async () => { panel.unmount(); });
+  await act(async () => { releaseContinue(); await flush(); });
+
+  assert.ok(seen.length > before, "the answer is reported after the panel is gone");
+  assert.equal(seen.at(-1)?.status, "running");
+  assert.equal(seen.at(-1)?.sessionId, "s1", "it says which session it belongs to");
+});
+
 test("a live stream frame replaces the view without refetching", async () => {
-  const stopped = { ...view("completed"), research: { ...view("running").research, status: "completed", usageKnown: true, tokens: 900 } };
+  const stopped = {
+    ...view("completed"),
+    research: { ...view("running").research, status: "completed", usageKnown: true, tokens: 900 },
+    // The first frame of a stream is the whole tree; later frames are deltas.
+    graph: { ...view("completed").graph, full: true, removed: [] },
+  };
   const api = fakeClient({ streamBody: `data: ${JSON.stringify(stopped)}\n\n` });
   let panel!: ReactTestRenderer;
   await act(async () => { panel = create(React.createElement(IdeaResearchPanel, { client: api, sessionId: "s1", researchId: "research-1" })); });

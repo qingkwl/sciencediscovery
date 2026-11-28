@@ -120,6 +120,184 @@ test("the two runs stay in the order the conversation happened in", () => {
   assert.deepEqual([...positions].sort((left, right) => left - right), positions);
 });
 
+test("a review card is drawn at the end of the turn it reviewed, not under the question", () => {
+  // The checkpoint message is written when the review starts, mid-turn —
+  // before the run writes its answer. Stored order would put the card between
+  // the question and the work it reviews, reading as the assistant's reply.
+  const checkpoint = checkpointMessage("review-1", "2026-01-01T00:00:00.000Z");
+  const markup = render({
+    detail: detail([
+      message("question-a", "user", "QUESTION-A"),
+      checkpoint,
+      message("answer-a", "assistant", "PLAIN-ANSWER-A"),
+    ]),
+    replays: [{ messageId: "answer-a", runId: "run-a", state: answered("run-a", "THOUGHT-A", "ANSWER-A"), userMessageId: "question-a" }],
+  });
+  const positions = ["QUESTION-A", "ANSWER-A", 'data-testid="review-card"']
+    .map((needle) => {
+      const at = markup.indexOf(needle);
+      assert.notEqual(at, -1, `${needle} is missing from the transcript`);
+      return at;
+    });
+  assert.deepEqual([...positions].sort((left, right) => left - right), positions);
+});
+
+test("a review card does not cross into the next turn", () => {
+  // The card answers for the first turn's artifacts, so it stays above the
+  // second question even though persistence wrote it earlier.
+  const checkpoint = checkpointMessage("review-1", "2026-01-01T00:00:00.000Z");
+  const markup = render({
+    detail: detail([
+      message("question-a", "user", "QUESTION-A"),
+      checkpoint,
+      message("answer-a", "assistant", "PLAIN-ANSWER-A"),
+      message("question-b", "user", "QUESTION-B"),
+      message("answer-b", "assistant", "PLAIN-ANSWER-B"),
+    ]),
+  });
+  const card = markup.indexOf('data-testid="review-card"');
+  assert.notEqual(card, -1);
+  assert.ok(markup.indexOf("QUESTION-A") < card);
+  assert.ok(card < markup.indexOf("QUESTION-B"));
+});
+
+/** A review checkpoint message, stamped so the live-turn rule can read it.
+ *  `overrides` lets a test make two checkpoints distinguishable on screen. */
+function checkpointMessage(
+  id: string,
+  createdAt: string,
+  overrides: Partial<NonNullable<ChatMessage["reviewerCheckpoint"]>> = {},
+): ChatMessage {
+  const message = { content: "Reviewer Specialist review", createdAt, id, kind: "reviewer_checkpoint" as const, role: "assistant" as const };
+  return { ...message, reviewerCheckpoint: { status: "completed", toolCallId: `tool-${id}`, ...overrides } };
+}
+
+/** A running checkpoint's progress, named so the card renders the name. */
+function runningProgress(artifactLogicalName: string): NonNullable<NonNullable<ChatMessage["reviewerCheckpoint"]>["progress"]> {
+  return { artifactCompleted: 0, artifactLogicalName, artifactTotal: 0, completed: 0, failed: 0, queued: 0, total: 0 };
+}
+
+test("a review card written by the running turn waits for that turn's answer", () => {
+  // A checkpoint is written mid-turn, before the answer. Drawing it while the
+  // turn streams puts it above the reply it is a verdict on, so it is held
+  // back until the turn ends.
+  const cards = [message("question-a", "user", "QUESTION-A"), checkpointMessage("review-live", "2026-01-01T00:00:10.000Z")];
+  const streaming = render({
+    detail: detail(cards),
+    run: {
+      ...answered("run-live", "THOUGHT-LIVE", "ANSWER-LIVE"),
+      startedAt: Date.parse("2026-01-01T00:00:05.000Z"),
+      terminal: false,
+    },
+  });
+  assert.doesNotMatch(streaming, /data-testid="review-card"/);
+
+  // The turn ended and its answer is stored: the card is drawn at the end.
+  const finished = render({ detail: detail([...cards, message("answer-a", "assistant", "ANSWER-A")]) });
+  assert.match(finished, /data-testid="review-card"/);
+
+  // A review the reader started is theirs to watch while it runs: the live
+  // turn's hold does not apply to it.
+  const manual = checkpointMessage("review-manual", "2026-01-01T00:00:10.000Z");
+  manual.reviewerCheckpoint = { status: "running", toolCallId: "manual-review:review-manual" };
+  const started = render({
+    detail: detail([message("question-a", "user", "QUESTION-A"), manual]),
+    run: {
+      ...answered("run-live", "THOUGHT-LIVE", "ANSWER-LIVE"),
+      startedAt: Date.parse("2026-01-01T00:00:05.000Z"),
+      terminal: false,
+    },
+  });
+  assert.match(started, /data-testid="review-card-running"/);
+});
+
+test("a card written before the first question keeps its place at the head", () => {
+  // There is no turn for it to move after: the boundary rule only carries a
+  // held checkpoint to the next question, and one already above the first
+  // question stays there.
+  const markup = render({
+    detail: detail([
+      checkpointMessage("review-head", "2025-12-31T23:59:00.000Z"),
+      message("question-a", "user", "QUESTION-A"),
+      message("answer-a", "assistant", "ANSWER-A"),
+    ]),
+  });
+  const card = markup.indexOf('data-testid="review-card"');
+  assert.notEqual(card, -1);
+  assert.ok(card < markup.indexOf("QUESTION-A"));
+});
+
+test("two cards written in one turn both follow its answer, in the order they were written", () => {
+  // The two cards must be distinguishable on screen, or the assertions below
+  // would pass just as well with their order reversed: an empty completed
+  // card renders the same markup for every checkpoint. A running card names
+  // the artifact it is on, which gives each one a unique string to find.
+  const markup = render({
+    detail: detail([
+      message("question-a", "user", "QUESTION-A"),
+      checkpointMessage("review-one", "2026-01-01T00:00:01.000Z", { progress: runningProgress("one.md"), status: "running" }),
+      checkpointMessage("review-two", "2026-01-01T00:00:02.000Z", { progress: runningProgress("two.md"), status: "running" }),
+      message("answer-a", "assistant", "ANSWER-A"),
+      message("question-b", "user", "QUESTION-B"),
+    ]),
+  });
+  const first = markup.indexOf("one.md");
+  const second = markup.indexOf("two.md");
+  assert.notEqual(first, -1);
+  assert.notEqual(second, -1);
+  assert.ok(markup.indexOf("ANSWER-A") < first);
+  assert.ok(first < second);
+  assert.ok(second < markup.indexOf("QUESTION-B"));
+});
+
+test("a card whose write time cannot be read is drawn rather than hidden", () => {
+  // The live-turn hold compares the checkpoint's stamp with the run's start.
+  // An unreadable or missing stamp cannot prove the card belongs to the
+  // running turn, and losing a review is worse than drawing it a turn early,
+  // so the comparison fails open.
+  const unreadable = render({
+    detail: detail([message("question-a", "user", "QUESTION-A"), checkpointMessage("review-unreadable", "not-a-timestamp")]),
+    run: {
+      ...answered("run-live", "THOUGHT-LIVE", "ANSWER-LIVE"),
+      startedAt: Date.parse("2026-01-01T00:00:05.000Z"),
+      terminal: false,
+    },
+  });
+  assert.match(unreadable, /data-testid="review-card"/);
+
+  const missing = checkpointMessage("review-missing", "");
+  delete (missing as { createdAt?: string }).createdAt;
+  const unstamped = render({
+    detail: detail([message("question-a", "user", "QUESTION-A"), missing]),
+    run: {
+      ...answered("run-live", "THOUGHT-LIVE", "ANSWER-LIVE"),
+      startedAt: Date.parse("2026-01-01T00:00:05.000Z"),
+      terminal: false,
+    },
+  });
+  assert.match(unstamped, /data-testid="review-card"/);
+});
+
+test("a card from an earlier turn is drawn while the next turn streams", () => {
+  // Only what the live run wrote is held. A card the coordinator wrote after
+  // the previous turn belongs to that turn and is readable at once.
+  const markup = render({
+    detail: detail([
+      message("question-a", "user", "QUESTION-A"),
+      message("answer-a", "assistant", "ANSWER-A"),
+      checkpointMessage("review-earlier", "2026-01-01T00:00:00.000Z"),
+      message("question-b", "user", "QUESTION-B"),
+    ]),
+    run: {
+      ...answered("run-live", "THOUGHT-LIVE", "ANSWER-LIVE"),
+      startedAt: Date.parse("2026-01-01T00:00:05.000Z"),
+      terminal: false,
+    },
+  });
+  assert.match(markup, /data-testid="review-card"/);
+  assert.ok(markup.indexOf('data-testid="review-card"') < markup.indexOf("QUESTION-B"));
+});
+
 test("the reader's turn is its text alone, in the grey bubble", () => {
   const markup = render({ detail: detail([message("question-a", "user", "QUESTION-A")]) });
   // The handoff draws the question as a grey bubble against the right edge:

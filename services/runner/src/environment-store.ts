@@ -1187,6 +1187,25 @@ export class EnvironmentStore {
     if ((this.config.platform ?? process.platform) !== "win32") return error;
     const detail = [error instanceof Error ? error.message : String(error),
       (error as { stdout?: string }).stdout ?? "", (error as { stderr?: string }).stderr ?? ""].join("\n");
+    // [W15 access-violation face] A provisioner that dies with 0xC0000005
+    // (STATUS_ACCESS_VIOLATION; Node surfaces it as error.code 3221225477
+    // or -1073741819) is the machine's broken VC++ runtime shape, not a
+    // package, network or path problem — every other diagnostic here would
+    // send the user down the wrong track. Translate it into the two
+    // operator fixes BEFORE anything else can mask it (the message is what
+    // GET setup surfaces to the settings page, so this is the user-facing
+    // hint the field asked for).
+    const exitCode = (error as { code?: unknown }).code;
+    if (exitCode === 3221225477 || exitCode === -1073741819
+      || /3221225477|1073741819|0xC0000005|Access is denied/i.test(detail)) {
+      const diagnostic = [
+        "The environment provisioner (micromamba) crashed with a Windows access violation (0xC0000005). This is a machine-level runtime problem, not a package or network failure.",
+        "Fix it with either of the following, then retry from System Settings:",
+        "1. Install the Microsoft Visual C++ Redistributable (x64): https://aka.ms/vs/17/release/vc_redist.x64.exe",
+        "2. Or run an administrator terminal: sfc /scannow (repairs corrupted system files, takes several minutes), then restart the app.",
+      ].join("\n");
+      return new Error(`${diagnostic}\n\nOriginal output:\n${detail.slice(0, 1200)}`);
+    }
     if (!looksLikePathLengthFailure(detail)) return error;
     const root = this.packagesRoot;
     let reset = "";

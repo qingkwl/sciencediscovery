@@ -20,6 +20,22 @@ test("stack args pin the start-stack contract", () => {
   assert.deepEqual(args, ["--mode", "local", "--no-node-build"]);
 });
 
+// [W31-③] The dead-port precheck in main.ts (ensureBackend) must not regress
+// to a seconds-scale budget: a live loopback backend answers in single-digit
+// ms and a dead port refuses instantly, so anything above a couple of poll
+// intervals is pure cold-start waste (measured 1.05s per start before W31).
+// The budget literal lives in main.ts; this test reads the source so a quiet
+// bump fails here instead of silently taxing every launch.
+test("ensureBackend precheck budget stays in the fast-fail range", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const { fileURLToPath } = await import("node:url");
+  const source = await readFile(fileURLToPath(new URL("../src/main.ts", import.meta.url)), "utf8");
+  const call = /waitHealthy\(endpoints\.health,\s*(\d+),\s*fetch\)/.exec(source);
+  assert.ok(call, "ensureBackend precheck call site not found");
+  const budget = Number(call[1]);
+  assert.ok(budget > 0 && budget <= 500, `precheck budget ${budget}ms exceeded the 500ms fast-fail ceiling`);
+});
+
 test("poll delay stays fast for the first minute, then doubles, caps at 5s, gives up past the max", () => {
   // Fast window: flat base interval (default 250ms) until 60s.
   assert.equal(nextPollDelayMs(0, 120_000), 250);

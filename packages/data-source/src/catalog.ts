@@ -128,19 +128,72 @@ export class McpSourceCatalog {
 
   async refresh(signal?: AbortSignal): Promise<McpCatalog> {
     const revision = this.configurationRevision?.();
-    return this.applyCurrent(await this.gateway.catalog(signal, this.proxyMapProvider?.()), revision);
+    const run = this.gateway.catalog(signal, this.proxyMapProvider?.())
+      .then((catalog) => this.applyCurrent(catalog, revision));
+    return this.trackInFlight(run);
   }
 
   async reload(signal?: AbortSignal): Promise<McpCatalog> {
     const revision = this.configurationRevision?.();
-    return this.applyCurrent(await this.gateway.reload(this.proxyMapProvider?.(), signal), revision);
+    const run = this.gateway.reload(this.proxyMapProvider?.(), signal)
+      .then((catalog) => this.applyCurrent(catalog, revision));
+    return this.trackInFlight(run);
   }
+
+  /** Publish the in-flight snapshot so reloadIfChanged can await it instead
+   * of stacking a second full reload behind the boot wave. [W31-④ follow-up] */
+  private trackInFlight(run: Promise<McpCatalog>): Promise<McpCatalog> {
+    this.inFlight = run;
+    return run.finally(() => {
+      if (this.inFlight === run) this.inFlight = undefined;
+    });
+  }
+
+  /** [W31-④] Reset-and-reconnect only when something actually changed.
+   *
+   * The first-chat warmup used to call `reload()` unconditionally: the
+   * boot-time refresh had just connected every stdio server (three child
+   * processes, ~1.3s), and the warmup's `reload` closed all of them and
+   * re-spawned the full set — the "pre-warm" was pure reset. This variant
+   * compares the configuration revision that produced the current catalog
+   * with the live one: unchanged (and a catalog present) returns the
+   * current snapshot with zero reconnects. A revision mismatch or a missing
+   * catalog falls through to the full `reload`, so a real configuration
+   * change still rebuilds everything exactly as before.
+   *
+   * [W31-④ follow-up] The warmup can also lose a race with the boot-time
+   * refresh itself: with the refresh off the health gate (W31-②) the
+   * shell's warmup POST sometimes arrives before the boot wave has applied
+   * its catalog — `this.catalog` is still unset, so the check below would
+   * fall through and issue a second full reload right behind the first one
+   * (observed live: warmup POST right after ready, boot catalog ~1s later,
+   * second full wave immediately after). Instead of falling through blind,
+   * wait for the in-flight `refresh`/`reload` to settle, then re-check:
+   * when the boot wave lands first and the revision matches, the warmup
+   * returns the fresh catalog with zero reconnects. */
+  async reloadIfChanged(signal?: AbortSignal): Promise<McpCatalog> {
+    if (this.inFlight) await this.inFlight.catch(() => undefined);
+    const liveRevision = this.configurationRevision?.();
+    if (this.catalog && liveRevision !== undefined && this.catalogRevision === liveRevision) {
+      return this.getCatalog()!;
+    }
+    return this.reload(signal);
+  }
+
+  /** Revision of the configuration that produced the CURRENT catalog snapshot
+   * (undefined until the first refresh/reload lands). [W31-④] */
+  private catalogRevision?: string;
+
+  /** The in-flight refresh/reload (W31-② moved the boot refresh off the
+   * health gate, so callers can now overlap it). [W31-④ follow-up] */
+  private inFlight?: Promise<unknown>;
 
   /** Leave the current registry untouched when an in-flight snapshot expired. */
   private applyCurrent(catalog: McpCatalog, revision: string | undefined): McpCatalog {
     if (revision !== this.configurationRevision?.()) {
       return { ...catalog, revision: createHash("sha256").update("[]").digest("hex"), servers: [] };
     }
+    this.catalogRevision = revision;
     return this.apply(catalog);
   }
 

@@ -287,6 +287,12 @@
   justify-content: flex-end;
 }
 
+/* A row that carries a note wraps it onto a full-width line under the title
+   and control. The note is a sentence about the row, not another control, so
+   its length must not decide how wide `.row-control` becomes. */
+.settings-group-detail .settings-row.has-note { flex-wrap: wrap; }
+.settings-group-detail .settings-row.has-note > .row-note-line { flex: 1 0 100%; min-width: 0; }
+.settings-group-detail .settings-row.has-note > .row-note-line .row-note { margin-top: 0; }
 .settings-group-detail .settings-row.is-stack {
   flex-direction: column;
   align-items: stretch;
@@ -419,6 +425,17 @@
 
 .mcp-import-menu { position: relative; }
 .mcp-import-trigger { display: inline-flex; align-items: center; gap: 7px; }
+.mcp-server-row { flex-wrap: wrap; }
+.mcp-server-row > .settings-card-main { flex: 1 1 220px; }
+.mcp-server-row > .settings-card-main strong { flex-wrap: wrap; }
+.mcp-server-row > .settings-card-main small { overflow-wrap: anywhere; }
+.mcp-server-row .settings-tag { white-space: nowrap; }
+.mcp-source-actions { flex: 0 1 auto; max-width: 100%; flex-wrap: wrap; justify-content: flex-end; }
+.mcp-default-choice, .mcp-service-choice { display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; font-size: 12px; }
+.mcp-default-choice input { margin: 0; }
+.mcp-service-choice { margin-left: 8px; }
+.mcp-row-menu .skill-row-menu-popover { width: 196px; }
+.skill-row-menu-item:disabled { opacity: 0.5; cursor: not-allowed; }
 .mcp-import-popover {
   position: absolute;
   top: calc(100% + 6px);
@@ -560,6 +577,9 @@
 .settings-list-heading h3 { margin: 0; font-size: 14px; }
 .settings-number { display: flex; flex-direction: column; gap: 6px; max-width: 100%; }
 .settings-number .field-input.is-number { width: 112px; max-width: 100%; }
+/* A value the page refuses to send carries the same danger border the
+   configuration forms use, so it reads as invalid before the note is read. */
+.settings-section .settings-row input[aria-invalid="true"] { border-color: var(--danger); }
 .environment-setup-progress,
 .proxy-diagnostics { display: grid; gap: 12px; font-size: 13px; color: var(--text-secondary); }
 .environment-setup-progress > div,
@@ -629,3 +649,45 @@
 @container (max-width: 520px) {
   .usage-settings-metrics { grid-template-columns: minmax(0, 1fr); }
 }
+
+/* A settings page whose first read has no remembered answer paints its layout
+   instead of a single loading line: the same blocks the answer will draw, at
+   the same sizes, so nothing moves when it lands. A revisit paints the cached
+   answer and never shows this frame. */
+.settings-skeleton { display: grid; gap: 0; }
+.settings-skeleton-block {
+  display: block;
+  min-width: 0;
+  border-radius: 8px;
+  background: linear-gradient(90deg, var(--surface-hover) 25%, var(--surface-subtle) 50%, var(--surface-hover) 75%);
+  background-size: 200% 100%;
+  animation: settings-skeleton-shimmer 1.2s ease-in-out infinite;
+}
+@keyframes settings-skeleton-shimmer {
+  from { background-position: 200% 0; }
+  to { background-position: -200% 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .settings-skeleton-block { animation: none; }
+}
+/* 运行环境: one card per machine, drawn inside the loaded card's own frame. */
+.settings-skeleton-card .is-runner-mark { width: 32px; height: 32px; flex: 0 0 auto; border-radius: 8px; }
+.settings-skeleton-card-main { display: grid; flex: 1; gap: 7px; }
+.settings-skeleton-card-main .is-runner-name { width: 30%; height: 12px; }
+.settings-skeleton-card-main .is-runner-detail { width: 55%; height: 9px; }
+.settings-skeleton-card .is-runner-action { width: 76px; height: 28px; flex: 0 0 auto; border-radius: var(--radius-s); }
+/* 模型用量: the three metric cards and the model table. */
+.settings-skeleton-block.is-usage-metric-label { width: 44%; height: 11px; }
+.settings-skeleton-block.is-usage-metric-value { width: 60%; height: 23px; margin-top: 12px; }
+.settings-skeleton-table { display: grid; min-width: 480px; }
+.settings-skeleton-row {
+  display: grid;
+  grid-template-columns: 40% minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr);
+  align-items: center;
+  gap: 16px;
+  padding: 12px 16px;
+}
+.settings-skeleton-row:first-child { background: var(--surface-subtle); }
+.settings-skeleton-row + .settings-skeleton-row { border-top: 1px solid #ededed; }
+.settings-skeleton-row .settings-skeleton-block { height: 12px; }
+.settings-skeleton-row .settings-skeleton-block.is-name { height: 26px; }

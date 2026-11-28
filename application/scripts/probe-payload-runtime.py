@@ -309,6 +309,20 @@ def check_packages(present):
     )
 
 
+def probe_store_with_w8_escape():
+    """The store add+query leg. The W8 escape hatch
+    (SD_PROBE_SKIP_STORE_WRITE=1) was REMOVED after the build machine's
+    chromadb Rust add segfault (problems/W8, machine-level VC++ runtime damage)
+    was fixed by reinstalling the VC++ x64 redistributable - verified green
+    twice: dev-venv retest AND a full assemble probe run, both 2026-11-25.
+    The leg is now mandatory again: a segfault here fails the build loudly
+    instead of shipping with a hand-verify note.
+    """
+    import asyncio
+
+    return asyncio.run(probe_store())
+
+
 def main():
     present = {
         name: importlib.util.find_spec(name) is not None
@@ -326,7 +340,7 @@ def main():
         print(f"FAIL: {table_error}", file=sys.stderr)
         return 1
 
-    kind, ordered, scores = asyncio.run(probe_store())
+    kind, ordered, scores = probe_store_with_w8_escape()
     print(f"store write+query: {kind} -> {ordered} scores={scores}")
 
     via_add, via_query, via_ef = probe_default_embedding()

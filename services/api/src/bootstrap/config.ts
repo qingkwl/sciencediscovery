@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -49,6 +50,13 @@ export interface ServerConfig {
   modelCatalogPath: string;
   paperPythonPath: string;
   paperWorkerPath: string;
+  /**
+   * [D3 P2-2] Frozen rail: when a sd-services onedir exists, the paper
+   * worker spawns as `<exe> paper <pdf> <out>` (the dispatcher's paper
+   * entry runs the loose-file worker). Undefined keeps the venv rail
+   * (`pythonPath + workerPath`), which P3-3 retires after P4's window.
+   */
+  paperFrozenCommand?: { exe: string; args: string[] };
   port: number;
   /**
    * The port users open when another process owns the public one (the JiuwenSwarm adapter sits in front of
@@ -237,6 +245,17 @@ export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCo
       ? resolve(repositoryRoot, env.SCIENCE_AGENT_PAPER_PYTHON_PATH.trim())
       : resolve(dataDir, "envs/paper/bin/python"),
     paperWorkerPath: resolve(repositoryRoot, env.SCIENCE_AGENT_PAPER_WORKER_PATH?.trim() || "services/paper/paper_worker.py"),
+    // [D3 P2-2] frozen rail: an explicit env override wins, else a
+    // sd-services onedir under the data dir (the P2-5 assemble layout)
+    // is used when present. SD_SD_SERVICES_FREEZE=0 forces the venv
+    // rail (verification window).
+    ...(() => {
+      const explicit = env.SCIENCE_AGENT_SD_SERVICES_EXE?.trim();
+      if (explicit) return { paperFrozenCommand: { exe: resolve(repositoryRoot, explicit), args: ["paper"] } };
+      if (env.SD_SD_SERVICES_FREEZE === "0") return {};
+      const frozenExe = resolve(dataDir, "frozen", "sd-services", "sd-services", "sd-services.exe");
+      return existsSync(frozenExe) ? { paperFrozenCommand: { exe: frozenExe, args: ["paper"] } } : {};
+    })(),
     port,
     ...(publicPort !== undefined ? { publicPort } : {}),
     permissionWaitTimeoutMs,

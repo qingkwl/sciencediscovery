@@ -29,9 +29,10 @@
  */
 
 import { createHash } from "node:crypto";
-import { statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { delimiter, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import { repositoryRoot } from "../bootstrap/config.js";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
@@ -193,6 +194,28 @@ function interpreterOnPath(env: NodeJS.ProcessEnv): string | undefined {
 export function resolveMcpPython(env: NodeJS.ProcessEnv = process.env, dataDir?: string): string {
   const configured = env.SCIENCE_AGENT_GATEWAY_PYTHON_PATH?.trim();
   if (configured) return configured;
+  // [D3 P2-2] frozen rail: a sd-services onedir under the data dir (the
+  // P2-5 assemble layout) or an explicit env override spawns the MCP
+  // servers through the dispatcher exe; its -m channel carries
+  // `python -m sciencediscovery_gateway.*` args unchanged, so the spawn
+  // site needs no edit. SD_SD_SERVICES_FREEZE=0 forces the venv rail
+  // (dev escape hatch only — the packaged payload ships no venv since the
+  // P3-4 early retirement, and start-stack's resolver hard-fails there
+  // before the API is up, so this branch cannot silently fall through in
+  // a packaged install).
+  if (env.SD_SD_SERVICES_FREEZE !== "0") {
+    const frozen = env.SCIENCE_AGENT_SD_SERVICES_EXE?.trim();
+    const roots = [
+      ...(dataDir?.trim() ? [resolve(process.cwd(), dataDir.trim())] : []),
+      ...(env.SCIENCE_AGENT_DATA_DIR?.trim() ? [resolve(process.cwd(), env.SCIENCE_AGENT_DATA_DIR.trim())] : []),
+    ];
+    for (const root of roots) {
+      const cand = frozen
+        ? resolve(process.cwd(), frozen)
+        : join(root, "frozen", "sd-services", "sd-services", "sd-services.exe");
+      if (runnableFile(cand)) return cand;
+    }
+  }
   // Explicit roots first: the data dir the API resolved, then an env-var data
   // dir, then an operator-set envs root. The cwd-relative defaults come last so
   // an incidental checkout layout cannot outrank a configured environment.
@@ -469,6 +492,17 @@ export class McpNodeClient {
         // the parent carries it (set by packagedEnv on darwin; absent on
         // win32 dev — no-op there).
         if (process.env.PYTHONDONTWRITEBYTECODE) env.PYTHONDONTWRITEBYTECODE = process.env.PYTHONDONTWRITEBYTECODE;
+        // [D3 P3-4, W12 third strike] The frozen dispatcher's __file__ lives
+        // inside the onedir's _internal/, so external_urls.py's parent-walk
+        // no longer reaches the repository root where config/external-urls.json
+        // ships (the venv rail's editable link used to provide that hop). The
+        // spawn cwd is not the repo root either. Hand the bundled servers the
+        // absolute config path so the URL authority works from any layout.
+        if (bundledPython && !env.SCIENCE_AGENT_EXTERNAL_URLS_PATH) {
+          const configured = process.env.SCIENCE_AGENT_EXTERNAL_URLS_PATH?.trim();
+          const candidate = configured ?? resolve(repositoryRoot, "config", "external-urls.json");
+          if (existsSync(candidate)) env.SCIENCE_AGENT_EXTERNAL_URLS_PATH = resolve(candidate);
+        }
         const transport = new StdioClientTransport({
           args: server.args,
           command,

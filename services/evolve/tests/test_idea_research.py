@@ -3,6 +3,7 @@ import pytest
 
 pytestmark = pytest.mark.science_tags(category='ut', os='linux', arch=('amd64', 'arm64'))
 import asyncio
+import copy
 import io
 import json
 import tempfile
@@ -12,7 +13,8 @@ import unittest.mock
 import urllib.error
 from pathlib import Path
 
-from sciencediscovery_evolve.vendor.idea_tree.research import IdeaTreeEngine, Interrupted, ResearchStore, node, now, parse_json
+from sciencediscovery_evolve.vendor.idea_tree import research as research_module
+from sciencediscovery_evolve.vendor.idea_tree.research import BudgetReached, IdeaTreeEngine, Interrupted, ResearchStore, node, now, parse_json
 from sciencediscovery_evolve.vendor.idea_tree.research_service import Settings
 from sciencediscovery_evolve.vendor.idea_tree.templates import snapshot
 
@@ -263,6 +265,88 @@ class ResearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('Used 0 of', self.state['reason'])
         self.assertFalse(self.state['usageKnown'])
         self.assertGreater(self.state['unreportedBudgetEstimate'], 0)
+
+    async def test_a_user_end_outranks_a_budget_exhaustion(self):
+        # Issue #1455: a stop request can land after run()'s last check_stop() and before
+        # the budget reservation, which then raises BudgetReached. The irreversible end
+        # request must win and stay terminal instead of becoming a resumable pause.
+        from unittest.mock import patch
+        from sciencediscovery_evolve.vendor.idea_tree import research_service as service
+        from fastapi import HTTPException
+
+        class StopBeforeBudgetLock(asyncio.Lock):
+            """Set the user's stop at that suspension point, as a concurrent stop does."""
+            async def acquire(self):
+                engine.stop_action = 'end'
+                return await super().acquire()
+
+        self.state['settings']['maxTokens'] = 1
+        engine = IdeaTreeEngine(self.state, self.store, {}, self.model)
+        engine.usage_lock = StopBeforeBudgetLock()
+        await engine.run()
+        self.assertEqual(self.state['status'], 'ended')
+        self.assertEqual(self.state['reason'], 'Ended by user')
+        self.assertNotIn('token budget', self.state['reason'])
+        self.assertEqual(self.calls, [])
+        # `ended` is irreversible: a `continue` must be refused, unlike `paused`.
+        with patch.object(service, '_store', self.store), \
+                patch.object(service, 'start', side_effect=AssertionError('must not start')):
+            continuation = service.Command(projectId='p', sessionId='s', researchId='research-test',
+                                           operation='continue', llm=dict(url='http://localhost', token='local'))
+            with self.assertRaises(HTTPException) as conflict:
+                await service.command(continuation)
+            self.assertEqual(conflict.exception.status_code, 409)
+            self.assertIn('has ended', conflict.exception.detail)
+
+    async def test_a_user_pause_outranks_a_budget_exhaustion(self):
+        # The pause request must resolve as the user's pause, not as the budget's
+        # terminal `budget_exhausted` state.
+        class StopBeforeBudgetLock(asyncio.Lock):
+            async def acquire(self):
+                engine.stop_action = 'pause'
+                return await super().acquire()
+
+        self.state['settings']['maxTokens'] = 1
+        engine = IdeaTreeEngine(self.state, self.store, {}, self.model)
+        engine.usage_lock = StopBeforeBudgetLock()
+        await engine.run()
+        self.assertEqual(self.state['status'], 'paused')
+        self.assertEqual(self.state['reason'], 'Paused by user')
+        self.assertEqual(self.calls, [])
+
+    async def test_budget_exhaustion_without_a_stop_request_stays_terminal(self):
+        # Control: the fix must not turn plain budget exhaustion into a resumable pause.
+        self.state['settings']['maxTokens'] = 1
+        await IdeaTreeEngine(self.state, self.store, {}, self.model).run()
+        self.assertEqual(self.state['status'], 'budget_exhausted')
+        self.assertIn('Remaining token budget cannot fund the next stage', self.state['reason'])
+        self.assertIn('Used 0 of 1 tokens', self.state['reason'])
+
+    async def test_service_end_while_a_stage_hits_the_budget_settles_ended(self):
+        # The user-visible journey: `end` reaches the in-flight engine as a flag, then
+        # the in-flight stage raises BudgetReached before any stop check.
+        from unittest.mock import patch
+        from sciencediscovery_evolve.vendor.idea_tree import research_service as service
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def ask(engine, role, payload, check=None):
+            entered.set()
+            await release.wait()
+            raise BudgetReached('Remaining token budget cannot fund the next stage')
+
+        with patch.object(service, '_store', self.store), patch.object(IdeaTreeEngine, 'ask', ask):
+            created = await service.command(service.Command(projectId='p', sessionId='s', operation='create',
+                                                            objective='Goal', llm=dict(url='http://localhost', token='local')))
+            identifier = created['research']['id']
+            await entered.wait()
+            ending = await service.command(service.Command(projectId='p', sessionId='s', researchId=identifier,
+                                                           operation='end'))
+            self.assertEqual(ending['research']['status'], 'pausing')
+            release.set()
+            await service._running[identifier][1]
+            settled = service.state_for('p', 's', identifier)
+            self.assertEqual(settled['status'], 'ended')
+            self.assertEqual(settled['reason'], 'Ended by user')
 
     async def test_a_branch_at_the_ceiling_records_the_direction_it_could_not_place(self):
         """F8: a candidate parent at maxDepth - 1 leaves allowance 0, so the candidate
@@ -642,14 +726,258 @@ class ResearchTests(unittest.IsolatedAsyncioTestCase):
             release.set()
             await task
             self.assertEqual(service.state_for('p', 's', identifier)['status'], 'paused')
-            # A persisted running flag after a process restart is never an auto-resume instruction.
+            # A persisted running flag after a process restart is never an auto-resume
+            # instruction, but the read path may not settle it: the verdict belongs to
+            # the startup reconciliation, not to whichever request reads first (#1456).
             saved = self.store.read('p', 's', identifier)
             saved['status'] = 'running'
             self.store.save(saved)
+            path = self.store.path('p', 's', identifier)
+            before = path.read_bytes()
+            self.assertEqual(service.state_for('p', 's', identifier)['status'], 'running')
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(service.reconcile_orphaned_researches(), 1)
+            restarted = self.store.read('p', 's', identifier)
+            self.assertEqual(restarted['status'], 'interrupted')
+            self.assertEqual(restarted['reason'], 'Service restarted; continue manually')
             self.assertEqual(service.state_for('p', 's', identifier)['status'], 'interrupted')
+            # Already settled: a second boot has nothing to do.
+            self.assertEqual(service.reconcile_orphaned_researches(), 0)
             ended = await service.command(service.Command(projectId='p', sessionId='s', researchId=identifier, operation='end'))
             self.assertEqual(ended['research']['status'], 'ended')
             self.assertNotIn(identifier, service._running)
+
+    async def test_a_research_ended_in_flight_comes_back_ended_after_a_restart(self):
+        # #1464: `end` during a live run only reached the engine's memory, so a
+        # restart before the in-flight stage returned folded the user's verdict into
+        # `interrupted` and `continue` was accepted again. The request is persisted
+        # while the run is still `pausing`, and the restart maps it to `ended`.
+        from unittest.mock import patch
+        from sciencediscovery_evolve.vendor.idea_tree import research_service as service
+        from fastapi import HTTPException
+        entered = asyncio.Event()
+        async def ask(engine, role, payload, check=None):
+            entered.set()
+            await asyncio.Event().wait()  # the process dies before this call returns
+        with patch.object(service, '_store', self.store), patch.object(service, '_running', {}), \
+                patch.object(IdeaTreeEngine, 'ask', ask):
+            created = await service.command(service.Command(projectId='p', sessionId='s', operation='create', objective='Goal', llm=dict(url='http://localhost', token='local')))
+            identifier = created['research']['id']
+            await entered.wait()
+            # The stage records itself as running before it awaits the model call.
+            service._running[identifier][0].state.setdefault('activities', []).append(
+                dict(role='design', nodeId='ROOT', round=1, status='running', startedAt=now(), finishedAt=None, error=None))
+            ending = await service.command(service.Command(projectId='p', sessionId='s', researchId=identifier, operation='end'))
+            # The runtime status is still `pausing`: the SSE stream keeps running and
+            # the engine settles the run normally.
+            self.assertEqual(ending['research']['status'], 'pausing')
+            # The stop intent itself is on disk while the run is still in flight.
+            in_flight = self.store.read('p', 's', identifier)
+            self.assertEqual(in_flight['status'], 'pausing')
+            self.assertEqual(in_flight['pendingStop'], 'end')
+            task = service._running[identifier][1]
+            # The process dies before the in-flight stage settles.
+            service._running.clear()
+            self.assertEqual(service.reconcile_orphaned_researches(), 1)
+            restarted = self.store.read('p', 's', identifier)
+            self.assertEqual(restarted['status'], 'ended')
+            self.assertEqual(restarted['reason'], 'Ended by user')
+            self.assertEqual([a['status'] for a in restarted['activities']], ['stopped'])
+            self.assertNotIn('pendingStop', restarted)
+            self.assertEqual(service.state_for('p', 's', identifier)['status'], 'ended')
+            with self.assertRaises(HTTPException) as conflict:
+                await service.command(service.Command(projectId='p', sessionId='s', researchId=identifier, operation='continue', llm=dict(url='http://localhost', token='local')))
+            self.assertEqual(conflict.exception.status_code, 409)
+            self.assertIn('has ended', conflict.exception.detail)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+    async def test_a_graceful_shutdown_keeps_the_pending_end_for_the_next_boot(self):
+        # The settle mark must survive any exit that did not settle the run: a
+        # cancelled drive task (SIGINT/loop shutdown) leaves `pausing`, and clearing
+        # the mark there would fold the user's `end` into `interrupted` on the next
+        # boot again (#1464).
+        from unittest.mock import patch
+        from sciencediscovery_evolve.vendor.idea_tree import research_service as service
+        from fastapi import HTTPException
+        entered = asyncio.Event()
+        async def ask(engine, role, payload, check=None):
+            entered.set()
+            await asyncio.Event().wait()
+        with patch.object(service, '_store', self.store), patch.object(service, '_running', {}), \
+                patch.object(IdeaTreeEngine, 'ask', ask):
+            created = await service.command(service.Command(projectId='p', sessionId='s', operation='create', objective='Goal', llm=dict(url='http://localhost', token='local')))
+            identifier = created['research']['id']
+            await entered.wait()
+            service._running[identifier][0].state.setdefault('activities', []).append(
+                dict(role='design', nodeId='ROOT', round=1, status='running', startedAt=now(), finishedAt=None, error=None))
+            await service.command(service.Command(projectId='p', sessionId='s', researchId=identifier, operation='end'))
+            task = service._running[identifier][1]
+            # Graceful shutdown: the drive task is cancelled before the in-flight call
+            # returns, so the run never reaches a settle branch.
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            persisted = self.store.read('p', 's', identifier)
+            self.assertEqual(persisted['status'], 'pausing')
+            self.assertEqual(persisted['pendingStop'], 'end')
+            self.assertEqual(service.reconcile_orphaned_researches(), 1)
+            restarted = self.store.read('p', 's', identifier)
+            self.assertEqual(restarted['status'], 'ended')
+            self.assertEqual(restarted['reason'], 'Ended by user')
+            self.assertEqual([a['status'] for a in restarted['activities']], ['stopped'])
+            self.assertNotIn('pendingStop', restarted)
+            with self.assertRaises(HTTPException) as conflict:
+                await service.command(service.Command(projectId='p', sessionId='s', researchId=identifier, operation='continue', llm=dict(url='http://localhost', token='local')))
+            self.assertEqual(conflict.exception.status_code, 409)
+
+    async def test_a_live_end_still_settles_ended_and_drops_the_persisted_stop(self):
+        # #1464 keeps the existing invariants: `end` does not shortcut to `ended`
+        # while the run is live (so the stream, the model grant and the one research
+        # per Session guard stay as they were), the engine settles the same
+        # `ended` / `Ended by user`, and the persisted mark does not outlive it.
+        from unittest.mock import patch
+        from sciencediscovery_evolve.vendor.idea_tree import research_service as service
+        from fastapi import HTTPException
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def ask(engine, role, payload, check=None):
+            entered.set()
+            await release.wait()
+            engine.check_stop()
+            return dict(candidates=[], reason='Done')
+        with patch.object(service, '_store', self.store), patch.object(service, '_running', {}), \
+                patch.object(IdeaTreeEngine, 'ask', ask):
+            created = await service.command(service.Command(projectId='p', sessionId='s', operation='create', objective='Goal', llm=dict(url='http://localhost', token='local')))
+            identifier = created['research']['id']
+            await entered.wait()
+            ending = await service.command(service.Command(projectId='p', sessionId='s', researchId=identifier, operation='end'))
+            self.assertEqual(ending['research']['status'], 'pausing')
+            self.assertEqual(service.state_for('p', 's', identifier)['status'], 'pausing')
+            # No second research is admitted in this Session while the first settles.
+            with self.assertRaises(HTTPException) as conflict:
+                await service.command(service.Command(projectId='p', sessionId='s', operation='create', objective='Another goal', llm=dict(url='http://localhost', token='local')))
+            self.assertEqual(conflict.exception.status_code, 409)
+            task = service._running[identifier][1]
+            release.set()
+            await task
+            settled = self.store.read('p', 's', identifier)
+            self.assertEqual(settled['status'], 'ended')
+            self.assertEqual(settled['reason'], 'Ended by user')
+            self.assertNotIn('pendingStop', settled)
+            self.assertNotIn(identifier, service._running)
+
+    async def test_a_research_paused_in_flight_comes_back_paused_after_a_restart(self):
+        # The same restart window for `pause`: the user asked to keep the run
+        # resumable, so the recovered status is `paused`, not `interrupted`. A
+        # record written before the mark existed keeps the interrupted verdict.
+        from unittest.mock import patch
+        from sciencediscovery_evolve.vendor.idea_tree import research_service as service
+        entered = asyncio.Event()
+        async def ask(engine, role, payload, check=None):
+            entered.set()
+            await asyncio.Event().wait()
+        with patch.object(service, '_store', self.store), patch.object(service, '_running', {}), \
+                patch.object(IdeaTreeEngine, 'ask', ask):
+            created = await service.command(service.Command(projectId='p', sessionId='s', operation='create', objective='Goal', llm=dict(url='http://localhost', token='local')))
+            identifier = created['research']['id']
+            await entered.wait()
+            # The stage records itself as running before it awaits the model call.
+            service._running[identifier][0].state.setdefault('activities', []).append(
+                dict(role='design', nodeId='ROOT', round=1, status='running', startedAt=now(), finishedAt=None, error=None))
+            pausing = await service.command(service.Command(projectId='p', sessionId='s', researchId=identifier, operation='pause'))
+            self.assertEqual(pausing['research']['status'], 'pausing')
+            self.assertEqual(self.store.read('p', 's', identifier)['pendingStop'], 'pause')
+            task = service._running[identifier][1]
+            service._running.clear()
+            self.assertEqual(service.reconcile_orphaned_researches(), 1)
+            restarted = self.store.read('p', 's', identifier)
+            self.assertEqual(restarted['status'], 'paused')
+            self.assertEqual(restarted['reason'], 'Paused by user')
+            self.assertEqual([a['status'] for a in restarted['activities']], ['stopped'])
+            self.assertNotIn('pendingStop', restarted)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        # The dead run's own final save is not part of this simulation; drop it so the
+        # next reconciliation sees only the legacy record.
+        self.store.path('p', 's', identifier).unlink()
+        # A legacy pausing record has no mark: it keeps the restart verdict.
+        legacy = copy.deepcopy(self.state)
+        legacy.update(id='research-legacy', status='pausing', activities=[
+            dict(role='design', nodeId='ROOT', round=1, status='running', startedAt=now(), finishedAt=None, error=None)])
+        self.store.save(legacy)
+        with patch.object(service, '_store', self.store), patch.object(service, '_running', {}):
+            self.assertEqual(service.reconcile_orphaned_researches(), 1)
+        settled = self.store.read('p', 's', 'research-legacy')
+        self.assertEqual(settled['status'], 'interrupted')
+        self.assertEqual(settled['reason'], 'Service restarted; continue manually')
+        self.assertEqual(settled['activities'][0]['status'], 'stopped')
+
+    async def test_reading_a_research_never_writes_it(self):
+        # #1456: list/get/events are reads. A `running` record with no engine in
+        # this process is a restart orphan, but only the startup reconciliation may
+        # settle it: the old read path persisted `interrupted` and closed the running
+        # activities, once per streamed frame and even for an archived Session.
+        from unittest.mock import patch
+        from sciencediscovery_evolve.vendor.idea_tree import research_service as service
+        self.state.update(status='running', activities=[
+            dict(role='design', nodeId='ROOT', round=1, status='running', startedAt=now(), finishedAt=None, error=None)])
+        self.store.save(self.state)
+        path = self.store.path('p', 's', 'research-test')
+        before = path.read_bytes()
+        with patch.object(service, '_store', self.store), patch.object(service, '_running', {}):
+            listed = await service.command(service.Command(projectId='p', sessionId='s', operation='list'))
+            self.assertEqual([item['research']['status'] for item in listed['items']], ['running'])
+            self.assertEqual(path.read_bytes(), before, 'list must not rewrite the research')
+            fetched = await service.command(service.Command(projectId='p', sessionId='s', researchId='research-test', operation='get'))
+            self.assertEqual(fetched['research']['status'], 'running')
+            self.assertEqual(path.read_bytes(), before, 'get must not rewrite the research')
+            # The events path reads once before streaming and again on every frame.
+            response = await service.events(service.Command(projectId='p', sessionId='s', researchId='research-test', operation='events'))
+            frame = await response.body_iterator.__anext__()
+            await response.body_iterator.aclose()
+            self.assertEqual(json.loads(frame.split('data: ', 1)[1])['research']['status'], 'running')
+            self.assertEqual(path.read_bytes(), before, 'the events stream must not rewrite the research')
+
+    def test_startup_reconciliation_settles_only_orphans(self):
+        # #1456: the restart verdict is one boot-time pass, not a read side effect.
+        from unittest.mock import patch
+        from sciencediscovery_evolve.vendor.idea_tree import research_service as service
+        activity = dict(role='design', nodeId='ROOT', round=1, status='running', startedAt=now(), finishedAt=None, error=None)
+        for identifier, status in [('research-running', 'running'), ('research-pausing', 'pausing'),
+                                   ('research-paused', 'paused'), ('research-completed', 'completed')]:
+            state = copy.deepcopy(self.state)
+            state.update(id=identifier, status=status, activities=[dict(activity)])
+            self.store.save(state)
+        paused_bytes = self.store.path('p', 's', 'research-paused').read_bytes()
+        completed_bytes = self.store.path('p', 's', 'research-completed').read_bytes()
+        with patch.object(service, '_store', self.store), patch.object(service.log, 'info') as info:
+            # A research this process is driving is not an orphan, even if this pass
+            # is invoked again.
+            with patch.object(service, '_running', {'research-running': (None, None)}):
+                self.assertEqual(service.reconcile_orphaned_researches(), 1)
+                info.assert_called_once_with('settled %d research(es) interrupted by a service restart', 1)
+                still_running = self.store.read('p', 's', 'research-running')
+                self.assertEqual(still_running['status'], 'running')
+                self.assertEqual(still_running['activities'][0]['status'], 'running')
+            info.reset_mock()
+            self.assertEqual(service.reconcile_orphaned_researches(), 1)
+            info.assert_called_once_with('settled %d research(es) interrupted by a service restart', 1)
+            info.reset_mock()
+            self.assertEqual(service.reconcile_orphaned_researches(), 0)
+            info.assert_not_called()
+        for identifier in ('research-running', 'research-pausing'):
+            settled = self.store.read('p', 's', identifier)
+            self.assertEqual(settled['status'], 'interrupted')
+            self.assertEqual(settled['reason'], 'Service restarted; continue manually')
+            self.assertEqual(settled['activities'][0]['status'], 'stopped')
+            self.assertTrue(settled['activities'][0]['finishedAt'])
+            self.assertEqual(settled['activities'][0]['error'], 'Service restarted')
+        # Terminal and user-paused researches are left exactly as they were.
+        self.assertEqual(self.store.path('p', 's', 'research-paused').read_bytes(), paused_bytes)
+        self.assertEqual(self.store.path('p', 's', 'research-completed').read_bytes(), completed_bytes)
+        self.assertEqual(self.store.read('p', 's', 'research-paused')['activities'][0]['status'], 'running')
 
     async def test_service_refuses_to_continue_a_budget_exhausted_research(self):
         # The Python lifecycle must reject the terminal budget state too, even if a
@@ -983,3 +1311,164 @@ def test_a_research_with_non_ascii_content_reads_on_a_non_utf8_host(tmp_path):
     # Both the single read and the directory scan: `get` after a restart goes
     # through read(), `list` always goes through the scan (research_service.py).
     assert read_on_a_host_with_ascii_as_the_default_codec(tmp_path, RESEARCH_READ_SCRIPT) == "ok"
+
+
+class LiveFrameTests(unittest.IsolatedAsyncioTestCase):
+    """#1454: a live frame carries the change, not the whole tree."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.store = ResearchStore(Path(self.temp.name))
+        self.state = dict(id='research-test', projectId='p', sessionId='s', objective='Compare directions.',
+                          materials='material', modelId='m', settings=Settings(candidatesPerRound=1, maxDepth=6).model_dump(),
+                          template=snapshot('scientific-hypothesis-general/v1'), status='running', phase='ideate',
+                          round=0, batch=[], batchCompleted=0, tokens=0, usageKnown=True, reason=None,
+                          currentNodeId=None, createdAt=now(), updatedAt=now(),
+                          nodes=[node('ROOT', None, 'Goal', 'direction', 0)])
+
+    def grow(self, count, first=1):
+        """`count` candidates, each with a design stage big enough to show in a payload."""
+        for index in range(first, first + count):
+            added = node(str(index), 'ROOT', f'Candidate {index}', 'candidate', 1)
+            added['stages'] = {'design': {'text': 'a long design ' * 400}}
+            self.state['nodes'].append(added)
+            self.state['nodes'][0]['childrenIds'].append(str(index))
+
+    def test_a_lean_node_never_builds_the_stage_serialisation_it_omits(self):
+        # Building `result` and then deleting it was the expensive half of the frame:
+        # for a designed candidate the string is as large as the node itself.
+        from unittest.mock import patch
+        self.grow(1)
+        self.state['nodes'][1]['stages'] = {'design': {'text': 'x' * 8000}}
+        engine = IdeaTreeEngine(self.state, self.store, {})
+        calls = []
+        real = json.dumps
+
+        def counting(*args, **kwargs):
+            calls.append(args[0] if args else kwargs)
+            return real(*args, **kwargs)
+
+        with patch.object(research_module.json, 'dumps', counting):
+            lean = research_module.graph_node(self.state['nodes'][1], False)
+            self.assertEqual(calls, [], 'a frame node serialises no stages')
+            heavy = research_module.graph_node(self.state['nodes'][1], True)
+        self.assertNotIn('result', lean)
+        self.assertEqual(len(calls), 1, 'the read model still serialises stages once')
+        self.assertEqual(json.loads(heavy['result']), {'design': {'text': 'x' * 8000}})
+
+    def test_a_get_answer_still_carries_result_and_the_insight_log(self):
+        from unittest.mock import patch
+        from sciencediscovery_evolve.vendor.idea_tree import research_service as service
+        self.grow(1)
+        self.state['nodes'][1]['insightRecords'] = [dict(id='insight-1', summary='lesson')]
+        self.store.save(self.state)
+        with patch.object(service, '_store', self.store):
+            answer = service.view(self.state)
+        node = answer['graph']['nodes'][1]
+        self.assertEqual(json.loads(node['result']), {'design': {'text': 'a long design ' * 400}})
+        self.assertEqual(node['insightRecords'], [dict(id='insight-1', summary='lesson')])
+        self.assertNotIn('nodes', answer['research'])
+
+    def test_the_first_frame_is_the_whole_tree_without_the_fields_the_view_does_not_draw(self):
+        self.grow(12)
+        self.store.save(self.state)
+        graph, cursor = IdeaTreeEngine(self.state, self.store, {}).graph_frame(None)
+        self.assertTrue(graph['full'])
+        self.assertEqual(graph['revision'], self.state['revision'])
+        self.assertEqual([n['id'] for n in graph['nodes']], [n['id'] for n in self.state['nodes']])
+        self.assertEqual(len(graph['edges']), 12)
+        for item in graph['nodes']:
+            self.assertNotIn('result', item)
+            self.assertNotIn('insightRecords', item)
+            self.assertIn('stages', item)  # the node detail still renders it
+        assert cursor[0] == self.state['revision']
+
+    def test_a_frame_grows_with_the_change_not_with_the_tree(self):
+        sizes = []
+        totals = []
+        for count in (4, 40):
+            self.setUp()
+            self.grow(count)
+            self.store.save(self.state)
+            full, cursor = IdeaTreeEngine(self.state, self.store, {}).graph_frame(None)
+            self.state['nodes'][1]['status'] = 'done'
+            self.state['nodes'][1]['score'] = 7.5
+            self.store.save(self.state)
+            delta, _ = IdeaTreeEngine(self.state, self.store, {}).graph_frame(cursor)
+            self.assertFalse(delta['full'])
+            self.assertEqual(delta['since'], cursor[0], 'the frame names the revision it was computed from')
+            self.assertEqual([n['id'] for n in delta['nodes']], ['1'], 'only the node that changed')
+            self.assertLess(len(json.dumps(delta)) * 2, len(json.dumps(full)),
+                            'a whole frame is not a stand-in for a delta')
+            sizes.append(len(json.dumps(delta)))
+            totals.append(len(json.dumps(full)))
+        self.assertEqual(sizes[0], sizes[1], 'the same one-node change costs the same in a 4-node and a 40-node tree')
+        self.assertGreater(totals[1], totals[0] * 5, 'the whole tree does grow with the tree, which is what the delta avoids')
+
+    def test_a_new_node_arrives_with_its_edge_and_no_old_node(self):
+        self.store.save(self.state)
+        _, cursor = IdeaTreeEngine(self.state, self.store, {}).graph_frame(None)
+        self.grow(1)
+        self.store.save(self.state)
+        delta, _ = IdeaTreeEngine(self.state, self.store, {}).graph_frame(cursor)
+        # ROOT's child list moved, so it travels too; the other candidates do not exist.
+        self.assertEqual([n['id'] for n in delta['nodes']], ['ROOT', '1'])
+        self.assertEqual(delta['edges'], [dict(source='ROOT', target='1', type='child', ordinal=1)])
+        self.assertEqual(delta['removed'], [])
+
+    def test_a_rewritten_stage_travels_and_an_unchanged_node_does_not(self):
+        self.grow(1)
+        self.store.save(self.state)
+        _, cursor = IdeaTreeEngine(self.state, self.store, {}).graph_frame(None)
+        # Nothing moved: the frame carries no node at all, only the research fields.
+        quiet, cursor = IdeaTreeEngine(self.state, self.store, {}).graph_frame(cursor)
+        self.assertEqual(quiet['nodes'], [])
+        self.assertEqual(quiet['edges'], [])
+        self.state['nodes'][1]['stages']['design'] = {'text': 'rewritten design'}
+        self.store.save(self.state)
+        delta, cursor = IdeaTreeEngine(self.state, self.store, {}).graph_frame(cursor)
+        self.assertEqual([n['id'] for n in delta['nodes']], ['1'])
+        self.assertEqual(delta['nodes'][0]['stages'], {'design': {'text': 'rewritten design'}})
+
+    async def test_the_stream_sends_a_whole_tree_then_deltas_then_the_terminal_frame(self):
+        from unittest.mock import patch
+        from sciencediscovery_evolve.vendor.idea_tree import research_service as service
+        self.grow(20)
+        self.store.save(self.state)
+        engine = IdeaTreeEngine(self.state, self.store, {})
+        with patch.object(service, '_store', self.store), \
+                patch.object(service, '_running', {'research-test': (engine, None)}):
+            response = await service.events(service.Command(projectId='p', sessionId='s', researchId='research-test', operation='get'))
+            frames = response.body_iterator
+            first = json.loads((await anext(frames))[len('data: '):])
+            self.assertTrue(first['graph']['full'], 'a fresh stream starts from the whole tree')
+            self.assertEqual(len(first['graph']['nodes']), 21)
+            self.assertNotIn('result', first['graph']['nodes'][0])
+            self.assertEqual(first['research']['status'], 'running')
+            self.assertNotIn('nodes', first['research'])
+
+            self.state['nodes'][2]['status'] = 'done'
+            self.state['nodes'][2]['insight'] = 'candidate insight'
+            self.store.save(self.state)
+            second = json.loads((await anext(frames))[len('data: '):])
+            self.assertFalse(second['graph']['full'])
+            self.assertEqual([n['id'] for n in second['graph']['nodes']], ['2'])
+            self.assertEqual(second['graph']['nodes'][0]['insight'], 'candidate insight')
+            self.assertEqual(second['graph']['since'], first['graph']['revision'])
+
+            self.state['status'] = 'completed'
+            self.store.save(self.state)
+            last = json.loads((await anext(frames))[len('data: '):])
+            self.assertEqual(last['research']['status'], 'completed')
+            self.assertFalse(last['graph']['full'])
+            with self.assertRaises(StopAsyncIteration):
+                await anext(frames)
+
+    def test_a_revision_moves_with_every_durable_checkpoint(self):
+        self.store.save(self.state)
+        first = self.state['revision']
+        self.state['status'] = 'paused'
+        self.store.save(self.state)
+        self.assertEqual(self.state['revision'], first + 1)
+        self.assertEqual(self.store.read('p', 's', 'research-test')['revision'], first + 1)

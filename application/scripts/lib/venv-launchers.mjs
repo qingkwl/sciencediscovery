@@ -7,6 +7,17 @@
 // to exist there). The trampoline does not read pyvenv.cfg either, so
 // bootstrap fixing only the home line is useless.
 //
+// [D3 P3-4 RETIREMENT MARKER — venv-rail machinery, do not extend]
+// This module serves the VENV rail only. The frozen rail (D3 P1/P2)
+// spawns sd-jw.exe / sd-services.exe directly and never touches
+// trampolines/symlinks/venv DLL copies. Retirement conditions (ALL
+// required): P4-1 ships two consecutive releases with the frozen rail
+// default-on and zero venv-rail fallback hits in the wild; SD_JW_FREEZE
+// / SD_SD_SERVICES_FREEZE escape hatches removed; assemble 5.5/5.5b
+// delete the venv staging. Then this file, bootstrap's fixVenvLaunchers,
+// and the A6 pyc face retire TOGETHER. Until then: live code, keep it
+// working — the dual rail IS the rollback plan (design D3 P3-4).
+//
 // Fix: identify trampolines by their marker string and overwrite them with
 // the bundled real interpreter exe. Dropped into venv\Scripts\, the real exe
 // follows CPython's standard venv discovery (walk up from its own location

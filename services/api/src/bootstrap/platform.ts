@@ -276,7 +276,7 @@ export function createPlatformServices(
     mcpGateway,
     { memoryGraphSink, outages: mcpSourceOutages },
   );
-  const paperService = new PaperService(store, config.paperPythonPath, config.paperWorkerPath);
+  const paperService = new PaperService(store, config.paperPythonPath, config.paperWorkerPath, undefined, config.paperFrozenCommand);
   const artifactManager = new GovernedDownloadManager(
     store,
     mcpRegistry,
@@ -712,7 +712,16 @@ export async function initializePlatformServices(
       apiLog.warn("shell_execution_outcome_not_recorded", { executionId: execution.id, errorMessage: shortErrorMessage(error) });
     }
   });
-  await mcpCatalog.refresh().catch((error) => {
+  // [W31-②] The initial MCP catalog refresh connects every stdio server
+  // (three sd-services.exe children, ~1.3s spawn+handshake). It used to be
+  // awaited here, which serialized it into the /api/health gate — every
+  // launch paid it before health could answer 200. The catalog is not a
+  // health input (getStatus() honestly reports "unavailable" until the first
+  // refresh lands), and the API's other routes stay reachable: the shell's
+  // first-chat warmup and the UI's tool listing both arrive seconds later,
+  // after this background refresh has settled. Failure semantics are
+  // unchanged — the same warn lines fire, the stack keeps booting.
+  void mcpCatalog.refresh().catch((error) => {
     apiLog.warn("mcp_catalog_startup_failed", { errorMessage: shortErrorMessage(error) });
     console.warn("MCP catalog was unavailable during API startup:", error);
   });
