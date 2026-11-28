@@ -736,6 +736,8 @@ export class SessionStore {
   private workspaceProvenanceCache?: WorkspaceProvenanceIndex;
   private settingsMutationQueue: Promise<void> = Promise.resolve();
   private secretKey?: Buffer;
+  /** [W34-①] Shared in-flight key resolution (telemetry fires once). */
+  private secretKeyResolution?: Promise<Buffer>;
   /** [W34-①] `Date.now()` when `load()` began — the anchor for the
    * model_secret_key_resolved telemetry's bootMs field. */
   private loadStartedAtMs?: number;
@@ -840,14 +842,23 @@ export class SessionStore {
     // prove the tax actually left the startup path — without this line the
     // session_store component's durationMs is indistinguishable between
     // "lazy worked" and "lazy silently regressed".
-    const startedAt = Date.now();
-    const trigger = new Error("resolution trigger").stack?.split("\n").slice(2, 5).join(" <- ") ?? "unknown";
-    this.secretKey = await this.loadOrCreateSecretKey();
-    apiLog.info("model_secret_key_resolved", {
-      durationMs: Date.now() - startedAt,
-      trigger,
-      bootMs: Date.now() - (this.loadStartedAtMs ?? startedAt),
-    });
+    // The in-flight promise is shared across concurrent callers (the 15th
+    // package's acceptance run logged one line per waiter); the telemetry
+    // fires inside the memoized promise exactly once, from whichever caller
+    // won the race.
+    if (!this.secretKeyResolution) {
+      const startedAt = Date.now();
+      const bootAnchor = this.loadStartedAtMs ?? startedAt;
+      this.secretKeyResolution = this.loadOrCreateSecretKey().then((key) => {
+        apiLog.info("model_secret_key_resolved", {
+          durationMs: Date.now() - startedAt,
+          trigger: new Error("resolution trigger").stack?.split("\n").slice(2, 5).join(" <- ") ?? "unknown",
+          bootMs: Date.now() - bootAnchor,
+        });
+        return key;
+      });
+    }
+    this.secretKey = await this.secretKeyResolution;
   }
 
   private encryptModelApiToken(modelId: string, apiToken: string): string {
